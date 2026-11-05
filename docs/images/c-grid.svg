@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 310" width="480" height="310" font-family="Helvetica, Arial, sans-serif" font-size="15">
+  <title>Variable placement on a Voronoi C-grid</title>
+  <rect width="480" height="310" fill="#ffffff"/>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f5fae"/>
+    </marker>
+  </defs>
+  <!-- cells -->
+  <polygon points="236.6,100 150,50 63.4,100 63.4,200 150,250 236.6,200" fill="#eef3f8" stroke="#5b6b7b" stroke-width="1.5"/>
+  <polygon points="409.8,100 323.2,50 236.6,100 236.6,200 323.2,250 409.8,200" fill="#f6f1e7" stroke="#5b6b7b" stroke-width="1.5"/>
+  <!-- shared edge j -->
+  <line x1="236.6" y1="100" x2="236.6" y2="200" stroke="#c0392b" stroke-width="4"/>
+  <!-- generator-to-generator segment -->
+  <line x1="150" y1="150" x2="323.2" y2="150" stroke="#555" stroke-width="1.2" stroke-dasharray="5,4"/>
+  <!-- normal vector -->
+  <line x1="236.6" y1="150" x2="292" y2="150" stroke="#1f5fae" stroke-width="3" marker-end="url(#arrow)"/>
+  <!-- generators -->
+  <circle cx="150" cy="150" r="4.5" fill="#222"/>
+  <circle cx="323.2" cy="150" r="4.5" fill="#222"/>
+  <!-- labels -->
+  <text x="112" y="128">η<tspan dy="4" font-size="11">1</tspan><tspan dy="-4">, z</tspan><tspan dy="4" font-size="11">b,1</tspan><tspan dy="-4">, hC</tspan><tspan dy="4" font-size="11">1</tspan></text>
+  <text x="298" y="128">η<tspan dy="4" font-size="11">2</tspan><tspan dy="-4">, z</tspan><tspan dy="4" font-size="11">b,2</tspan><tspan dy="-4">, hC</tspan><tspan dy="4" font-size="11">2</tspan></text>
+  <text x="136" y="172" font-size="13">x<tspan dy="4" font-size="10">1</tspan></text>
+  <text x="318" y="172" font-size="13">x<tspan dy="4" font-size="10">2</tspan></text>
+  <text x="243" y="143" fill="#1f5fae">n<tspan dy="4" font-size="11">j</tspan><tspan dy="-4">, u</tspan><tspan dy="4" font-size="11">j</tspan></text>
+  <text x="243" y="96" fill="#c0392b">L<tspan dy="4" font-size="11">j</tspan></text>
+  <text x="186" y="168" fill="#555">δ<tspan dy="4" font-size="11">j</tspan></text>
+  <text x="62" y="278" font-size="12" fill="#333">cell 1 = cells_on_edge[j][0]</text>
+  <text x="252" y="278" font-size="12" fill="#333">cell 2 = cells_on_edge[j][1]</text>
+  <text x="62" y="298" font-size="12" fill="#333">edge_sign_on_cell = +1 (n outward)</text>
+  <text x="252" y="298" font-size="12" fill="#333">edge_sign_on_cell = −1 (n inward)</text>
+</svg>

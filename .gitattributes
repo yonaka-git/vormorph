@@ -1,0 +1,6 @@
+# 改行コードは LF に統一する（Windows の CI でも rustfmt の差分を出さないため）
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary

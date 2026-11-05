@@ -1,0 +1,84 @@
+# 床止め下流の局所洗掘（デモ用の例題）
+#
+# 延長 200 m、幅 20 m、勾配 1/500 の直線水路に、落差 1 m の床止めを置く。
+# 流量 40 m³/s、粒径 2 mm の均一粒径。
+#
+# 目安：単位幅流量 q = 2 m²/s、n = 0.025 のとき、
+#       等流水深 h = (n q / √I)^(3/5) ≈ 1.07 m、フルード数 ≈ 0.58。
+#
+# v0.1.0 では `vormorph check examples/sill.toml` で設定の検証だけができる。
+# 設定キーは src/config.rs と一致させること（config.rs の単体テストがこのファイルを読む）。
+
+title = "sill"
+
+[mesh]
+kind = "channel"
+length = 200.0          # 水路延長 [m]（x = 0 が上流端）
+width = 20.0            # 水路幅 [m]
+cell_size = 1.0         # 代表格子幅 [m]
+layout = "hexagonal"    # "hexagonal" または "rectangular"
+
+[bed]
+slope = 0.002           # 縦断勾配 [-]
+z_downstream = 0.0      # 下流端の河床高 [m]
+
+# 床止め：x_start〜x_end を非侵食層とし、x ≤ x_end の初期河床を height だけかさ上げする
+[[structures]]
+kind = "sill"
+x_start = 80.0          # [m]
+x_end = 82.0            # [m]
+height = 1.0            # 落差 [m]
+
+[physics]
+gravity = 9.81                  # [m/s²]
+water_density = 1000.0          # [kg/m³]
+kinematic_viscosity = 1.0e-6    # [m²/s]
+
+[time]
+dt = 0.2                # [s]
+end = 3600.0            # [s]（流れの時間）
+morphology_start = 300.0  # 助走計算の後に河床変動を始める [s]
+
+[hydro]
+theta = 0.55
+manning_n = 0.025
+dry_depth = 1.0e-3      # [m]
+
+[hydro.solver]
+newton_tol = 1.0e-10
+newton_max_iter = 50
+pcg_rel_tol = 1.0e-12
+pcg_max_iter = 1000
+
+[sediment]
+grain_size = 0.002      # 粒径 d [m]
+density = 2650.0        # 土粒子の密度 [kg/m³]
+porosity = 0.4
+morfac = 10.0
+angle_of_repose = 32.0  # 水中安息角 [°]
+
+[sediment.bedload]
+formula = "mpm"             # "mpm" または "ashida_michiue"
+critical_shields = 0.047    # MPM 原著の値
+static_friction = 1.0       # μ_s（勾配補正）
+kinetic_friction = 0.45     # μ_k（勾配補正）
+
+# 浮遊砂も計算する場合はコメントを外す。
+# d = 2 mm では u*/w_f ≈ 1 で浮遊砂の寄与は小さいと見込み、まずは掃流砂だけで計算する。
+# [sediment.suspended]
+# entrainment = "itakura_kishi"   # または "garcia_parker"
+# min_depth = 0.05                # [m]
+# diffusivity_coef = 0.15
+
+[boundary.upstream]
+kind = "discharge"
+discharge = 40.0                # [m³/s]（通水能に比例して境界辺に配分）
+sediment_supply = "equilibrium"
+
+[boundary.downstream]
+kind = "depth"
+depth = 1.07                    # 等流水深 [m]
+
+[output]
+dir = "output/sill"
+interval = 60.0                 # [s]

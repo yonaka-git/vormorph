@@ -1,0 +1,23 @@
+[package]
+name = "vormorph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Planar 2D morphodynamic model on Voronoi C-grids with a Casulli-type semi-implicit scheme"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yonaka-git/vormorph"
+readme = "README.md"
+keywords = ["shallow-water", "morphodynamics", "voronoi", "sediment-transport", "hydraulics"]
+categories = ["science", "simulation"]
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
