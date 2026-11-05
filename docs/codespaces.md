@@ -12,7 +12,7 @@ GitHub Codespaces を使うと、手元に何も入れずに、ブラウザだ�
 | Rust | `rust-toolchain.toml` に従う（stable、rustfmt、clippy） |
 | Python | uv 0.13.7。`tools/` の環境は `uv.lock` から作る（Python 本体も uv が用意する） |
 | gmsh 用の共有ライブラリ | `libglu1-mesa`, `libxft2`, `libxcursor1`, `libxinerama1`, `libgomp1` |
-| その他 | `tmux`（長い計算用） |
+| その他 | `tmux`（長い計算用）、SSH サーバー（`gh codespace ssh`・`gh codespace cp` 用） |
 | VS Code の拡張機能 | rust-analyzer, Even Better TOML, Python, Ruff |
 
 codespace を作ると、最後に次のコマンドが自動で実行されます（`postCreateCommand`）。初回は数分かかります。

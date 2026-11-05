@@ -5,6 +5,11 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "features": {
+    // gh codespace ssh / cp で手元から接続するための SSH サーバー
+    // （ベースイメージには入っていない）
+    "ghcr.io/devcontainers/features/sshd:1": {}
+  },
   "containerEnv": {
     // Codespaces では uv のキャッシュ（ホーム）と .venv（/workspaces）が別のファイルシステムに
     // あり、ハードリンクできないという警告が出るため、最初からコピーにする
