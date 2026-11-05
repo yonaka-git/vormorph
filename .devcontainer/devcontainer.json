@@ -1,0 +1,30 @@
+// vormorph の開発環境（GitHub Codespaces / VS Code Dev Containers）
+// 使い方と注意は docs/codespaces.md
+{
+  "name": "vormorph",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "containerEnv": {
+    // Codespaces では uv のキャッシュ（ホーム）と .venv（/workspaces）が別のファイルシステムに
+    // あり、ハードリンクできないという警告が出るため、最初からコピーにする
+    "UV_LINK_MODE": "copy",
+    "CARGO_TERM_COLOR": "always"
+  },
+  // ツールチェーンと依存を入れ、リリースビルドまで済ませておく
+  "postCreateCommand": "rustup toolchain install && cargo build --release --locked && uv sync --project tools --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "ms-python.python",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "python.defaultInterpreterPath": "${workspaceFolder}/tools/.venv/bin/python"
+      }
+    }
+  }
+}

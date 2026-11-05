@@ -45,6 +45,7 @@
 | `examples/` | 例題の設定ファイル。`examples/domains/` は格子生成ツールの入力 |
 | `tools/` | Python の格子生成（`make_mesh.py`, `vormesh/`）と後処理（uv で管理）。テストは `tools/tests/` |
 | `references/` | 文献 PDF（コミットしない） |
+| `.devcontainer/` | GitHub Codespaces の開発環境（使い方は `docs/codespaces.md`） |
 
 ## コーディング規約
 
@@ -104,4 +105,5 @@ scope: config, mesh, hydro, linsolve, sediment, model, io, tools など（任意
 - Python の後処理と格子生成は `tools/` で uv を使う。例：`uv run --project tools python tools/plot_profile.py output/sill/*.vtu`
 - PyPI の gmsh は `libGLU.so.1` と `libXft.so.2` を必要とする（Ubuntu では `sudo apt install libglu1-mesa libxft2`）。ないと `import gmsh` が `OSError` になり、`tools/tests/test_gmsh.py` は飛ばされる。
 - 格子ファイルの形式（`tools/vormesh/meshfile.py` と `src/mesh/file.rs`）を変えるときは、両方と `docs/design/mesh-generation.md` を同じコミットで直し、`tests/data/island_coarse.mesh.toml` を作り直す（コマンドは `tests/mesh_file.rs` の冒頭）。
+- 計算は GitHub Codespaces でも実行できる（`.devcontainer/`、手順は `docs/codespaces.md`）。アイドルタイムアウト（ターミナルへの出力でリセット）と最長 12 時間の制限がある。gmsh が必要とする共有ライブラリを変えたら `.devcontainer/Dockerfile` も直す。
 - CI（`.github/workflows/ci.yml`）は ubuntu と windows で fmt・clippy・test を、ubuntu で MSRV（1.85）の check と `cargo doc`、`tools/` の pytest を実行する。

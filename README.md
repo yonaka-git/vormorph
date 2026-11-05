@@ -127,6 +127,12 @@ flowchart TD
   - 格子生成に使う gmsh は、OpenGL と X11 の共有ライブラリを必要とします（Ubuntu なら `sudo apt install libglu1-mesa libxft2`）。
 - 可視化に使う場合は [ParaView](https://www.paraview.org/download/)。
 
+### GitHub Codespaces で動かす
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/yonaka-git/vormorph?quickstart=1)
+
+手元に何も入れずに、ブラウザだけでビルド・テスト・格子生成を試せます。Rust・uv・gmsh 用の共有ライブラリが入った環境（`.devcontainer/`）が立ち上がり、リリースビルドと `tools/` の環境作りまで自動で済みます。長い計算をするときの注意（アイドルタイムアウト）や、計算結果を手元に持ってくる方法は [docs/codespaces.md](docs/codespaces.md) にあります。
+
 ### ビルドとテスト
 
 ```bash
@@ -200,6 +206,7 @@ uv run --project tools python tools/plot_profile.py output/sill/sill_*.vtu -o pr
 
 ```text
 vormorph/
+├── .devcontainer/         GitHub Codespaces の開発環境
 ├── src/
 │   ├── config.rs          TOML 設定の読み込みと検証
 │   ├── mesh/              ボロノイ格子（MPAS 形式）、直線水路の生成、格子ファイルの読み込み
@@ -217,6 +224,7 @@ vormorph/
 ├── docs/
 │   ├── design/            設計概要（離散式）、格子生成、ADR
 │   ├── verification.md    検証計画と結果
+│   ├── codespaces.md      GitHub Codespaces での実行
 │   └── references.md      参考文献
 └── tools/                 Python の格子生成（gmsh）と後処理（uv）
 ```
