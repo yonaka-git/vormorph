@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 340" width="680" height="340" font-family="Helvetica, Arial, sans-serif" font-size="14">
+  <title>Boundary generators placed as mirrored pairs on intersecting circles</title>
+  <rect width="680" height="340" fill="#ffffff"/>
+  <rect x="67.0" y="17.5" width="540.0" height="157.5" fill="#eef3f8"/>
+  <text x="74.5" y="40.0" fill="#5b6b7b" font-size="13">domain</text>
+  <text x="74.5" y="268.0" fill="#5b6b7b" font-size="13">outside</text>
+  <circle cx="112.0" cy="175.0" r="99.0" fill="none" stroke="#8796a5" stroke-width="1" stroke-dasharray="4,3"/>
+  <circle cx="262.0" cy="175.0" r="99.0" fill="none" stroke="#8796a5" stroke-width="1" stroke-dasharray="4,3"/>
+  <circle cx="412.0" cy="175.0" r="99.0" fill="none" stroke="#8796a5" stroke-width="1" stroke-dasharray="4,3"/>
+  <circle cx="562.0" cy="175.0" r="99.0" fill="none" stroke="#8796a5" stroke-width="1" stroke-dasharray="4,3"/>
+  <line x1="262.0" y1="175.0" x2="262.0" y2="32.5" stroke="#5b6b7b" stroke-width="1.5"/>
+  <line x1="412.0" y1="175.0" x2="412.0" y2="32.5" stroke="#5b6b7b" stroke-width="1.5"/>
+  <line x1="67.0" y1="175.0" x2="607.0" y2="175.0" stroke="#24303c" stroke-width="1.2"/>
+  <line x1="262.0" y1="175.0" x2="412.0" y2="175.0" stroke="#c0392b" stroke-width="4"/>
+  <line x1="187.0" y1="110.4" x2="187.0" y2="239.6" stroke="#555" stroke-width="1.1" stroke-dasharray="5,4"/>
+  <circle cx="187.0" cy="110.4" r="5" fill="#222"/>
+  <circle cx="187.0" cy="239.6" r="5" fill="#ffffff" stroke="#222" stroke-width="1.5"/>
+  <line x1="337.0" y1="110.4" x2="337.0" y2="239.6" stroke="#555" stroke-width="1.1" stroke-dasharray="5,4"/>
+  <circle cx="337.0" cy="110.4" r="5" fill="#222"/>
+  <circle cx="337.0" cy="239.6" r="5" fill="#ffffff" stroke="#222" stroke-width="1.5"/>
+  <line x1="487.0" y1="110.4" x2="487.0" y2="239.6" stroke="#555" stroke-width="1.1" stroke-dasharray="5,4"/>
+  <circle cx="487.0" cy="110.4" r="5" fill="#222"/>
+  <circle cx="487.0" cy="239.6" r="5" fill="#ffffff" stroke="#222" stroke-width="1.5"/>
+  <circle cx="112.0" cy="175.0" r="4" fill="#c0392b"/>
+  <circle cx="262.0" cy="175.0" r="4" fill="#c0392b"/>
+  <circle cx="412.0" cy="175.0" r="4" fill="#c0392b"/>
+  <circle cx="562.0" cy="175.0" r="4" fill="#c0392b"/>
+  <line x1="262.0" y1="175.0" x2="176.3" y2="125.5" stroke="#1f5fae" stroke-width="1.5"/>
+  <text x="194.5" y="134.5" fill="#1f5fae">r<tspan dy="4" font-size="11">k</tspan></text>
+  <text x="248.0" y="197.0" fill="#c0392b">b<tspan dy="4" font-size="11">k</tspan></text>
+  <text x="406.0" y="197.0" fill="#c0392b">b<tspan dy="4" font-size="11">k+1</tspan></text>
+  <text x="347.0" y="102.4">s<tspan dy="4" font-size="11">k</tspan><tspan dy="-4"> (generator)</tspan></text>
+  <text x="347.0" y="257.6">s′<tspan dy="4" font-size="11">k</tspan><tspan dy="-4"> (mirror)</tspan></text>
+  <text x="343.0" y="214.0" fill="#555" font-size="12">2d<tspan dy="4" font-size="10">k</tspan><tspan dy="-4"> = dc_edge</tspan></text>
+  <text x="299.5" y="167.0" fill="#c0392b" font-size="12">boundary edge</text>
+  <text x="67.0" y="326" font-size="12" fill="#333">The circles at b_k and b_k+1 meet at a generator-mirror pair symmetric about the boundary edge.</text>
+</svg>

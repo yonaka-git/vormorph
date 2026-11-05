@@ -10,9 +10,10 @@
 //! x = L が [`EdgeKind::Downstream`](super::EdgeKind::Downstream)、
 //! y = 0 と y = W が [`EdgeKind::Wall`](super::EdgeKind::Wall)。
 //!
-//! 生成した格子は [`Mesh::derive_cell_connectivity`] と
-//! [`voronoi::compute_geometry`](super::voronoi::compute_geometry) を通して、
-//! 符号と幾何量をほかの格子と同じ手順で計算する。
+//! セルは行ごと（y の小さい列から、各列を x の順）に並べる。小さな検証用の格子なので、
+//! ヒルベルト曲線の順への並べ替えはしない。生成した多角形の並び
+//! （[`PolygonMesh`](super::voronoi::PolygonMesh)）は [`voronoi::build`](super::voronoi::build)
+//! を通して、符号と幾何量をほかの格子と同じ手順で計算する。
 
 use super::Mesh;
 use crate::config::{ChannelLayout, MeshConfig};

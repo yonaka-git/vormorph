@@ -1,0 +1,18 @@
+# 格子生成ツール（tools/make_mesh.py）の入力：円形の島のある矩形の池（合成データ）
+#
+#   uv run --project tools python tools/make_mesh.py examples/domains/island.toml \
+#       -o output/mesh/island.mesh.toml --plot output/mesh/island.png
+#
+# 60 m × 30 m の矩形の池の中央に、半径 5 m の円形の島（格子の穴）がある。周囲はすべて壁。
+# 穴（島・橋脚）の扱いの例。静水保持（V03 は河床の起伏による島）の変形として、
+# 穴の周りの境界辺でも偽の流れが生じないことの確認に使える。
+
+title = "island"
+cell_size = 1.5                      # 目標の格子幅（母点の間隔）[m]
+
+[[outer]]
+kind = "wall"
+line = [[0.0, 0.0], [60.0, 0.0], [60.0, 30.0], [0.0, 30.0], [0.0, 0.0]]
+
+[[holes]]
+circle = { center = [30.0, 15.0], radius = 5.0 }

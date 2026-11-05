@@ -1,15 +1,35 @@
 [project]
 name = "vormorph-tools"
 version = "0.1.0"
-description = "Post-processing scripts for vormorph (VTK output -> figures)"
+description = "Pre- and post-processing tools for vormorph (mesh generation with gmsh, VTK output -> figures)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
 dependencies = [
+    "gmsh>=4.13",
     "matplotlib>=3.9",
     "meshio>=5.3",
     "numpy>=2.0",
+    "scipy>=1.13",
+    "shapely>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "SIM", "RUF"]
+# 日本語の文字列・コメントの全角文字（括弧・句読点）は意図したもの
+ignore = ["RUF001", "RUF002", "RUF003"]

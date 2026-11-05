@@ -80,6 +80,7 @@ cargo test --test verification v06      # 1ケースだけ
 ### V08〜V11 河床変動
 
 - V08（浮遊砂）、V09（交互砂州）、V10（湾曲水路）の比較対象とする実験・解析は、実装時に選定して [references.md](references.md) に追加します。
+- V10 の格子は、格子生成ツール（[design/mesh-generation.md](design/mesh-generation.md)）で `examples/domains/bend.toml` から作ります。水路の寸法は、比較する実験に合わせて変えます。
 - V11 は `examples/sill.toml` の条件で計算します。格子幅を 3 段階に変え、最大洗掘深とその位置の格子依存性を確かめます。
 
 ## 結果の記録

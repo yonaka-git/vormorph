@@ -12,7 +12,7 @@
 -->
 ![床止め下流の局所洗掘の模式図（プレースホルダー。計算結果ではありません）](docs/images/hero.png)
 
-> **開発状況**：v0.1.0 は、設計文書とモジュールの雛形の段階です。数値計算の本体（流れ・流砂）はまだ実装していません。実装の進み具合は[検証](#検証)の表と[ロードマップ](#ロードマップ)に記載しています。
+> **開発状況**：v0.1.0 は、設計文書とモジュールの雛形の段階です。数値計算の本体（流れ・流砂）はまだ実装していません。動作するのは、設定ファイルの検証と、Python の格子生成ツール（[格子生成](#格子生成)）です。実装の進み具合は[検証](#検証)の表と[ロードマップ](#ロードマップ)に記載しています。
 
 ## 特徴（設計）
 
@@ -22,6 +22,7 @@
 - **Casulli 型 θ 法の半陰解法**：水位勾配と摩擦を陰的に扱い、重力波の Courant 条件に縛られません。wet/dry を含む水位の連立方程式（対称正定値）は、Newton 法と行列フリーの前処理付き共役勾配法で解きます。
 - **跳水・射流に対応した保存型の移流**：Stelling–Duinmeijer / Kramer–Stelling 系の陽的な保存型風上差分で、堰や床止めの周りの急変流を扱います。
 - **辺で評価する流砂と河床変動**：掃流砂は境界面の法線成分で評価します（MPM／芦田・道上を切り替え可能）。長谷川の式による勾配補正、非侵食層（床止め）による流出の頭打ち、浮遊砂、MORFAC、安息角補正を含みます。
+- **自作の格子生成ツール（gmsh）**：境界の線分がそのままボロノイ辺になるように、境界に関して対称な母点の対を置き、内部は重心ボロノイ分割にします。セルはヒルベルト曲線の順に並べ、メモリアクセスの局所性を高めます。ツールは動作します（Rust 側で読み込んで接続配列を組み立てる部分は未実装）。
 - **小さな依存と検証しやすい構成**：外部クレートは `serde` と `toml` だけです。`unsafe` は使いません。数値計算のループはセル単位で書き、将来の並列化（rayon）に備えます。11 の検証ケースをテストとして管理します。
 
 ## 数値解法の要点
@@ -114,7 +115,7 @@ flowchart TD
 | V10 | 湾曲水路の河床変動 | 外岸側の洗掘 | 📋 |
 | V11 | 床止め下流の局所洗掘 | 洗掘深と格子依存性 | 📋 |
 
-設定ファイルの読み込みと検証、格子の接続と符号の規約、状態変数の基本操作には、単体テストがあります（`cargo test` で実行）。
+設定ファイルの読み込みと検証、格子ファイルの読み込み、格子の接続と符号の規約、状態変数の基本操作には、単体テストがあります（`cargo test` で実行）。格子生成ツールのテストは `uv run --project tools pytest tools/tests` で実行します。
 
 ## クイックスタート
 
@@ -122,7 +123,8 @@ flowchart TD
 
 - Rust（[rustup](https://rustup.rs/) で入れます）。`rust-toolchain.toml` があるので、初回のビルドで stable のツールチェーンが自動で入ります。
   - Linux では、リンカとして C コンパイラが必要です（Ubuntu なら `sudo apt install build-essential`）。
-- 後処理に使う場合は [uv](https://docs.astral.sh/uv/)（Python の環境は `tools/` で管理します）。
+- 格子生成と後処理に使う場合は [uv](https://docs.astral.sh/uv/)（Python の環境は `tools/` で管理します）。
+  - 格子生成に使う gmsh は、OpenGL と X11 の共有ライブラリを必要とします（Ubuntu なら `sudo apt install libglu1-mesa libxft2`）。
 - 可視化に使う場合は [ParaView](https://www.paraview.org/download/)。
 
 ### ビルドとテスト
@@ -160,6 +162,25 @@ downstream : depth 1.07 m
 output     : output/sill every 60 s
 ```
 
+### 格子生成
+
+計算領域の外形（折れ線・円弧・島）を TOML で書き、格子ファイルを作ります。
+
+```bash
+uv sync --project tools
+uv run --project tools python tools/make_mesh.py examples/domains/bend.toml \
+    -o output/mesh/bend.mesh.toml --plot output/mesh/bend.png
+```
+
+![180° 湾曲水路の格子。セルを番号（ヒルベルト曲線の順）で塗り分け、母点を番号順に結んでいる](docs/images/mesh-bend.png)
+
+- gmsh で境界を格子幅に合わせて分割し、内部に初期の母点を置きます。
+- 境界辺ごとに、境界に関して対称な母点と鏡映点の対を置きます。境界の線分がそのままボロノイ辺になり、境界でも直交性が厳密に成り立ちます。
+- 内部の母点を Lloyd 法で動かし、重心ボロノイ分割に近づけます。
+- セルをヒルベルト曲線の順に並べ、面積・直交性・境界の規約を検査してから書き出します。
+
+手順と格子ファイルの形式は [docs/design/mesh-generation.md](docs/design/mesh-generation.md) にあります。
+
 ### ParaView での可視化（ソルバーの実装後）
 
 1. ParaView を[公式サイト](https://www.paraview.org/download/)から入手します。
@@ -181,7 +202,7 @@ uv run --project tools python tools/plot_profile.py output/sill/sill_*.vtu -o pr
 vormorph/
 ├── src/
 │   ├── config.rs          TOML 設定の読み込みと検証
-│   ├── mesh/              ボロノイ格子（MPAS 形式）、直線水路の生成、外部格子の読み込み
+│   ├── mesh/              ボロノイ格子（MPAS 形式）、直線水路の生成、格子ファイルの読み込み
 │   ├── state.rs           状態変数
 │   ├── hydro.rs           半陰解法、Perot 再構成、移流
 │   ├── linsolve.rs        行列フリー PCG
@@ -190,24 +211,27 @@ vormorph/
 │   ├── io.rs              VTK 出力
 │   └── main.rs            コマンドライン
 ├── tests/verification.rs  検証ケース
-├── examples/sill.toml     床止め下流の局所洗掘（デモ用）
+├── examples/
+│   ├── sill.toml          床止め下流の局所洗掘（デモ用）
+│   └── domains/           格子生成ツールの入力（湾曲水路、島のある池）
 ├── docs/
-│   ├── design/            設計概要（離散式）と ADR
+│   ├── design/            設計概要（離散式）、格子生成、ADR
 │   ├── verification.md    検証計画と結果
 │   └── references.md      参考文献
-└── tools/                 Python の後処理（uv）
+└── tools/                 Python の格子生成（gmsh）と後処理（uv）
 ```
 
 ## ロードマップ
 
 - [x] v0.1.0：設計文書、モジュールの雛形、設定ファイル、検証ケースの一覧、CI
-- [ ] 格子：直線水路の生成、幾何の検査（V01）、Perot 再構成（V02）、VTK 出力
+- [x] 格子生成ツール（gmsh、鏡映対の境界母点、重心ボロノイ分割、ヒルベルト曲線の順）
+- [ ] 格子：多角形の並びからの接続配列の組み立て、直線水路の生成、格子ファイルの読み込み、幾何の検査（V01）、Perot 再構成（V02）、VTK 出力
 - [ ] 流れ：半陰解法と wet/dry（V03, V04）、流量・水位境界と摩擦（V06）
 - [ ] 急変流：保存型風上差分（V05, V07）
 - [ ] 河床変動：掃流砂・Exner 式・非侵食層、床止めの例題（V11）とヒーロー画像の差し替え
 - [ ] 浮遊砂（V08）
-- [ ] 交互砂州・湾曲水路（V09, V10）、JIGSAW で生成した外部格子の読み込み
-- [ ] 以降の候補：混合粒径（平野の交換層モデル）、rayon による並列化、加速流でのエネルギー水頭保存形
+- [ ] 交互砂州・湾曲水路（V09, V10）
+- [ ] 以降の候補：混合粒径（平野の交換層モデル）、rayon による並列化、加速流でのエネルギー水頭保存形、局所的に細かい格子
 
 ## 参考文献
 
@@ -218,7 +242,9 @@ vormorph/
 - Stelling, G. S., Duinmeijer, S. P. A. (2003). A staggered conservative scheme for every Froude number in rapidly varied shallow water flows. *Int. J. Numer. Meth. Fluids*, 43(12), 1329–1354. <https://doi.org/10.1002/fld.537>
 - Kramer, S. C., Stelling, G. S. (2008). A conservative unstructured scheme for rapidly varied flows. *Int. J. Numer. Meth. Fluids*, 58(2), 183–212. <https://doi.org/10.1002/fld.1722>
 - Perot, B. (2000). Conservation properties of unstructured staggered mesh schemes. *J. Comput. Phys.*, 159(1), 58–89. <https://doi.org/10.1006/jcph.2000.6424>
-- Engwirda, D. (2017). JIGSAW-GEO (1.0): locally orthogonal staggered unstructured grid generation for general circulation modelling on the sphere. *Geosci. Model Dev.*, 10(6), 2117–2140. <https://doi.org/10.5194/gmd-10-2117-2017>
+- Geuzaine, C., Remacle, J.-F. (2009). Gmsh: A 3-D finite element mesh generator with built-in pre- and post-processing facilities. *Int. J. Numer. Meth. Engng*, 79(11), 1309–1331. <https://doi.org/10.1002/nme.2579>
+- Abdelkader, A., et al. (2018). Sampling conditions for conforming Voronoi meshing by the VoroCrust algorithm. *SoCG 2018*, LIPIcs 99, 1:1–1:16. <https://doi.org/10.4230/LIPIcs.SoCG.2018.1>
+- Du, Q., Faber, V., Gunzburger, M. (1999). Centroidal Voronoi tessellations: applications and algorithms. *SIAM Review*, 41(4), 637–676. <https://doi.org/10.1137/S0036144599352836>
 - 芦田和男, 道上正規 (1972). 移動床流れの抵抗と掃流砂量に関する基礎的研究. *土木学会論文報告集*, 206, 59–69. <https://doi.org/10.2208/jscej1969.1972.206_59>
 
 ## 作者

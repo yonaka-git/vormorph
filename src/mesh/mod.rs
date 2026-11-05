@@ -41,8 +41,20 @@
 //!   区別する。
 //!
 //! 接続配列は行ごとに長さが異なるので、CSR 形式の [`Jagged`] で持つ。
+//!
+//! ## 格子の作り方
+//!
+//! | 入口 | 内容 |
+//! |---|---|
+//! | [`channel::build`] | 直線矩形水路（検証ケースとデモ用）を内部で生成する |
+//! | [`file::read`] | 格子生成ツール `tools/make_mesh.py`（gmsh を使う自作ツール）の出力を読む |
+//!
+//! どちらも多角形の並び（[`voronoi::PolygonMesh`]）を作り、[`voronoi::build`] で接続配列と
+//! 幾何量を組み立てる。格子生成ツールはセルをヒルベルト曲線の順に並べて書き出すので、
+//! 番号の近いセルは空間的にも近い（`docs/design/mesh-generation.md`）。
 
 pub mod channel;
+pub mod file;
 pub mod voronoi;
 
 use std::ops::{Index, IndexMut};

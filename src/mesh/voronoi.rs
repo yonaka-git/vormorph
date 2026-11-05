@@ -1,38 +1,80 @@
-//! 外部で生成した格子の読み込みと、ボロノイ格子の幾何量の計算。
+//! 多角形のセルの並びから、MPAS 形式の接続配列と幾何量を組み立てる。
+//!
+//! 格子の作り方によらず（直線水路の [`channel`](super::channel)、格子生成ツールの出力を読む
+//! [`file`](super::file)）、[`PolygonMesh`] を作ってから [`build`] を通す。辺の向きと符号の
+//! 規約を決めるのはこのモジュールと [`Mesh::derive_cell_connectivity`] だけにする。
 //!
 //! ## 直交性
 //!
-//! デローニー三角形分割の外心を頂点とするボロノイ図では、隣り合う母点を結ぶ線分と、
-//! 両者を隔てるボロノイ辺が直交する。C 格子の水位勾配 (η_2 − η_1)/δ_j や、河床の法線方向
-//! 勾配が2点差分で厳密になるのはこの性質による。鈍角三角形では外心が三角形の外に出て、
-//! 母点の順序と辺の向きが食い違うことがあるため、格子生成の側で局所的に直交性のよい分割
-//! （JIGSAW の locally orthogonal grid; Engwirda, 2017）を作る。
+//! ボロノイ図では、隣り合う母点を結ぶ線分と、両者を隔てるボロノイ辺が直交する。C 格子の
+//! 水位勾配 (η_2 − η_1)/δ_j や、河床の法線方向勾配が2点差分で厳密になるのはこの性質による。
+//! 境界辺は、母点をその辺の直線に関して鏡映した点との二等分線になるように格子を作る
+//! （`tools/vormesh` の鏡映対の母点、`docs/design/mesh-generation.md`）。
 //!
-//! ## 入力形式
+//! ## 番号のつけ方
 //!
-//! 当面は JIGSAW（jigsawpy）が出力する三角形分割を読み、その双対としてボロノイ格子を
-//! 組み立てる想定。具体的なファイル形式、境界の種類（壁・上流端・下流端）の指定方法、
-//! 河床高の与え方は未定で、実装時に ADR に記録する。
+//! - セルと頂点の番号は [`PolygonMesh`] のまま使う。格子生成ツールはセルをヒルベルト曲線の順に
+//!   並べ、頂点をセルの順に初めて現れた順に並べて書き出す。
+//! - 辺の番号は、セルを番号順にたどり、各セルの辺を反時計回りにたどって初めて現れた順に
+//!   つける。辺の `cells_on_edge[e][0]` は先に現れたセル（番号の小さいセル）になる。
+//!   これにより、セル単位のループで参照する辺と頂点も、番号の近い範囲に集まる。
 //!
 //! ## 参考文献
 //!
-//! - Engwirda (2017): JIGSAW-GEO による局所直交格子の生成
 //! - MPAS Mesh Specification v1.0 (2015): 接続配列の定義
+//! - Du, Faber & Gunzburger (1999): 重心ボロノイ分割
 
-use super::Mesh;
-use std::io;
-use std::path::Path;
+use super::{EdgeKind, Jagged, Mesh};
 
-/// 三角形分割からその双対のボロノイ格子を組み立てる。
+/// 境界辺の両端の頂点と種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryEdge {
+    /// 両端の頂点番号。セルから見て反時計回りの向き。
+    pub vertices: [usize; 2],
+    /// 辺の種類（[`EdgeKind::Interior`] 以外）。
+    pub kind: EdgeKind,
+}
+
+/// 多角形のセルの並びで表したボロノイ格子（接続配列を組み立てる前の形）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PolygonMesh {
+    /// 母点の x 座標 \[m\]。
+    pub x_cell: Vec<f64>,
+    /// 母点の y 座標 \[m\]。
+    pub y_cell: Vec<f64>,
+    /// ボロノイ頂点の x 座標 \[m\]。
+    pub x_vertex: Vec<f64>,
+    /// ボロノイ頂点の y 座標 \[m\]。
+    pub y_vertex: Vec<f64>,
+    /// セルの頂点番号（反時計回り）。セル c の辺 k は `vertices_on_cell[c][k]` →
+    /// `vertices_on_cell[c][(k + 1) % n]`。
+    pub vertices_on_cell: Jagged<usize>,
+    /// 境界辺。相手のセルがない辺は、すべてここに種類つきで挙げる。
+    pub boundary_edges: Vec<BoundaryEdge>,
+}
+
+impl PolygonMesh {
+    /// セル数。
+    pub fn n_cells(&self) -> usize {
+        self.x_cell.len()
+    }
+
+    /// 頂点の数。
+    pub fn n_vertices(&self) -> usize {
+        self.x_vertex.len()
+    }
+}
+
+/// 多角形のセルの並びから、MPAS 形式の接続配列と幾何量を持つ [`Mesh`] を組み立てる。
 ///
-/// `points` は三角形の頂点（ボロノイ格子の母点）、`triangles` は反時計回りに並べた
-/// 頂点番号。ボロノイ頂点は各三角形の外心になる。領域の境界上の母点のセルは、
-/// 境界線で閉じる。
-pub fn dual_of_triangulation(points: &[[f64; 2]], triangles: &[[usize; 3]]) -> Mesh {
+/// 辺の番号は[モジュールの説明](self)のとおりにつけ、[`Mesh::derive_cell_connectivity`] と
+/// [`compute_geometry`] を通す。内部の辺を2つのセルが逆向きに共有していない場合
+/// （T 字の接合など）と、相手のいない辺が `boundary_edges` にない場合は失敗する。
+pub fn build(polygons: &PolygonMesh) -> Mesh {
     todo!(
-        "デローニー三角形分割の双対 ({} points, {} triangles)",
-        points.len(),
-        triangles.len()
+        "多角形の並びから接続配列を組み立てる ({} cells, {} vertices)",
+        polygons.n_cells(),
+        polygons.n_vertices()
     )
 }
 
@@ -40,9 +82,4 @@ pub fn dual_of_triangulation(points: &[[f64; 2]], triangles: &[[usize; 3]]) -> M
 /// `normal_edge`）を計算する。
 pub fn compute_geometry(mesh: &mut Mesh) {
     todo!("幾何量の計算 ({} cells)", mesh.n_cells())
-}
-
-/// JIGSAW の格子ファイルを読み込む（形式は未定）。
-pub fn read_jigsaw_msh(path: &Path) -> io::Result<Mesh> {
-    todo!("JIGSAW 格子の読み込み ({})", path.display())
 }

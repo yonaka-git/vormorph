@@ -15,8 +15,13 @@
 - 格子の接続配列（CSR 形式の `Jagged`）と、法線の符号の規約（`Mesh::derive_cell_connectivity`）
 - 例題 `examples/sill.toml`（床止め下流の局所洗掘）
 - 検証ケース 11 件の一覧（`tests/verification.rs`、未実装は `#[ignore]`）と `docs/verification.md`
-- 設計文書 `docs/design/overview.md`（支配方程式・離散式・1ステップの手順）と ADR 4 件
+- 設計文書 `docs/design/overview.md`（支配方程式・離散式・1ステップの手順）と ADR 0001〜0004
 - 文献リスト `docs/references.md`
 - Python の後処理の雛形 `tools/plot_profile.py`（uv で管理）
-- CI：fmt・clippy・test（ubuntu・windows）、MSRV の check、`cargo doc`
+- 格子生成ツール `tools/make_mesh.py`（パッケージ `tools/vormesh/`）：gmsh による境界の分割と初期母点、境界に関して対称な母点の対、Lloyd 法による重心ボロノイ分割、ヒルベルト曲線の順への並べ替え、格子の検査、格子ファイル（TOML）の書き出し、格子の図。pytest のテスト
+- 格子生成ツールの入力例 `examples/domains/`（180° 湾曲水路、島のある池）
+- 格子ファイルの読み込み `mesh::file`（形式・版・番号の範囲の検査）と、多角形の並び `mesh::voronoi::PolygonMesh`（接続配列の組み立ては `todo!()`）
+- 格子生成ツールの出力を Rust 側で読み、面積・辺の共有・直交性・境界の母点の位置・番号の局所性を確かめるテスト `tests/mesh_file.rs`（データは `tests/data/island_coarse.mesh.toml`）
+- 設計文書 `docs/design/mesh-generation.md` と ADR-0005（格子生成は gmsh を使った自作ツールで行い、セルをヒルベルト曲線の順に並べる）
+- CI：fmt・clippy・test（ubuntu・windows）、MSRV の check、`cargo doc`、`tools/` の pytest
 - ライセンス：MIT OR Apache-2.0

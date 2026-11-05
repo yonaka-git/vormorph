@@ -20,9 +20,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt  # noqa: E402
-import meshio  # noqa: E402
-import numpy as np  # noqa: E402
+import matplotlib.pyplot as plt
+import meshio
+import numpy as np
 
 DRY_DEPTH = 1.0e-3
 """これより浅いセルは乾いているとみなし、水位を描かない [m]。"""

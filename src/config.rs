@@ -84,7 +84,8 @@ pub enum MeshConfig {
         #[serde(default)]
         layout: ChannelLayout,
     },
-    /// 外部で生成した格子を読み込む（[`crate::mesh::voronoi`]）。ファイル形式は未定。
+    /// 格子生成ツール（`tools/make_mesh.py`）が書き出した格子ファイルを読み込む
+    /// （[`crate::mesh::file`]）。
     File {
         /// 格子ファイルのパス。
         path: PathBuf,

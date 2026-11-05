@@ -58,3 +58,13 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
+
+  tools:
+    name: tools (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install shared libraries for gmsh
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libglu1-mesa libxft2
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --project tools --locked pytest tools/tests

@@ -1,0 +1,50 @@
+# 格子生成ツール（tools/make_mesh.py）の入力：180° の湾曲水路（合成データ）
+#
+#   uv run --project tools python tools/make_mesh.py examples/domains/bend.toml \
+#       -o output/mesh/bend.mesh.toml --plot output/mesh/bend.png
+#
+# 上流の直線区間（40 m）→ 中心線の半径 30 m の 180° 湾曲 → 下流の直線区間（40 m）。
+# 水路幅 10 m。流れは右側の直線区間を +y 向きに上り、湾曲を回って左側の直線区間を下る。
+# 検証ケース V10（湾曲部の局所洗掘）で使う想定。
+
+title = "bend180"
+cell_size = 1.0                      # 目標の格子幅（母点の間隔）[m]
+
+# 外周を反時計回り（領域を左手に見る向き）にたどる。各区間の終点は次の区間の始点と一致させる。
+# line = 折れ線 [[x, y], ...]、arc = 円弧 { center, radius, start, end }（角度は度、start → end）
+
+[[outer]]
+kind = "upstream"
+line = [[25.0, -40.0], [35.0, -40.0]]
+
+[[outer]]
+kind = "wall"                        # 外岸（上流の直線区間）
+line = [[35.0, -40.0], [35.0, 0.0]]
+
+[[outer]]
+kind = "wall"                        # 外岸（湾曲部）
+arc = { center = [0.0, 0.0], radius = 35.0, start = 0.0, end = 180.0 }
+
+[[outer]]
+kind = "wall"                        # 外岸（下流の直線区間）
+line = [[-35.0, 0.0], [-35.0, -40.0]]
+
+[[outer]]
+kind = "downstream"
+line = [[-35.0, -40.0], [-25.0, -40.0]]
+
+[[outer]]
+kind = "wall"                        # 内岸（下流の直線区間）
+line = [[-25.0, -40.0], [-25.0, 0.0]]
+
+[[outer]]
+kind = "wall"                        # 内岸（湾曲部、時計回り）
+arc = { center = [0.0, 0.0], radius = 25.0, start = 180.0, end = 0.0 }
+
+[[outer]]
+kind = "wall"                        # 内岸（上流の直線区間）
+line = [[25.0, 0.0], [25.0, -40.0]]
+
+[lloyd]
+iterations = 100
+tolerance = 1e-3

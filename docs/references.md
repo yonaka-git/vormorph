@@ -2,7 +2,7 @@
 
 この文書は、vormorph の設計と実装で参照する文献の一覧です。
 
-- 書誌情報は 2026-11-05 に、Crossref、J-STAGE、doi.org、出版社・公式サイトで確認しました。
+- 書誌情報は 2026-11-05 に、Crossref、DataCite、J-STAGE、doi.org、出版社・公式サイトで確認しました。
 - オープンアクセスの文献は `references/` に保存しています。著作権のためリポジトリには含めず、`.gitignore` で除外しています。
 - 入手状況の欄の意味は次のとおりです。
 
@@ -39,11 +39,19 @@
 
 ## 格子生成
 
+格子生成ツール（`tools/make_mesh.py`）の手順は [design/mesh-generation.md](design/mesh-generation.md)、判断の理由は [ADR-0005](design/adr/0005-mesh-generator.md) にあります。
+
 | 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
 |---|---|---|---|---|---|
-| Engwirda, D. | 2017 | JIGSAW-GEO (1.0): locally orthogonal staggered unstructured grid generation for general circulation modelling on the sphere | Geosci. Model Dev., 10(6), 2117–2140 | [10.5194/gmd-10-2117-2017](https://doi.org/10.5194/gmd-10-2117-2017) | 取得済み（`engwirda2017_jigsaw-geo.pdf`、CC BY 3.0） |
-| Engwirda, D. | — | JIGSAW（C++ の格子生成ライブラリ） | GitHub | <https://github.com/dengwirda/jigsaw> | URL のみ（独自ライセンス。商用システムへの組み込みには作者との取り決めが必要） |
-| Engwirda, D. | — | jigsaw-python（JIGSAW の Python インターフェース） | GitHub | <https://github.com/dengwirda/jigsaw-python> | URL のみ（同上） |
+| Geuzaine, C., Remacle, J.-F. | 2009 | Gmsh: A 3-D finite element mesh generator with built-in pre- and post-processing facilities | Int. J. Numer. Meth. Engng, 79(11), 1309–1331 | [10.1002/nme.2579](https://doi.org/10.1002/nme.2579) | 取得済み（`geuzaine2009_gmsh-preprint.pdf`。gmsh 公式サイトの著者版プレプリント。出版社版は有料） |
+| Geuzaine, C., Remacle, J.-F. | — | Gmsh（格子生成ソフトウェア）4.15.2 | 公式サイト | <https://gmsh.info/> | URL のみ（GPL-2.0-or-later、外部ライブラリとのリンクの例外つき。リポジトリには含めない） |
+| Abdelkader, A., Bajaj, C. L., Ebeida, M. S., Mahmoud, A. H., Mitchell, S. A., Owens, J. D., Rushdi, A. A. | 2018 | Sampling conditions for conforming Voronoi meshing by the VoroCrust algorithm | 34th Int. Symp. Computational Geometry (SoCG 2018), LIPIcs 99, 1:1–1:16 | [10.4230/LIPIcs.SoCG.2018.1](https://doi.org/10.4230/LIPIcs.SoCG.2018.1) | 取得済み（`abdelkader2018_vorocrust-sampling.pdf`、CC BY 3.0。境界の鏡映対の母点の考え方） |
+| Abdelkader, A., Bajaj, C. L., Ebeida, M. S., Mahmoud, A. H., Mitchell, S. A., Owens, J. D., Rushdi, A. A. | 2020 | VoroCrust: Voronoi meshing without clipping | ACM Trans. Graph., 39(3), 1–16 | [10.1145/3337680](https://doi.org/10.1145/3337680) | 要手動入手（ACM。無料公開かは未確認） |
+| Lloyd, S. P. | 1982 | Least squares quantization in PCM | IEEE Trans. Inf. Theory, 28(2), 129–137 | [10.1109/TIT.1982.1056489](https://doi.org/10.1109/TIT.1982.1056489) | 要手動入手（有料） |
+| Du, Q., Faber, V., Gunzburger, M. | 1999 | Centroidal Voronoi tessellations: applications and algorithms | SIAM Review, 41(4), 637–676 | [10.1137/S0036144599352836](https://doi.org/10.1137/S0036144599352836) | 要手動入手（有料） |
+| Hilbert, D. | 1891 | Ueber die stetige Abbildung einer Line auf ein Flächenstück | Mathematische Annalen, 38(3), 459–460 | [10.1007/BF01199431](https://doi.org/10.1007/BF01199431) | 要手動入手（有料） |
+| Bader, M. | 2013 | Space-Filling Curves: An Introduction with Applications in Scientific Computing | Springer, Texts in Computational Science and Engineering, 9 | [10.1007/978-3-642-31046-1](https://doi.org/10.1007/978-3-642-31046-1) | 要手動入手（書籍） |
+| Engwirda, D. | 2017 | JIGSAW-GEO (1.0): locally orthogonal staggered unstructured grid generation for general circulation modelling on the sphere | Geosci. Model Dev., 10(6), 2117–2140 | [10.5194/gmd-10-2117-2017](https://doi.org/10.5194/gmd-10-2117-2017) | 取得済み（`engwirda2017_jigsaw-geo.pdf`、CC BY 3.0。局所直交格子の参考。JIGSAW は ADR-0005 で不採用） |
 
 ## 流砂
 
@@ -88,6 +96,8 @@
 - **平野 (1971)**：交換層モデルの原著は「Armoring をともなう河床低下について」（第195号）です。「拡幅を伴う流路変動について」は 1973 年（第210号）の別の論文で、交換層の原著ではありません。
 - **Rubey (1933)**：沈降速度式の原著を特定しました（American Journal of Science）。
 - **D-Flow FM のマニュアル**：公式の配布ファイルは随時更新される DRAFT 版です。引用するときは版とリビジョンを併記します。
+- **Hilbert (1891)**：題名の綴りは原文どおり「einer Line」です（現代の綴りは Linie）。Crossref と出版社のページも「Line」です。
+- **VoroCrust**：境界の母点の対を円の交点に置く条件を示したのは SoCG 2018 の論文（オープンアクセス）で、アルゴリズム全体は ACM TOG (2020) にまとめられています。
 
 ## 追加候補
 
