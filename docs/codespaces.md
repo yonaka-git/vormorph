@@ -11,7 +11,7 @@ GitHub Codespaces を使うと、手元に何も入れずに、ブラウザだ�
 | ベースイメージ | `mcr.microsoft.com/devcontainers/rust:1-trixie`（Debian 13） |
 | Rust | `rust-toolchain.toml` に従う（stable、rustfmt、clippy） |
 | Python | uv 0.13.7。`tools/` の環境は `uv.lock` から作る（Python 本体も uv が用意する） |
-| gmsh 用の共有ライブラリ | `libglu1-mesa`, `libxft2`, `libxcursor1`, `libxinerama1`, `libgomp1` |
+| gmsh 用の共有ライブラリ | `libgl1`, `libglu1-mesa`, `libxft2`, `libxcursor1`, `libxinerama1`, `libgomp1` |
 | その他 | `tmux`（長い計算用）、SSH サーバー（`gh codespace ssh`・`gh codespace cp` 用） |
 | VS Code の拡張機能 | rust-analyzer, Even Better TOML, Python, Ruff |
 
@@ -32,8 +32,10 @@ uv sync --project tools --locked         # tools/.venv を作る
 ```bash
 cargo test
 cargo run --release -- check examples/sill.toml
-uv run --project tools pytest tools/tests
+uv run --project tools pytest tools/tests -rs
 ```
+
+gmsh を読み込めないと、`tools/tests/test_gmsh.py` は飛ばされ、pytest は成功のまま終わります。`-rs` を付けると、飛ばされたテストとその理由が表示されます。「SKIPPED」の行が出ていなければ、gmsh も使えます。
 
 ### マシンの種類
 
@@ -78,8 +80,11 @@ ParaView での可視化は手元の PC で行います。計算結果は次の�
 
 ```bash
 gh codespace list                                      # codespace の名前を調べる
-gh codespace cp -r -c <名前> remote:/workspaces/vormorph/output/sill ./output/
+gh codespace cp -e -r -c <名前> remote:/workspaces/vormorph/output/sill ./output/
 ```
+
+- `-e` を付けないと、手元の OpenSSH の版によっては、ディレクトリがあっても `No such file or directory` になります（OpenSSH 10.2 で確認）。
+- `-e` を付けると、リモートのパスは codespace のシェルで展開されます。`remote:/workspaces/vormorph/output/sill/*.vtu` のようにワイルドカードも使えます。
 
 Python での後処理（図の作成）は codespace の中でもできます。できた PNG は VS Code のエディターで開いて確認できます。
 
@@ -103,4 +108,4 @@ uv run --project tools python tools/plot_profile.py output/sill/sill_*.vtu -o ou
 
 - `.devcontainer/` を変えたら、コマンドパレットの **Codespaces: Rebuild Container** で作り直します。
 - uv の版は `.devcontainer/Dockerfile` で固定しています。上げるときは、手元の uv と合わせます。
-- gmsh の版を上げて必要な共有ライブラリが変わったら、`Dockerfile` の `apt-get install` の一覧を直します。必要なライブラリは `readelf -d tools/.venv/lib/libgmsh.so.*` で確かめられます。
+- gmsh の版を上げて必要な共有ライブラリが変わったら、`Dockerfile` の `apt-get install` の一覧を直します。足りないライブラリは、codespace の中で `ldd tools/.venv/lib/libgmsh.so.* | grep "not found"` を実行すると分かります。

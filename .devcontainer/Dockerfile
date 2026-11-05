@@ -6,11 +6,14 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-trixie
 
 # gmsh の libgmsh.so が必要とする共有ライブラリ。
-# CI の ubuntu-latest には最初から入っているものも、コンテナでは明示的に入れる。
+# CI の ubuntu-latest には最初から入っているものも、コンテナでは明示的に入れる
+# （Debian 13 の libglu1-mesa は libgl1 を依存として入れない）。
+# 足りないものは `ldd tools/.venv/lib/libgmsh.so.* | grep "not found"` で調べられる。
 # tmux は長い計算をターミナルから切り離して続けるために使う。
 RUN apt-get update \
     && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
+        libgl1 \
         libglu1-mesa \
         libxft2 \
         libxcursor1 \
