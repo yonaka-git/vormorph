@@ -26,11 +26,12 @@ uv run --project tools pytest tools/tests
 | `vormesh/meshfile.py` | 格子ファイル（vormorph mesh 形式 v1、TOML）の書き出しと読み込み |
 | `vormesh/plot.py` | 格子の図（セルを番号で塗り分け、母点を番号順に結ぶ） |
 | `plot_profile.py` | `.vtu` のセルデータ（`x_cell`, `y_cell`, `zb`, `eta`, `h`）から縦断図を描く |
-| `tests/` | pytest のテスト。`test_gmsh.py` は gmsh を読み込めない環境では飛ばす |
+| `tests/` | pytest のテスト。`test_gmsh.py` は gmsh を読み込めない環境では飛ばす（`VORMORPH_REQUIRE_GMSH=1` のときは失敗させる） |
 
 手順と格子ファイルの形式は [docs/design/mesh-generation.md](../docs/design/mesh-generation.md) にあります。格子ファイルの形式は Rust 側の `src/mesh/file.rs` と、セルデータの名前は `src/io.rs` の出力の規約と合わせています。変えるときは両方を直してください。
 
 ## gmsh について
 
 - PyPI の gmsh は、OpenGL と X11 の共有ライブラリを必要とします。Ubuntu では `sudo apt install libglu1-mesa libxft2` で入ります。ないと `import gmsh` が `OSError: libGLU.so.1: cannot open shared object file` で失敗します。
+- gmsh を読み込めないと、`tests/test_gmsh.py` は飛ばされ、pytest は成功のまま終わります。環境変数 `VORMORPH_REQUIRE_GMSH=1` を設定すると、飛ばさずに失敗させます。CI と Codespaces ではこの値を設定しているので、共有ライブラリが足りなければテストが失敗して気づけます。手元で確かめるときは `VORMORPH_REQUIRE_GMSH=1 uv run --project tools pytest tools/tests` のように実行します。
 - gmsh は GPL-2.0-or-later（外部ライブラリとのリンクの例外つき）で配布されています。このリポジトリは gmsh を含まず、配布もしません。

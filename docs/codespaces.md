@@ -32,10 +32,10 @@ uv sync --project tools --locked         # tools/.venv を作る
 ```bash
 cargo test
 cargo run --release -- check examples/sill.toml
-uv run --project tools pytest tools/tests -rs
+uv run --project tools pytest tools/tests
 ```
 
-gmsh を読み込めないと、`tools/tests/test_gmsh.py` は飛ばされ、pytest は成功のまま終わります。`-rs` を付けると、飛ばされたテストとその理由が表示されます。「SKIPPED」の行が出ていなければ、gmsh も使えます。
+Codespaces では環境変数 `VORMORPH_REQUIRE_GMSH=1` を設定しています。gmsh を読み込めないときは、`tools/tests/test_gmsh.py` を飛ばさずに失敗させるので、pytest が通れば gmsh も使えます。
 
 ### マシンの種類
 

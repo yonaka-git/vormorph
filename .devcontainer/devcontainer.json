@@ -14,7 +14,9 @@
     // Codespaces では uv のキャッシュ（ホーム）と .venv（/workspaces）が別のファイルシステムに
     // あり、ハードリンクできないという警告が出るため、最初からコピーにする
     "UV_LINK_MODE": "copy",
-    "CARGO_TERM_COLOR": "always"
+    "CARGO_TERM_COLOR": "always",
+    // gmsh を読み込めないとき、tools/tests/test_gmsh.py を飛ばさずに失敗させる
+    "VORMORPH_REQUIRE_GMSH": "1"
   },
   // ツールチェーンと依存を入れ、リリースビルドまで済ませておく
   "postCreateCommand": "rustup toolchain install && cargo build --release --locked && uv sync --project tools --locked",

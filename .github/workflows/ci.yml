@@ -62,6 +62,9 @@ jobs:
   tools:
     name: tools (pytest)
     runs-on: ubuntu-latest
+    env:
+      # gmsh を読み込めないとき、test_gmsh.py を飛ばさずに失敗させる
+      VORMORPH_REQUIRE_GMSH: "1"
     steps:
       - uses: actions/checkout@v5
       - name: Install shared libraries for gmsh

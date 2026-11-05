@@ -1,6 +1,11 @@
-"""gmsh を使う格子生成の全体の流れ。gmsh を読み込めない環境では飛ばす。"""
+"""gmsh を使う格子生成の全体の流れ。
+
+gmsh を読み込めない環境では飛ばす。ただし環境変数 `VORMORPH_REQUIRE_GMSH=1` のとき
+（CI と Codespaces）は、共有ライブラリの不足に気づけるように、飛ばさずに失敗させる。
+"""
 
 import dataclasses
+import os
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +14,8 @@ import pytest
 try:
     import gmsh  # noqa: F401
 except (ImportError, OSError) as err:  # 共有ライブラリ（libGLU など）がないと OSError になる
+    if os.environ.get("VORMORPH_REQUIRE_GMSH") == "1":
+        pytest.fail(f"gmsh is required (VORMORPH_REQUIRE_GMSH=1) but not available: {err}", pytrace=False)
     pytest.skip(f"gmsh is not available: {err}", allow_module_level=True)
 
 from vormesh import Domain, generate, meshfile
