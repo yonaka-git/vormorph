@@ -249,7 +249,7 @@ vormorph/
 
 ## 作者
 
-&lt;氏名&gt; — GitHub: [@yonaka-git](https://github.com/yonaka-git)
+yonaka — GitHub: [@yonaka-git](https://github.com/yonaka-git)
 
 ## ライセンス
 
