@@ -27,6 +27,7 @@
 - 検証ケース V01（格子幾何）を実装。面積・直交誤差・閉合誤差がいずれも $10^{-12}$ 以下であることを、正方形配置と六角形配置で確かめる。結果は `docs/verification.md` に記録
 - Perot 法によるセル中心の流速の再構成 `hydro::reconstruct_cell_velocity`
 - 検証ケース V02（Perot 再構成）を実装。一様流で、直線水路の2つの配置と格子生成ツールの島の格子の全セル（境界セルを含む）が $10^{-12}$ m/s 以内で一致することを確かめる
+- VTK 出力 `io::VtkWriter`：時刻ごとの VTK XML UnstructuredGrid（`.vtu`、ASCII）と ParaView Data（`.pvd`）。各 `.vtu` に時刻（`TimeValue`）も書く。浮動小数点数は読み戻すと同じ値になる最短の10進表記で書き、NaN・無限大や配列の長さの不一致は書き出さずに誤りにする。濃度 `c` の出力に使う `dry_depth` を `VtkWriter::new` の引数に追加。読み戻して確かめるテスト `tests/vtk_output.rs`（meshio と `tools/plot_profile.py` でも読めることを確認済み）
 - 格子生成ツールの出力を Rust 側で読み、面積・辺の共有・直交性・境界の母点の位置・番号の局所性を確かめるテスト `tests/mesh_file.rs`（データは `tests/data/island_coarse.mesh.toml`）。Rust 側で組み立てた接続配列と幾何量（境界辺の数、オイラー標数、`check_geometry` の結果）も確かめる
 - 設計文書 `docs/design/mesh-generation.md` と ADR-0005（格子生成は gmsh を使った自作ツールで行い、セルをヒルベルト曲線の順に並べる）
 - CI：fmt・clippy・test（ubuntu・windows）、MSRV の check、`cargo doc`、`tools/` の pytest
