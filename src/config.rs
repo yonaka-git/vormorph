@@ -96,10 +96,10 @@ pub enum MeshConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelLayout {
-    /// 母点を三角格子状に置く。内部のセルは正六角形になる。
+    /// 母点を三角格子状に置く。内部のセルはほぼ正六角形になる（[`crate::mesh::channel`]）。
     #[default]
     Hexagonal,
-    /// 母点を正方格子状に置く。セルは正方形になる。
+    /// 母点を正方格子状に置く。セルはほぼ正方形の長方形になる。
     Rectangular,
 }
 

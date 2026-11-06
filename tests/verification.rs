@@ -24,17 +24,30 @@ fn channel_mesh(layout: ChannelLayout, cell_size: f64) -> Mesh {
         cell_size,
         layout,
     })
+    .expect("the verification channel must be a valid mesh")
 }
 
 /// V01 格子幾何：総面積、直交誤差、各セルが閉じていること。
+///
+/// 結果の値は `cargo test --test verification v01 -- --nocapture` で表示される
+/// （`docs/verification.md` の記録に使う）。
 #[test]
-#[ignore = "未実装: mesh::channel::build, Mesh::check_geometry"]
 fn v01_mesh_geometry() {
     for layout in LAYOUTS {
-        let report = channel_mesh(layout, 2.0).check_geometry();
+        let mesh = channel_mesh(layout, 2.0);
+        let report = mesh.check_geometry();
         let exact_area = 200.0 * 20.0;
+        let area_error = (report.total_area - exact_area).abs() / exact_area;
+        println!(
+            "V01 {layout:?}: {} cells, {} edges, area error {area_error:.1e}, \
+             orthogonality {:.1e}, closure {:.1e}",
+            mesh.n_cells(),
+            mesh.n_edges(),
+            report.max_orthogonality_error,
+            report.max_closure_error
+        );
         assert!(
-            (report.total_area - exact_area).abs() <= 1e-12 * exact_area,
+            area_error <= 1e-12,
             "{layout:?}: total area {} != {exact_area}",
             report.total_area
         );
