@@ -938,6 +938,61 @@ mod tests {
         (mesh, e)
     }
 
+    /// 直線水路の側壁ぎわのセルで、一次の流速場の Perot 法の再構成の誤差が小さいこと。
+    ///
+    /// 側壁は最も外側の行の母点と鏡映点の二等分線なので、側壁ぎわのセルでも母点は重心の近くに
+    /// ある。正方形配置は、母点が長方形のセルの中心なので厳密になる。六角形配置の上下流端の近くの
+    /// セルは、端まで広がった多角形になるので除く（`mesh::channel`）。
+    #[test]
+    fn perot_reconstruction_of_linear_fields_is_accurate_at_side_walls() {
+        let fields: [fn(f64, f64) -> [f64; 2]; 4] = [
+            |x, _| [0.2 * x, 0.0],
+            |_, y| [0.2 * y, 0.0],
+            |x, y| [-0.2 * y, 0.2 * x],
+            |x, y| [0.2 * x, -0.2 * y],
+        ];
+        let (length, h) = (10.0, 0.25);
+        for layout in [ChannelLayout::Rectangular, ChannelLayout::Hexagonal] {
+            let mesh = mesh(length, 2.0, h, layout);
+            let away_from_ends = |c: usize| (2.0 * h..=length - 2.0 * h).contains(&mesh.x_cell[c]);
+            let at_wall = |c: usize| {
+                mesh.edges_on_cell[c]
+                    .iter()
+                    .any(|&e| mesh.is_boundary_edge(e))
+            };
+            for field in fields {
+                let u_n: Vec<f64> = (0..mesh.n_edges())
+                    .map(|e| {
+                        let [u, v] = field(mesh.x_edge[e], mesh.y_edge[e]);
+                        u * mesh.normal_edge[e][0] + v * mesh.normal_edge[e][1]
+                    })
+                    .collect();
+                let mut u_cell = vec![[0.0; 2]; mesh.n_cells()];
+                reconstruct_cell_velocity(&mesh, &u_n, &mut u_cell);
+                // 母点での厳密な値との差 / 1セル分の流速の変化 0.2h
+                let error = |c: usize| {
+                    let [u, v] = field(mesh.x_cell[c], mesh.y_cell[c]);
+                    (u_cell[c][0] - u).hypot(u_cell[c][1] - v) / (0.2 * h)
+                };
+                let max_of = |wall: bool| {
+                    (0..mesh.n_cells())
+                        .filter(|&c| away_from_ends(c) && at_wall(c) == wall)
+                        .map(error)
+                        .fold(0.0, f64::max)
+                };
+                let (interior, wall) = (max_of(false), max_of(true));
+                // 内部の六角形は母点について対称なので厳密。側壁ぎわの五角形は母点が重心から
+                // わずかにずれ（約 0.005h）、誤差は 0.06 程度
+                let wall_limit = match layout {
+                    ChannelLayout::Rectangular => 1e-12,
+                    ChannelLayout::Hexagonal => 0.1,
+                };
+                assert!(interior < 1e-12, "{layout:?}: interior error {interior}");
+                assert!(wall < wall_limit, "{layout:?}: wall error {wall}");
+            }
+        }
+    }
+
     #[test]
     fn edge_depth_uses_the_upwind_level_and_the_higher_bed() {
         let (mesh, e) = two_cells();

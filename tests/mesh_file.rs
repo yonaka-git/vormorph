@@ -12,9 +12,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use vormorph::hydro;
 use vormorph::mesh::file::{self, CellOrder, MeshFile};
-use vormorph::mesh::voronoi::PolygonMesh;
-use vormorph::mesh::{EdgeKind, NONE};
+use vormorph::mesh::voronoi::{self, PolygonMesh};
+use vormorph::mesh::{EdgeKind, Mesh, NONE};
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/island_coarse.mesh.toml")
@@ -214,4 +215,134 @@ fn rust_builds_connectivity_and_geometry() {
         "closure error {:e}",
         report.max_closure_error
     );
+}
+
+/// 格子を平面直角座標の桁（10⁵ m）だけ平行移動して組み立てても、幾何量が座標の丸めの範囲で
+/// 変わらないこと。面積は母点を原点にし、ほかの量は座標の差から計算しているため
+/// （`mesh::voronoi::compute_geometry`）。
+#[test]
+fn geometry_does_not_depend_on_the_coordinate_origin() {
+    const SHIFT: f64 = 1.0e5;
+    // 平行移動した座標の丸め（10⁵ m で約 1.5e-11 m）の数十倍 [m]
+    const TOL: f64 = 1e-9;
+    let polygons = load().to_polygons();
+    let mut moved = polygons.clone();
+    for coords in [
+        &mut moved.x_cell,
+        &mut moved.y_cell,
+        &mut moved.x_vertex,
+        &mut moved.y_vertex,
+    ] {
+        coords.iter_mut().for_each(|x| *x += SHIFT);
+    }
+    let near = voronoi::build(&polygons).expect("the fixture must build");
+    let far = voronoi::build(&moved).expect("the translated fixture must build");
+
+    for c in 0..near.n_cells() {
+        let (a, b) = (far.area_cell[c], near.area_cell[c]);
+        assert!((a - b).abs() <= TOL * b.sqrt(), "cell {c}: area {a} != {b}");
+    }
+    for e in 0..near.n_edges() {
+        let close = |a: f64, b: f64| (a - b).abs() <= TOL;
+        assert!(close(far.dv_edge[e], near.dv_edge[e]), "edge {e}: dv_edge");
+        assert!(close(far.dc_edge[e], near.dc_edge[e]), "edge {e}: dc_edge");
+        assert!(
+            close(far.x_edge[e] - SHIFT, near.x_edge[e]),
+            "edge {e}: x_edge"
+        );
+        assert!(
+            close(far.y_edge[e] - SHIFT, near.y_edge[e]),
+            "edge {e}: y_edge"
+        );
+        // 法線は短い辺ほど丸めの影響を受けるので、長さを掛けた L n で比べる
+        for k in 0..2 {
+            let (a, b) = (
+                far.dv_edge[e] * far.normal_edge[e][k],
+                near.dv_edge[e] * near.normal_edge[e][k],
+            );
+            assert!(close(a, b), "edge {e}: normal_edge");
+        }
+    }
+    let report = far.check_geometry();
+    assert!(
+        report.max_orthogonality_error < 1e-9,
+        "orthogonality error {:e}",
+        report.max_orthogonality_error
+    );
+    assert!(report.max_closure_error < 1e-12);
+}
+
+/// 位置 (x, y) \[m\] での流速 (u, v) \[m/s\]。
+type Field = fn(f64, f64) -> [f64; 2];
+
+/// 一次の流速場（勾配の成分は ±0.2 1/s または 0）。
+const LINEAR_FIELDS: [(&str, Field); 4] = [
+    ("u = 0.2x", |x, _| [0.2 * x, 0.0]),
+    ("u = 0.2y", |_, y| [0.2 * y, 0.0]),
+    ("rotation", |x, y| [-0.2 * y, 0.2 * x]),
+    ("acceleration", |x, y| [0.2 * x, -0.2 * y]),
+];
+
+/// 一次の流速場 `field` の法線成分を辺の中点で与え、Perot 法で再構成したセルの流速と、母点での
+/// 厳密な値との差を、1セル分の流速の変化 0.2h で割った値（セルごと）。
+fn perot_errors(mesh: &Mesh, field: Field, h: f64) -> Vec<f64> {
+    let u_n: Vec<f64> = (0..mesh.n_edges())
+        .map(|e| {
+            let [u, v] = field(mesh.x_edge[e], mesh.y_edge[e]);
+            let [nx, ny] = mesh.normal_edge[e];
+            u * nx + v * ny
+        })
+        .collect();
+    let mut u_cell = vec![[0.0; 2]; mesh.n_cells()];
+    hydro::reconstruct_cell_velocity(mesh, &u_n, &mut u_cell);
+    (0..mesh.n_cells())
+        .map(|c| {
+            let [u, v] = field(mesh.x_cell[c], mesh.y_cell[c]);
+            (u_cell[c][0] - u).hypot(u_cell[c][1] - v) / (0.2 * h)
+        })
+        .collect()
+}
+
+/// 格子生成ツールの格子で、壁ぎわのセルの Perot 法の精度が内部のセルと大きく変わらないこと。
+///
+/// 境界の母点は境界から約 0.43h の位置にあり、壁はその母点と鏡映点の二等分線なので、壁ぎわの
+/// セルでも母点は重心の近くにある（ずれは格子幅 0.5 m の同じ領域で最大 0.06h）。例外は外周の
+/// 凸な角に接するセルで、ずれが約 0.2h あり、誤差が大きいので除く
+/// （`docs/design/mesh-generation.md` の第8節）。
+#[test]
+fn perot_reconstruction_is_accurate_at_walls() {
+    let file = load();
+    let mesh = file::read(&fixture()).expect("the fixture must build into a mesh");
+    let h = meta_f64(&file, "cell_size");
+    // examples/domains/island.toml の外周の角
+    let corners = [[0.0, 0.0], [60.0, 0.0], [60.0, 30.0], [0.0, 30.0]];
+    let at_corner = |c: usize| {
+        mesh.vertices_on_cell[c].iter().any(|&v| {
+            corners
+                .iter()
+                .any(|p| (mesh.x_vertex[v] - p[0]).hypot(mesh.y_vertex[v] - p[1]) < 1e-9)
+        })
+    };
+    let at_wall = |c: usize| {
+        mesh.edges_on_cell[c]
+            .iter()
+            .any(|&e| mesh.is_boundary_edge(e))
+    };
+    for (name, field) in LINEAR_FIELDS {
+        let errors = perot_errors(&mesh, field, h);
+        let max_of = |keep: &dyn Fn(usize) -> bool| {
+            (0..mesh.n_cells())
+                .filter(|&c| keep(c))
+                .map(|c| errors[c])
+                .fold(0.0, f64::max)
+        };
+        let interior = max_of(&|c| !at_wall(c));
+        let wall = max_of(&|c| at_wall(c) && !at_corner(c));
+        let corner = max_of(&|c| at_corner(c));
+        println!(
+            "{name}: max error / (0.2 h) {interior:.3} (interior), {wall:.3} (walls), {corner:.3} (corners)"
+        );
+        assert!(interior < 0.1, "{name}: interior error {interior}");
+        assert!(wall < 0.15, "{name}: wall error {wall}");
+    }
 }

@@ -28,26 +28,48 @@ def boundary_length(mesh, kind):
     return sum(np.hypot(vx[b] - vx[a], vy[b] - vy[a]) for a, b in mesh.boundary[kind])
 
 
-def test_channel_with_a_circular_island():
-    domain = Domain.from_dict(
+def channel_with_island(x0=0.0, y0=0.0):
+    """長さ 30 m・幅 12 m の水路の中央に半径 2.5 m の円形の島がある領域（左下が (x0, y0)）。"""
+
+    def p(x, y):
+        return [x0 + x, y0 + y]
+
+    return Domain.from_dict(
         {
             "title": "channel-island",
             "cell_size": 1.0,
             "outer": [
-                {"kind": "wall", "line": [[0.0, 0.0], [30.0, 0.0]]},
-                {"kind": "downstream", "line": [[30.0, 0.0], [30.0, 12.0]]},
-                {"kind": "wall", "line": [[30.0, 12.0], [0.0, 12.0]]},
-                {"kind": "upstream", "line": [[0.0, 12.0], [0.0, 0.0]]},
+                {"kind": "wall", "line": [p(0.0, 0.0), p(30.0, 0.0)]},
+                {"kind": "downstream", "line": [p(30.0, 0.0), p(30.0, 12.0)]},
+                {"kind": "wall", "line": [p(30.0, 12.0), p(0.0, 12.0)]},
+                {"kind": "upstream", "line": [p(0.0, 12.0), p(0.0, 0.0)]},
             ],
-            "holes": [{"circle": {"center": [15.0, 6.0], "radius": 2.5}}],
+            "holes": [{"circle": {"center": p(15.0, 6.0), "radius": 2.5}}],
         }
     )
-    q = generate(domain).quality
+
+
+def test_channel_with_a_circular_island():
+    q = generate(channel_with_island()).quality
     assert q.max_orthogonality_error < 1e-10
     assert q.area_error < 1e-12
     # 円の島は折れ線で近似されるので、面積は少しだけ大きい
     assert q.domain_area == pytest.approx(30.0 * 12.0 - np.pi * 2.5**2, rel=5e-3)
     assert q.n_cells == pytest.approx(q.domain_area / (np.sqrt(3) / 2), rel=0.02)
+
+
+def test_domain_far_from_the_origin():
+    # 平面直角座標の桁（10⁵ m）に置いた領域でも、原点の近くと同じ品質の格子ができる。gmsh の
+    # 分割は平行移動でわずかに変わるので、格子そのものは比べない
+    near = generate(channel_with_island()).quality
+    far_result = generate(channel_with_island(1.0e5, 1.0e5))
+    far = far_result.quality
+    assert far.max_orthogonality_error < 1e-10
+    assert far.area_error < 1e-12
+    assert far.domain_area == pytest.approx(near.domain_area, rel=1e-9)
+    assert far.n_cells == pytest.approx(near.n_cells, rel=0.02)
+    assert far.max_centroid_offset < 0.05 and near.max_centroid_offset < 0.05
+    assert far_result.mesh.x_vertex.min() == pytest.approx(1.0e5, abs=1e-9)
 
 
 def test_open_boundaries_have_the_given_lengths():
