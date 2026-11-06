@@ -8,6 +8,10 @@
 //!   非侵食層（z_ne = 初期の z_b）とする。母点が `x_start`・`x_end` にちょうど乗る場合に
 //!   丸め誤差で分かれないよう、比較には格子幅の 10⁻⁹ 倍の許容差をつける。初期状態は
 //!   乾いた河床（η = z_b、u = 0）で、水は境界から入る。
+//! - 周期境界（`[boundary.upstream] kind = "periodic"`）では、上流端と下流端をつないだ格子
+//!   （[`channel::build_periodic`]）を作る。河床高と水位は `[bed] slope` の勾配 I を除いた値で
+//!   持つので、初期の河床高は一様に `z_downstream` で、初期状態は流量 `discharge` の等流
+//!   （水深 h_n = (n q / √I)^{3/5}、q = Q / W、辺の流速 (q / h_n) n_x）にする（ADR-0014）。
 //! - [`Model::with_state`]：格子と初期状態を外から与える（検証ケースで任意の地形を使うため）。
 //!
 //! ## 1ステップの流れ
@@ -278,7 +282,8 @@ impl Model {
     ///
     /// `mesh.kind = "channel"` のとき、直線水路の格子を作り、`[bed]` と `[[structures]]` から
     /// 初期河床と非侵食層を決める（モジュールの説明の「モデルの組み立て」）。初期状態は乾いた
-    /// 河床（η = z_b、u = 0）。
+    /// 河床（η = z_b、u = 0）。周期境界では、周期的な格子と、`discharge` の等流の初期状態を作る
+    /// （流量・勾配・粗度係数が正でなければ [`ModelError::Setup`]）。
     ///
     /// `mesh.kind = "file"` は、格子ファイルにセルの河床高がないので、まだ使えない
     /// （[`ModelError::Setup`]。[`Model::with_state`] で状態を与える）。
@@ -291,17 +296,25 @@ impl Model {
                 cell_size,
                 layout,
             } => {
-                let mesh = channel::build(&ChannelSpec {
+                let spec = ChannelSpec {
                     length: *length,
                     width: *width,
                     cell_size: *cell_size,
                     layout: *layout,
-                })?;
+                };
                 let bed = config.bed.as_ref().ok_or_else(|| {
                     ModelError::Setup("[bed] is required when mesh.kind = \"channel\"".to_owned())
                 })?;
-                let state = channel_state(&mesh, *length, *cell_size, bed, &config.structures);
-                (mesh, state)
+                if let UpstreamBoundary::Periodic { discharge } = config.boundary.upstream {
+                    let mesh = channel::build_periodic(&spec)?;
+                    let state =
+                        periodic_state(&mesh, *width, bed, discharge, config.hydro.manning_n)?;
+                    (mesh, state)
+                } else {
+                    let mesh = channel::build(&spec)?;
+                    let state = channel_state(&mesh, *length, *cell_size, bed, &config.structures);
+                    (mesh, state)
+                }
             }
             MeshConfig::File { path } => {
                 return Err(ModelError::Setup(format!(
@@ -315,15 +328,17 @@ impl Model {
 
     /// 格子と初期状態を外から与えて組み立てる（検証ケースで任意の地形を与えるため）。
     ///
-    /// 設定の `[mesh]`、`[bed]`、`[[structures]]` は使わない。状態は次のように整える。
+    /// 設定の `[mesh]`、`[[structures]]` は使わない。`[bed]` は、周期境界の体積力の勾配
+    /// （`slope`）にだけ使う。状態は次のように整える。
     ///
     /// - η < z_b のセルは η = z_b にする（乾いたセル。水の体積は変わらない）。
     /// - 壁の辺（上流端・下流端が壁の設定なら、その辺も）の u_n を 0 にする。
     /// - `u_cell` を `u_n` から Perot 法で再構成する。
     ///
     /// 配列の長さが格子と合わないとき、流量境界なのに上流端の辺がないとき、水位・水深境界
-    /// なのに下流端の辺がないとき、まだ実装していない浮遊砂（`[sediment.suspended]`）を含む
-    /// ときは [`ModelError::Setup`] を返す。
+    /// なのに下流端の辺がないとき、周期境界と周期的な格子（[`Mesh::is_periodic`]）が対応して
+    /// いないとき、まだ実装していない浮遊砂（`[sediment.suspended]`）を含むときは
+    /// [`ModelError::Setup`] を返す。
     pub fn with_state(config: Config, mesh: Mesh, mut state: State) -> Result<Self, ModelError> {
         config.validate()?;
         check_setup(&config, &mesh, &state)?;
@@ -590,10 +605,26 @@ fn check_setup(config: &Config, mesh: &Mesh, state: &State) -> Result<(), ModelE
     {
         problems.push("a discharge boundary needs upstream edges in the mesh".to_owned());
     }
-    if !matches!(config.boundary.downstream, DownstreamBoundary::Wall) && !has(EdgeKind::Downstream)
+    if matches!(
+        config.boundary.downstream,
+        DownstreamBoundary::WaterLevel { .. } | DownstreamBoundary::Depth { .. }
+    ) && !has(EdgeKind::Downstream)
     {
         problems
             .push("a water level or depth boundary needs downstream edges in the mesh".to_owned());
+    }
+    match (config.boundary.is_periodic(), mesh.is_periodic()) {
+        (true, false) => problems.push(
+            "periodic boundaries need a periodic mesh (mesh::channel::build_periodic)".to_owned(),
+        ),
+        (false, true) => problems.push(
+            "a periodic mesh needs kind = \"periodic\" at both the upstream and the downstream end"
+                .to_owned(),
+        ),
+        (true, true) if has(EdgeKind::Upstream) || has(EdgeKind::Downstream) => {
+            problems.push("a periodic mesh must not have upstream or downstream edges".to_owned())
+        }
+        _ => {}
     }
     if config
         .sediment
@@ -648,6 +679,33 @@ fn channel_state(
         }
     }
     state
+}
+
+/// 周期的な直線水路の初期状態：河床高は一様に `z_downstream`（勾配を除いた値）、流量
+/// `discharge` の等流（水深 h_n = (n q / √I)^{3/5}、q = Q / W、辺の流速 (q / h_n) n_x）。
+fn periodic_state(
+    mesh: &Mesh,
+    width: f64,
+    bed: &BedConfig,
+    discharge: f64,
+    manning_n: f64,
+) -> Result<State, ModelError> {
+    if !(discharge > 0.0 && bed.slope > 0.0 && manning_n > 0.0) {
+        return Err(ModelError::Setup(format!(
+            "periodic boundaries need discharge > 0, bed.slope > 0 and hydro.manning_n > 0 for the initial uniform flow (got {discharge}, {}, {manning_n})",
+            bed.slope
+        )));
+    }
+    let q = discharge / width;
+    let depth = (manning_n * q / bed.slope.sqrt()).powf(0.6);
+    let velocity = q / depth;
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    state.zb.fill(bed.z_downstream);
+    state.eta.fill(bed.z_downstream + depth);
+    for (u, n) in state.u_n.iter_mut().zip(&mesh.normal_edge) {
+        *u = velocity * n[0];
+    }
+    Ok(state)
 }
 
 /// 水の体積 Σ A_i max(η_i − z_{b,i}, 0) \[m³\]。
@@ -905,6 +963,189 @@ height = 1.0
             matches!(&err, ModelError::Setup(m) if m.contains("suspended sediment is not implemented")),
             "{err}"
         );
+    }
+
+    /// 周期的な直線水路（延長 20 m、幅 4 m、格子幅 1 m、勾配 1/500、単位幅流量 0.5 m²/s）の設定。
+    fn periodic_config(name: &str, layout: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("vormorph-{name}-{}", std::process::id()));
+        format!(
+            r#"
+title = "{name}"
+[mesh]
+kind = "channel"
+length = 20.0
+width = 4.0
+cell_size = 1.0
+layout = "{layout}"
+[bed]
+slope = 0.002
+z_downstream = 0.3
+[time]
+courant = 0.5
+dt_max = 1.0
+end = 60.0
+[hydro]
+theta = 0.55
+manning_n = 0.025
+[boundary.upstream]
+kind = "periodic"
+discharge = 2.0
+[boundary.downstream]
+kind = "periodic"
+[output]
+dir = {dir:?}
+interval = 1000.0
+"#
+        )
+        .parse()
+        .expect("valid periodic config")
+    }
+
+    /// 周期境界の初期状態は等流で、体積力と摩擦が釣り合うので、移動床でもそのまま保たれる
+    /// （開境界がないので、六角形配置でも上流端の流量の配分による偏りが生じない）。
+    #[test]
+    fn periodic_channel_starts_from_uniform_flow_and_stays_there() {
+        for layout in ["rectangular", "hexagonal"] {
+            let mut config = periodic_config("periodic", layout);
+            config.sediment = Some(sill_sediment());
+            let mut model = Model::new(config).expect("the periodic channel must build");
+            let (mesh, state) = (model.mesh(), model.state());
+            assert!(mesh.is_periodic(), "{layout}");
+            assert!(!mesh.edge_kind.contains(&EdgeKind::Upstream), "{layout}");
+            let h_n = (0.025_f64 * 0.5 / 0.002_f64.sqrt()).powf(0.6);
+            assert!(state.zb.iter().all(|&z| z == 0.3), "{layout}");
+            assert!(
+                (0..mesh.n_cells()).all(|c| (state.depth(c) - h_n).abs() < 1e-15),
+                "{layout}"
+            );
+            let (zb0, eta0, u0) = (state.zb.clone(), state.eta.clone(), state.u_n.clone());
+            let speed = 0.5 / h_n;
+            assert!(
+                state
+                    .u_cell
+                    .iter()
+                    .all(|u| (u[0] - speed).abs() < 1e-12 && u[1].abs() < 1e-12),
+                "{layout}: Perot must be exact across the seam"
+            );
+
+            while !model.finished() {
+                model.step().expect("the step must succeed");
+            }
+            let state = model.state();
+            let max_diff = |a: &[f64], b: &[f64]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f64::max)
+            };
+            assert!(max_diff(&state.zb, &zb0) <= 1e-12, "{layout}: bed");
+            assert!(
+                max_diff(&state.eta, &eta0) <= 1e-12,
+                "{layout}: water level"
+            );
+            assert!(max_diff(&state.u_n, &u0) <= 1e-12, "{layout}: velocity");
+            let water = model.water_balance();
+            assert_eq!((water.inflow, water.outflow), (0.0, 0.0), "{layout}");
+            assert!(
+                water.error().abs() <= 1e-12 * water.initial_volume,
+                "{layout}"
+            );
+            let sediment = model.sediment_balance();
+            assert_eq!((sediment.inflow, sediment.outflow), (0.0, 0.0), "{layout}");
+            assert!(sediment.error().abs() <= 1e-12, "{layout}: {sediment:?}");
+        }
+    }
+
+    #[test]
+    fn periodic_boundaries_and_meshes_must_match() {
+        // 周期境界の設定に、周期的でない格子
+        let mesh = basin();
+        let state = State::new(mesh.n_cells(), mesh.n_edges());
+        let periodic = periodic_config("mismatch", "rectangular");
+        let err = Model::with_state(periodic, mesh, state).unwrap_err();
+        assert!(err.to_string().contains("need a periodic mesh"), "{err}");
+
+        // 周期的な格子に、周期境界でない設定
+        let mesh = channel::build_periodic(&ChannelSpec {
+            length: 4.0,
+            width: 2.0,
+            cell_size: 1.0,
+            layout: ChannelLayout::Rectangular,
+        })
+        .expect("valid periodic channel");
+        let state = State::new(mesh.n_cells(), mesh.n_edges());
+        let err = Model::with_state(config(WALL, WALL), mesh, state).unwrap_err();
+        assert!(err.to_string().contains("a periodic mesh needs"), "{err}");
+
+        // 初期の等流を作れない
+        let mut no_flow = periodic_config("no-flow", "rectangular");
+        let UpstreamBoundary::Periodic { discharge } = &mut no_flow.boundary.upstream else {
+            unreachable!("the config is periodic")
+        };
+        *discharge = 0.0;
+        let err = Model::new(no_flow).unwrap_err();
+        assert!(err.to_string().contains("discharge > 0"), "{err}");
+    }
+
+    #[test]
+    fn periodic_boundaries_are_validated() {
+        let text = |upstream: &str, downstream: &str, extra: &str| {
+            format!(
+                r#"
+title = "periodic"
+[mesh]
+kind = "channel"
+length = 20.0
+width = 4.0
+cell_size = 1.0
+{extra}
+[time]
+dt = 0.5
+end = 10.0
+[hydro]
+theta = 0.55
+manning_n = 0.025
+[boundary.upstream]
+{upstream}
+[boundary.downstream]
+{downstream}
+[output]
+dir = "unused"
+interval = 10.0
+"#
+            )
+        };
+        let periodic = "kind = \"periodic\"\ndischarge = 2.0";
+        let bed = "[bed]\nslope = 0.002";
+        let invalid = |t: String, needle: &str| {
+            let err = t
+                .parse::<Config>()
+                .expect_err("the config must be rejected");
+            assert!(err.to_string().contains(needle), "{err}");
+        };
+        invalid(
+            text(periodic, "kind = \"wall\"", bed),
+            "must be given at both the upstream and the downstream end",
+        );
+        invalid(
+            text(WALL, "kind = \"periodic\"", bed),
+            "must be given at both the upstream and the downstream end",
+        );
+        invalid(
+            text(periodic, "kind = \"periodic\"", ""),
+            "[bed] is required",
+        );
+        invalid(
+            text(periodic, "kind = \"periodic\"", &format!("{bed}\n{SILL}")),
+            "structures cannot be used with periodic boundaries",
+        );
+        let config: Config = text(periodic, "kind = \"periodic\"", bed)
+            .parse()
+            .expect("valid periodic config");
+        assert!(config.boundary.is_periodic());
+        let summary = config.summary().to_string();
+        assert!(summary.contains("upstream   : periodic"), "{summary}");
+        assert!(summary.contains("downstream : periodic"), "{summary}");
     }
 
     /// `examples/sill.toml` の流砂の設定（掃流砂だけ）。

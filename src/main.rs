@@ -102,7 +102,8 @@ fn run(path: &str) -> ExitCode {
 }
 
 /// 進み具合の1行：時刻、ステップ数、時間刻み、クーラン数、反復回数、水の収支の誤差。
-/// 河床変動を計算したときは、1ステップの河床の変化の最大値と土砂の収支の誤差も加える。
+/// 河床変動を計算したときは、1ステップの河床の変化の最大値と土砂の収支の誤差（給砂量・
+/// 流出量に対する比。どちらもなければ体積 \[m³\]）も加える。
 fn progress_line(model: &Model, progress: &Progress) -> String {
     let dt = match model.time_step() {
         TimeStep::Fixed { dt } => format!("dt {dt} s"),
@@ -129,12 +130,17 @@ fn progress_line(model: &Model, progress: &Progress) -> String {
     }
     if progress.morphology_steps > 0 {
         let sediment = model.sediment_balance();
-        let scale =
-            (sediment.inflow + sediment.outflow + sediment.bed_change.abs()).max(f64::MIN_POSITIVE);
+        // 給砂も流出もない（周期境界や閉じた水域）ときは、土砂の総量が保たれるはずなので、
+        // 誤差を体積 [m³] で示す（比の分母が丸め誤差の大きさになるため）
+        let balance = if sediment.inflow + sediment.outflow > 0.0 {
+            let scale = sediment.inflow + sediment.outflow + sediment.bed_change.abs();
+            format!("{:.1e}", sediment.error() / scale)
+        } else {
+            format!("{:.1e} m^3", sediment.error())
+        };
         line.push_str(&format!(
-            " | bed change <= {:.2e} m/step | sediment balance {:.1e}",
+            " | bed change <= {:.2e} m/step | sediment balance {balance}",
             progress.max_bed_change,
-            sediment.error() / scale
         ));
         if progress.unconverged_avalanches > 0 {
             line.push_str(&format!(

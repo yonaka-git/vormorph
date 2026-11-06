@@ -74,4 +74,6 @@
 - 検証ケース V11 を「床止め下流の局所洗掘」から「河床のこぶの移動」（`v11_bump_migration`）に変更・実装。床止めの直下の洗掘孔は1セルにだけでき、格子を細かくしても収束しなかったため（作者と相談して変更。調査の記録は `docs/verification.md`）。高さ 0.1 m のこぶの縦断形の差が格子幅 1・0.5・0.25 m で 0.109 → 0.079 m² と減り、高さ 0.02 m のこぶの山の移動速度が線形理論と −1.0% で一致。図 `docs/images/v11_bump_migration.png` と `tools/plot_verification.py v11`
 - 格子生成ツールの格子の凸な角に接するセルの河床変動を確かめるテスト `tests/corner_cells.rs`（加速する流れで、角のセルの偏りは内部・壁ぎわと同じ程度）。結果を `docs/design/mesh-generation.md` の第8節に記録
 - 床止めの例題の河床変動量の平面図と縦断図を描く `tools/plot_sill.py`（pytest のテストつき）。README の冒頭の図 `docs/images/hero.png` を、模式図から `examples/sill.toml` の計算結果に差し替え
+- 直線水路の周期境界（ADR-0014）：`mesh::channel::build_periodic` で上流端と下流端をつないだ周期的な水路の格子を作る（六角形配置は x 方向に周期的な三角格子にして、継ぎ目のセルも内部と同じ六角形にする）。`mesh::voronoi::connect_periodic`（平行移動で重なる上流端と下流端の辺を内部の辺に継ぐ）、`Mesh::edge_shift`（継ぎ目の辺の反対側の母点の位置への平行移動）、`Mesh::is_periodic`、`Mesh::edge_midpoint_from`、`Mesh::neighbor_position_from`。Perot 法・河床勾配の最小二乗・直交性の検査・`dc_edge` は、継ぎ目の辺でセルの側の座標を使う
+- 設定 `[boundary.upstream] kind = "periodic"`（`discharge` は初期の等流の流量）と `[boundary.downstream] kind = "periodic"`。河床高と水位は `[bed] slope` の勾配を除いた値で持ち、勾配は運動量式の体積力 g I n_x にする（`HydroParams::background_slope`）。掃流砂の勾配の項と安息角補正の高低差にも、除いた勾配を戻す（`SedimentParams::background_slope`）。`Model::new` は周期的な格子と等流の初期状態を作り、`Model::with_state` は周期境界と周期的な格子の対応を確かめる。`vormorph run` は、給砂も流出もないとき、土砂の収支の誤差を体積 [m³] で表示する
 - ライセンス：MIT OR Apache-2.0

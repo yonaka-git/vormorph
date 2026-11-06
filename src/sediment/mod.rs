@@ -18,6 +18,9 @@
 //!   一致する。H_j が `dry_depth` 未満、または τ* ≤ τ*_c の辺では q_{b,j} = 0。
 //! - γ_j は長谷川の式による河床勾配の補正係数。内部の辺では、母点を結ぶ線分が辺に直交するので、
 //!   法線方向の勾配は2点差分 (z_{b,2(j)} − z_{b,1(j)}) / δ_j になる（全方向にかける）。
+//!   周期境界では河床高を縦断勾配 I を除いた値で持つので、勾配は
+//!   (z_{b,2(j)} − z_{b,1(j)}) / δ_j − I n_{x,j} になる（[`SedimentParams::background_slope`]、
+//!   ADR-0014）。安息角補正の高低差にも、除いた勾配の分 I n_{x,j} δ_j を戻す。
 //! - Φ は [`formulas`] の MPM 式または芦田・道上式（設定で切り替える）。
 //! - 境界辺：壁では 0。上流端（平衡給砂）と下流端（自由流出）では、内側のセルの水深と辺の流速から
 //!   同じ式で求め、勾配 ∂z_b/∂n には内側のセルの河床勾配（隣のセルとの最小二乗。[`bed_gradient`]）
@@ -99,6 +102,9 @@ pub struct SedimentParams {
     pub supply: Option<SedimentSupply>,
     /// 下流端から土砂が流出できるか（下流端が壁なら `false`）。
     pub downstream_open: bool,
+    /// 周期境界で河床高から除いた縦断勾配 I \[-\]（x の正の向きに下がる向きを正）。
+    /// 周期境界でなければ 0（ADR-0014）。
+    pub background_slope: f64,
 }
 
 impl SedimentParams {
@@ -116,9 +122,13 @@ impl SedimentParams {
                 UpstreamBoundary::Discharge {
                     sediment_supply, ..
                 } => Some(*sediment_supply),
-                UpstreamBoundary::Wall => None,
+                UpstreamBoundary::Wall | UpstreamBoundary::Periodic { .. } => None,
             },
-            downstream_open: !matches!(config.boundary.downstream, DownstreamBoundary::Wall),
+            downstream_open: matches!(
+                config.boundary.downstream,
+                DownstreamBoundary::WaterLevel { .. } | DownstreamBoundary::Depth { .. }
+            ),
+            background_slope: hydro::background_slope(config),
         })
     }
 
@@ -334,8 +344,11 @@ impl SedimentSolver {
             mesh,
             &mut state.zb,
             &state.z_ne,
-            tan_phi,
-            tolerance,
+            Avalanche {
+                tan_phi,
+                tolerance,
+                background_slope: params.background_slope,
+            },
             avalanche_flux,
             cap_factor,
         );
@@ -379,7 +392,8 @@ fn edge_capacity(
         EdgeKind::Wall => return 0.0,
         EdgeKind::Interior => (
             edge_depth[e],
-            (state.zb[c2] - state.zb[c1]) / mesh.dc_edge[e],
+            (state.zb[c2] - state.zb[c1]) / mesh.dc_edge[e]
+                - params.background_slope * mesh.normal_edge[e][0],
         ),
         EdgeKind::Upstream => {
             // 法線は領域の外を向くので、流入は u < 0
@@ -437,15 +451,17 @@ fn boundary_slope(mesh: &Mesh, zb: &[f64], e: usize) -> f64 {
 /// セル `c` の河床勾配ベクトル \[-\]：隣のセル（境界の外は除く）との差の最小二乗。
 ///
 /// 河床が平面なら厳密。隣のセルが一直線に並ぶ（幅が1セルの水路など）ときは、その方向の
-/// 成分だけを求め、直交する成分は 0 とする。
+/// 成分だけを求め、直交する成分は 0 とする。周期境界の継ぎ目の向こうのセルは、平行移動した
+/// 位置（[`Mesh::neighbor_position_from`]）で数える（河床高は勾配を除いた値のまま）。
 pub fn bed_gradient(mesh: &Mesh, zb: &[f64], c: usize) -> [f64; 2] {
     let (xc, yc) = (mesh.x_cell[c], mesh.y_cell[c]);
     let (mut mxx, mut mxy, mut myy, mut bx, mut by) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for &k in &mesh.cells_on_cell[c] {
+    for (&e, &k) in mesh.edges_on_cell[c].iter().zip(&mesh.cells_on_cell[c]) {
         if k == NONE {
             continue;
         }
-        let (dx, dy, dz) = (mesh.x_cell[k] - xc, mesh.y_cell[k] - yc, zb[k] - zb[c]);
+        let [xk, yk] = mesh.neighbor_position_from(e, c);
+        let (dx, dy, dz) = (xk - xc, yk - yc, zb[k] - zb[c]);
         mxx += dx * dx;
         mxy += dx * dy;
         myy += dy * dy;
@@ -490,6 +506,17 @@ fn cell_net_outflow(mesh: &Mesh, c: usize, flux: &[f64]) -> f64 {
         .sum()
 }
 
+/// 安息角補正の条件。
+#[derive(Debug, Clone, Copy)]
+struct Avalanche {
+    /// 水中安息角の正接 tan φ。
+    tan_phi: f64,
+    /// 収束判定：1回の反復で動いた厚さの最大値 \[m\]。
+    tolerance: f64,
+    /// 周期境界で河床高から除いた縦断勾配 I（高低差に I n_x δ を戻す）。
+    background_slope: f64,
+}
+
 /// 安息角補正（Jacobi 型の反復）。土砂を動かした反復の回数と、上限までに収束しなかったかを返す。
 ///
 /// `flux` は辺を通して移す河床の体積（法線の向きを正）、`scale` はセルの流出量を縮める倍率の
@@ -498,11 +525,15 @@ fn avalanche(
     mesh: &Mesh,
     zb: &mut [f64],
     z_ne: &[f64],
-    tan_phi: f64,
-    tolerance: f64,
+    condition: Avalanche,
     flux: &mut [f64],
     scale: &mut [f64],
 ) -> (usize, bool) {
+    let Avalanche {
+        tan_phi,
+        tolerance,
+        background_slope,
+    } = condition;
     for iteration in 0..AVALANCHE_MAX_ITERATIONS {
         // 辺：勾配の超過から移す体積（高い側から低い側へ）
         let mut steep = false;
@@ -512,7 +543,9 @@ fn avalanche(
             if c2 == NONE {
                 continue;
             }
-            let drop = zb[c1] - zb[c2];
+            // 実際の高低差（周期境界では、除いた勾配の分を戻す）
+            let drop =
+                zb[c1] - zb[c2] + background_slope * mesh.normal_edge[e][0] * mesh.dc_edge[e];
             let excess = drop.abs() - mesh.dc_edge[e] * tan_phi;
             if excess > 0.0 {
                 let inverse_areas = 1.0 / mesh.area_cell[c1] + 1.0 / mesh.area_cell[c2];
@@ -603,6 +636,7 @@ mod tests {
             },
             supply,
             downstream_open,
+            background_slope: 0.0,
         }
     }
 
@@ -671,6 +705,99 @@ mod tests {
             let bed = solver.update_bed(&mesh, &mut state, 0.1);
             assert!(bed.max_change < 1e-15, "{layout:?}: {}", bed.max_change);
             assert_eq!(bed.avalanche_iterations, 0);
+        }
+    }
+
+    /// 周期境界：勾配を除いた一様な河床の等流でも、辺の掃流砂量は除いた勾配の分の補正を含む
+    /// q_b0 (1 + γ I) n_x になる（勾配のある水路の等流と同じ。ADR-0014）。
+    #[test]
+    fn periodic_uniform_flow_includes_the_removed_slope() {
+        let (slope, h, u) = (0.002, 1.069235, 1.870496);
+        for layout in [ChannelLayout::Rectangular, ChannelLayout::Hexagonal] {
+            let mesh = channel::build_periodic(&ChannelSpec {
+                length: 20.0,
+                width: 6.0,
+                cell_size: 1.0,
+                layout,
+            })
+            .expect("valid periodic channel");
+            // 勾配を除いた河床は一様
+            let state = uniform_flow(&mesh, 0.0, h, u);
+            let p = SedimentParams {
+                background_slope: slope,
+                ..params(None, false)
+            };
+            let mut solver = SedimentSolver::new(&mesh, p);
+            solver.compute_bedload(&mesh, &state, 0.1);
+            let s = 1.65;
+            let tau = 0.025_f64.powi(2) * u * u / (h.cbrt() * s * 0.002);
+            let qb0 = (s * 9.81 * 0.002_f64.powi(3)).sqrt() * 8.0 * (tau - 0.047).powf(1.5);
+            let gamma = (0.047 / (0.45 * tau)).sqrt();
+            for e in 0..mesh.n_edges() {
+                let expected = match mesh.edge_kind[e] {
+                    EdgeKind::Wall => 0.0,
+                    _ => qb0 * (1.0 + gamma * slope) * mesh.normal_edge[e][0],
+                };
+                let q = solver.bedload_flux()[e];
+                assert!(
+                    (q - expected).abs() <= 1e-12 * qb0,
+                    "{layout:?} edge {e}: {q} vs {expected}"
+                );
+            }
+            let mut state = state;
+            let bed = solver.update_bed(&mesh, &mut state, 0.1);
+            assert!(bed.max_change < 1e-15, "{layout:?}: {}", bed.max_change);
+        }
+    }
+
+    /// 周期境界の安息角補正は、勾配を除いた河床に除いた勾配を戻した実際の高低差で判定する。
+    /// 勾配のある水路（勾配を除かない）と同じ量を動かす。
+    #[test]
+    fn periodic_avalanching_uses_the_actual_drop() {
+        let (slope, raise) = (0.5, 0.2);
+        let spec = ChannelSpec {
+            length: 9.0,
+            width: 3.0,
+            cell_size: 1.0,
+            layout: ChannelLayout::Rectangular,
+        };
+        let periodic = channel::build_periodic(&spec).expect("valid periodic channel");
+        let open = channel::build(&spec).expect("valid channel");
+        let peak = 13; // 中央の行の x = 4.5 m
+        let run = |mesh: &Mesh, background: f64| {
+            let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+            for c in 0..mesh.n_cells() {
+                // 勾配を除いた河床（周期境界）、または勾配のある実際の河床
+                state.zb[c] = if background > 0.0 {
+                    0.0
+                } else {
+                    -slope * mesh.x_cell[c]
+                };
+            }
+            state.zb[peak] += raise;
+            let zb0 = state.zb.clone();
+            let p = SedimentParams {
+                background_slope: background,
+                ..params(None, false)
+            };
+            let mut solver = SedimentSolver::new(mesh, p);
+            solver.compute_bedload(mesh, &state, 1.0);
+            let report = solver.update_bed(mesh, &mut state, 1.0);
+            let change: Vec<f64> = (0..mesh.n_cells()).map(|c| state.zb[c] - zb0[c]).collect();
+            (report, change)
+        };
+        let (with_trend, change_periodic) = run(&periodic, slope);
+        let (_, change_open) = run(&open, 0.0);
+        // 下流側の高低差 0.5 + 0.2 = 0.7 > tan 32° なので崩れる（勾配を除いた差 0.2 だけなら崩れない）
+        assert!(with_trend.avalanche_iterations > 0, "{with_trend:?}");
+        assert!(change_periodic[peak] < -1e-3, "{}", change_periodic[peak]);
+        for c in 0..periodic.n_cells() {
+            assert!(
+                (change_periodic[c] - change_open[c]).abs() < 1e-14,
+                "cell {c}: {} vs {}",
+                change_periodic[c],
+                change_open[c]
+            );
         }
     }
 
@@ -895,6 +1022,32 @@ mod tests {
                     "{layout:?} cell {c}: {gy}"
                 );
             }
+        }
+    }
+
+    /// 周期的な水路では、継ぎ目の向こうのセルを平行移動した位置で数える。正方形配置の
+    /// 最小二乗は x 方向の中心差分 (z_E − z_W) / 2Δx になり、継ぎ目のセルでも同じ。
+    #[test]
+    fn bed_gradient_wraps_around_the_periodic_seam() {
+        let length = 8.0;
+        let mesh = channel::build_periodic(&ChannelSpec {
+            length,
+            width: 3.0,
+            cell_size: 1.0,
+            layout: ChannelLayout::Rectangular,
+        })
+        .expect("valid periodic channel");
+        let wave = |x: f64| (2.0 * std::f64::consts::PI * x / length).cos();
+        let zb: Vec<f64> = mesh.x_cell.iter().map(|&x| wave(x)).collect();
+        for c in 0..mesh.n_cells() {
+            let x = mesh.x_cell[c];
+            let [gx, gy] = bed_gradient(&mesh, &zb, c);
+            let expected = (wave(x + 1.0) - wave(x - 1.0)) / 2.0;
+            assert!(
+                (gx - expected).abs() < 1e-14,
+                "cell {c}: {gx} vs {expected}"
+            );
+            assert!(gy.abs() < 1e-14, "cell {c}: {gy}");
         }
     }
 }
