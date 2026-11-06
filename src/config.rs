@@ -177,7 +177,8 @@ pub struct TimeConfig {
 pub struct HydroConfig {
     /// θ 法の重み θ（0.5 ≤ θ ≤ 1、推奨 0.55〜0.6）。
     pub theta: f64,
-    /// マニングの粗度係数 n [s/m^(1/3)]。
+    /// マニングの粗度係数 n [s/m^(1/3)]。0 なら摩擦なし（解析解と比べる検証用。流砂を
+    /// 計算するときは掃流力の評価に使うので正の値が必要）。
     pub manning_n: f64,
     /// wet/dry を判定する水深の閾値 \[m\]。
     #[serde(default = "default_dry_depth")]
@@ -527,7 +528,10 @@ impl Config {
             (0.5..=1.0).contains(&hydro.theta),
             "hydro.theta must be in [0.5, 1.0]",
         );
-        require(positive(hydro.manning_n), "hydro.manning_n must be > 0");
+        require(
+            hydro.manning_n.is_finite() && hydro.manning_n >= 0.0,
+            "hydro.manning_n must be >= 0",
+        );
         require(positive(hydro.dry_depth), "hydro.dry_depth must be > 0");
         require(
             positive(hydro.solver.newton_tol) && hydro.solver.newton_max_iter > 0,
@@ -552,6 +556,10 @@ impl Config {
                 "sediment.porosity must be in [0, 1)",
             );
             require(positive(sediment.morfac), "sediment.morfac must be > 0");
+            require(
+                positive(hydro.manning_n),
+                "hydro.manning_n must be > 0 when [sediment] is given (it sets the bed shear stress)",
+            );
             require(
                 sediment.angle_of_repose > 0.0 && sediment.angle_of_repose < 90.0,
                 "sediment.angle_of_repose must be in (0, 90) degrees",
@@ -775,6 +783,31 @@ mod tests {
             }
             other => panic!("expected ConfigError::Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn frictionless_flow_is_allowed_only_without_sediment() {
+        let text = SILL.replacen("manning_n = 0.025", "manning_n = 0.0", 1);
+        match text.parse::<Config>() {
+            Err(ConfigError::Invalid(messages)) => {
+                assert!(messages.iter().any(|m| m.contains("hydro.manning_n")));
+            }
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+        let start = text.find("[sediment]").expect("sill.toml has [sediment]");
+        let end = text
+            .find("[boundary.upstream]")
+            .expect("sill.toml has [boundary.upstream]");
+        let fixed_bed = format!("{}{}", &text[..start], &text[end..]);
+        let config: Config = fixed_bed.parse().expect("n = 0 is valid on a fixed bed");
+        assert_eq!(config.hydro.manning_n, 0.0);
+        assert!(config.sediment.is_none());
+
+        let negative = fixed_bed.replacen("manning_n = 0.0", "manning_n = -0.01", 1);
+        assert!(matches!(
+            negative.parse::<Config>(),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]
