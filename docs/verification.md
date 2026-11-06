@@ -116,7 +116,7 @@ cargo test --test verification v06      # 1ケースだけ
 
 六角形配置では、上下流端の近くで、上下に隣り合う偶数行の端のセルどうし（例：セル 0 と 199）が、長さ $x^\ast = 3\Delta x/4 - \Delta y^2/\Delta x \approx 0.11$ m の短い辺を共有します。奇数行には上下流端に母点を置かないので、奇数行の端のセルは五角形になり、その頂点が上下流端から $x^\ast$ だけ内側に来るためです（$x^\ast$ の符号による場合分けは `src/mesh/channel.rs` の単体テストを参照）。流れの計算への影響は、V02 以降のケースで確かめます。
 
-### V02 Perot 再構成（2026-11-06）
+### V02 Perot 再構成（2026-11-06, commit c8bc2af）
 
 `cargo test --test verification v02 -- --nocapture` の出力です。誤差は、全セルでの $\max(\lvert u_x - 0.7\rvert, \lvert u_y + 0.3\rvert)$ です。
 
