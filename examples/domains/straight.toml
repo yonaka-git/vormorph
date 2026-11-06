@@ -1,0 +1,29 @@
+# 格子生成ツール（tools/make_mesh.py）の入力：直線水路（合成データ）
+#
+#   uv run --project tools python tools/make_mesh.py examples/domains/straight.toml \
+#       -o output/mesh/straight.mesh.toml --plot output/mesh/straight.png
+#
+# 延長 60 m・幅 10 m の直線水路。x = 0 が上流端、x = 60 m が下流端、y = 0 と y = 10 m が側壁。
+# 外周に 90° の凸な角が 4 つある。母点が不規則で、凸な角に接するセルを含む格子で、
+# 等流の平衡河床が保たれること（検証ケース V12）と、角のセルの流砂の偏りを確かめるのに使う。
+
+title = "straight"
+cell_size = 1.0                      # 目標の格子幅（母点の間隔）[m]
+
+# 外周を反時計回り（領域を左手に見る向き）にたどる。
+
+[[outer]]
+kind = "wall"
+line = [[0.0, 0.0], [60.0, 0.0]]
+
+[[outer]]
+kind = "downstream"
+line = [[60.0, 0.0], [60.0, 10.0]]
+
+[[outer]]
+kind = "wall"
+line = [[60.0, 10.0], [0.0, 10.0]]
+
+[[outer]]
+kind = "upstream"
+line = [[0.0, 10.0], [0.0, 0.0]]

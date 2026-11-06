@@ -20,7 +20,7 @@
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
-use vormorph::config::{AdvectionScheme, ChannelLayout, Config};
+use vormorph::config::{AdvectionScheme, ChannelLayout, Config, SedimentConfig};
 use vormorph::hydro;
 use vormorph::mesh::channel::{self, ChannelSpec};
 use vormorph::mesh::{EdgeKind, Mesh, NONE, file};
@@ -1151,4 +1151,212 @@ fn v11_sill_local_scour() {
     let config = Config::load(path).expect("examples/sill.toml must be valid");
     let _ = config;
     todo!("格子幅を変えた計算と洗掘深の比較")
+}
+
+/// 格子生成ツール（`tools/make_mesh.py`）で作った、延長 60 m・幅 10 m の直線水路の格子。
+///
+/// 内部は重心ボロノイ分割に近い不規則な格子で、外周に 90° の凸な角が 4 つある。
+/// 次のコマンドで作ったもの（gmsh 4.15.2）。
+///
+/// ```text
+/// uv run --project tools python tools/make_mesh.py examples/domains/straight.toml \
+///     --cell-size 2.0 -o tests/data/straight_coarse.mesh.toml
+/// ```
+fn straight_mesh() -> Mesh {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/straight_coarse.mesh.toml");
+    file::read(&path).expect("the straight channel fixture must be a valid mesh")
+}
+
+/// `examples/sill.toml` と同じ流砂の条件（d = 2 mm、MPM、MORFAC 10、掃流砂だけ）。
+fn sill_sediment() -> SedimentConfig {
+    Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sill.toml"))
+        .expect("examples/sill.toml must be valid")
+        .sediment
+        .expect("examples/sill.toml has [sediment]")
+}
+
+/// V12 の1ケースの結果。
+struct EquilibriumRun {
+    /// 河床高の変化の最大値（全セル）\[m\]。
+    max_change: f64,
+    /// 河床高の変化の最大値（中央部：上下流端から延長の 1/4 以上離れたセル）\[m\]。
+    max_change_central: f64,
+    /// 河床高の変化の最大値（上流端に接するセル）\[m\]。
+    max_change_inlet: f64,
+    /// 給砂量 \[m³\]（地形の時間での体積）。
+    supply: f64,
+    /// 土砂の収支の誤差（給砂量に対する比）。
+    sediment_error: f64,
+    /// 水の収支の誤差（流入量に対する比）。
+    water_error: f64,
+    /// 時間刻みの範囲 \[s\]。
+    dt: (f64, f64),
+}
+
+/// 勾配 1/500 の水路に、単位幅流量 2 m²/s の等流と平衡給砂を与え、河床変動を `end` 秒解く。
+fn equilibrium_bed_run(
+    mesh: Mesh,
+    length: f64,
+    width: f64,
+    end: f64,
+    case: &str,
+) -> EquilibriumRun {
+    const SLOPE: f64 = 0.002;
+    const MANNING_N: f64 = 0.025;
+    const UNIT_DISCHARGE: f64 = 2.0;
+    let h_n = (MANNING_N * UNIT_DISCHARGE / SLOPE.sqrt()).powf(0.6);
+    let u_n = UNIT_DISCHARGE / h_n;
+    let boundary = format!(
+        r#"
+[boundary.upstream]
+kind = "discharge"
+discharge = {:?}
+sediment_supply = "equilibrium"
+
+[boundary.downstream]
+kind = "water_level"
+level = {h_n:?}
+"#,
+        UNIT_DISCHARGE * width
+    );
+    let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, end / 4.0);
+    config.time.dt = None;
+    config.time.courant = Some(0.5);
+    config.time.dt_max = Some(1.0);
+    config.sediment = Some(sill_sediment());
+
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        state.zb[c] = SLOPE * (length - mesh.x_cell[c]);
+        state.eta[c] = state.zb[c] + h_n;
+    }
+    for e in 0..mesh.n_edges() {
+        state.u_n[e] = u_n * mesh.normal_edge[e][0];
+    }
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    let zb0 = model.state().zb.clone();
+    if output_root().is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+    let mut dt = (f64::INFINITY, 0.0_f64);
+    while !model.finished() {
+        let report = model.step().expect("the step must succeed");
+        dt = (dt.0.min(report.dt), dt.1.max(report.dt));
+    }
+
+    let (mesh, state) = (model.mesh(), model.state());
+    let change = |c: usize| (state.zb[c] - zb0[c]).abs();
+    let max_over = |cells: &mut dyn Iterator<Item = usize>| cells.map(change).fold(0.0, f64::max);
+    let inlet: Vec<usize> = (0..mesh.n_edges())
+        .filter(|&e| mesh.edge_kind[e] == EdgeKind::Upstream)
+        .map(|e| mesh.cells_on_edge[e][0])
+        .collect();
+    let sediment = model.sediment_balance();
+    let water = model.water_balance();
+    EquilibriumRun {
+        max_change: max_over(&mut (0..mesh.n_cells())),
+        max_change_central: max_over(
+            &mut (0..mesh.n_cells())
+                .filter(|&c| (0.25 * length..=0.75 * length).contains(&mesh.x_cell[c])),
+        ),
+        max_change_inlet: max_over(&mut inlet.into_iter()),
+        supply: sediment.inflow,
+        sediment_error: sediment.error() / sediment.inflow,
+        water_error: water.error() / water.inflow,
+        dt,
+    }
+}
+
+/// V12 平衡河床の保持：一様な勾配の等流に平衡給砂を与えると、河床が変わらないこと。
+///
+/// 等流は任意のボロノイ格子で離散式の厳密な定常解で（辺の水深がすべて h、Perot 法が厳密）、
+/// 辺の掃流砂量は q_b0 (1 + γ I) n_x になる。セルの閉合 Σ s L n = 0 から、掃流砂量の発散は
+/// 0 になる。境界辺では内側のセルの河床勾配を外挿するので、給砂量と流出量も同じ値になる。
+///
+/// 条件は V06 と同じ（勾配 1/500、単位幅流量 2 m²/s、n = 0.025）で、`examples/sill.toml` の
+/// 流砂の条件（d = 2 mm、MPM、MORFAC 10）を加え、等流の状態から 600 s（地形の時間 6000 s）
+/// 解く。格子は直線水路（延長 200 m、幅 20 m）の正方形配置 2 m・六角形配置 2 m・1 m と、
+/// 格子生成ツールの直線水路（延長 60 m、幅 10 m、凸な角を含む不規則な格子）。次を確かめる。
+///
+/// - 正方形配置と格子生成ツールの格子：全セルで河床高の変化が 10⁻¹² m 以下（丸め誤差）
+/// - 六角形配置：中央部の変化が 10⁻³ m 以下で、格子幅 2 m → 1 m で 1/4 以下。上流端のセルの
+///   母点の x が行ごとに半間隔ずれるので、通水能による流量の配分が偏り（V06）、上流端の近くの
+///   流れがわずかに一様でなくなるため
+/// - 土砂と水の収支の誤差が、給砂量・流入量の 10⁻¹⁰ 以下
+#[test]
+fn v12_equilibrium_bed() {
+    const END: f64 = 600.0;
+    let mut cases = vec![
+        (
+            "rectangular, 2 m",
+            basin_mesh(ChannelLayout::Rectangular, 200.0, 20.0, 2.0),
+            200.0,
+            20.0,
+        ),
+        (
+            "hexagonal, 2 m",
+            basin_mesh(ChannelLayout::Hexagonal, 200.0, 20.0, 2.0),
+            200.0,
+            20.0,
+        ),
+        (
+            "hexagonal, 1 m",
+            basin_mesh(ChannelLayout::Hexagonal, 200.0, 20.0, 1.0),
+            200.0,
+            20.0,
+        ),
+    ];
+    cases.push(("mesh generator, 2 m", straight_mesh(), 60.0, 10.0));
+    let mut hexagonal_central = Vec::new();
+    for (name, mesh, length, width) in cases {
+        let cells = mesh.n_cells();
+        let case = format!("v12_{}", name.replace([',', ' '], "_").replace("__", "_"));
+        let run = equilibrium_bed_run(mesh, length, width, END, &case);
+        println!(
+            "V12 {name}: {cells} cells, dt {:.3}..{:.3} s, max |dz_b| {:.1e} m (all), \
+             {:.1e} m (central), {:.1e} m (inlet cells), supply {:.3} m^3, \
+             sediment balance error {:.1e}, water balance error {:.1e}",
+            run.dt.0,
+            run.dt.1,
+            run.max_change,
+            run.max_change_central,
+            run.max_change_inlet,
+            run.supply,
+            run.sediment_error,
+            run.water_error
+        );
+        assert!(run.supply > 0.0);
+        assert!(
+            run.sediment_error.abs() <= 1e-10,
+            "{name}: sediment balance {:e}",
+            run.sediment_error
+        );
+        assert!(
+            run.water_error.abs() <= 1e-10,
+            "{name}: water balance {:e}",
+            run.water_error
+        );
+        if name.starts_with("hexagonal") {
+            // 上流端の流量の配分の偏り（V06）による変化。格子を細かくすると減る
+            assert!(
+                run.max_change_central <= 1e-3,
+                "{name}: central change {:e} m",
+                run.max_change_central
+            );
+            hexagonal_central.push(run.max_change_central);
+        } else {
+            assert!(
+                run.max_change <= 1e-12,
+                "{name}: the bed must stay at rest, max change {:e} m",
+                run.max_change
+            );
+        }
+    }
+    // 格子幅 2 m → 1 m で 1/4 以下
+    assert!(
+        hexagonal_central[1] <= 0.25 * hexagonal_central[0],
+        "{hexagonal_central:?}"
+    );
 }
