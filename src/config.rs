@@ -25,7 +25,7 @@
 //! | `[[structures]]` | [`StructureConfig`] | 床止めなどの構造物（任意、複数可） |
 //! | `[physics]` | [`PhysicsConfig`] | 物理定数（省略時は既定値） |
 //! | `[time]` | [`TimeConfig`] | 時間刻み・終了時刻・河床変動の開始時刻 |
-//! | `[hydro]` | [`HydroConfig`] | θ、粗度係数、wet/dry の閾値、反復解法 |
+//! | `[hydro]` | [`HydroConfig`] | θ、粗度係数、wet/dry の閾値、移流、反復解法 |
 //! | `[sediment]` | [`SedimentConfig`] | 粒径・空隙率・流砂量式・MORFAC など（省略時は固定床） |
 //! | `[boundary]` | [`BoundaryConfig`] | 上流端・下流端の境界条件（それ以外の境界は壁） |
 //! | `[output]` | [`OutputConfig`] | 出力先と出力間隔 |
@@ -183,6 +183,9 @@ pub struct HydroConfig {
     /// wet/dry を判定する水深の閾値 \[m\]。
     #[serde(default = "default_dry_depth")]
     pub dry_depth: f64,
+    /// 運動量の移流の扱い（省略時は保存型の風上差分）。
+    #[serde(default)]
+    pub advection: AdvectionScheme,
     /// 水位の連立方程式の反復解法。
     #[serde(default)]
     pub solver: SolverConfig,
@@ -190,6 +193,18 @@ pub struct HydroConfig {
 
 fn default_dry_depth() -> f64 {
     1.0e-3
+}
+
+/// 運動量の移流の扱い。設定ファイルでは `"upwind"` または `"none"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum AdvectionScheme {
+    /// 保存型の1次風上差分（[`crate::hydro::advection`]。ADR-0008）。
+    #[default]
+    #[serde(rename = "upwind")]
+    Upwind,
+    /// 移流項を省く（F u_j = u_j）。検証で移流の効果を比べるためのもので、急変流には使えない。
+    #[serde(rename = "none")]
+    Disabled,
 }
 
 /// 水位の連立方程式（Newton 法＋PCG）の設定。
@@ -650,6 +665,16 @@ impl BedloadFormula {
     }
 }
 
+impl AdvectionScheme {
+    /// 設定ファイルでの表記。
+    fn name(self) -> &'static str {
+        match self {
+            Self::Upwind => "upwind",
+            Self::Disabled => "none",
+        }
+    }
+}
+
 impl SedimentSupply {
     /// 設定ファイルでの表記。
     fn name(self) -> &'static str {
@@ -703,8 +728,10 @@ impl fmt::Display for Summary<'_> {
         )?;
         writeln!(
             f,
-            "hydro      : theta {}, Manning n {}",
-            c.hydro.theta, c.hydro.manning_n
+            "hydro      : theta {}, Manning n {}, advection {}",
+            c.hydro.theta,
+            c.hydro.manning_n,
+            c.hydro.advection.name()
         )?;
         match &c.sediment {
             Some(s) => writeln!(
@@ -812,6 +839,27 @@ mod tests {
     }
 
     #[test]
+    fn advection_can_be_disabled_and_rejects_unknown_schemes() {
+        assert_eq!(
+            SILL.parse::<Config>().expect("valid").hydro.advection,
+            AdvectionScheme::Upwind
+        );
+        let text = SILL.replacen("advection = \"upwind\"", "advection = \"none\"", 1);
+        let config: Config = text.parse().expect("advection = \"none\" is valid");
+        assert_eq!(config.hydro.advection, AdvectionScheme::Disabled);
+        let omitted = SILL.replacen("advection = \"upwind\"", "", 1);
+        assert_eq!(
+            omitted.parse::<Config>().expect("valid").hydro.advection,
+            AdvectionScheme::default()
+        );
+        let unknown = SILL.replacen("advection = \"upwind\"", "advection = \"elm\"", 1);
+        assert!(matches!(
+            unknown.parse::<Config>(),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
     fn physics_section_can_be_omitted() {
         let start = SILL.find("[physics]").expect("sill.toml has [physics]");
         let end = SILL.find("[time]").expect("sill.toml has [time]");
@@ -826,6 +874,7 @@ mod tests {
         let summary = config.summary().to_string();
         assert!(summary.contains("hexagonal"), "{summary}");
         assert!(summary.contains("bedload mpm"), "{summary}");
+        assert!(summary.contains("advection upwind"), "{summary}");
         assert!(
             summary.contains("upstream   : discharge 40 m^3/s"),
             "{summary}"
