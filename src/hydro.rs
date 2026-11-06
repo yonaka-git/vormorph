@@ -212,10 +212,31 @@ pub fn edge_depths(mesh: &Mesh, state: &State, dry_depth: f64, out: &mut [f64]) 
 /// ```
 ///
 /// x_j は辺の中点、x_i は母点。発散定理から、一様流なら丸め誤差の範囲で厳密に元の
-/// 流速に一致する（検証ケース V02）。
+/// 流速に一致する（検証ケース V02）。境界辺も含めてセルを囲むすべての辺を使うので、
+/// 境界辺の u_j（壁なら 0、流入・流出端なら境界条件で決まる値）を入れてから呼ぶ。
+///
+/// `u_n` の長さは辺の数、`out` の長さはセル数でなければならない。
 pub fn reconstruct_cell_velocity(mesh: &Mesh, u_n: &[f64], out: &mut [[f64; 2]]) {
-    let _ = (mesh, u_n, out);
-    todo!("Perot 法による再構成")
+    debug_assert_eq!(
+        u_n.len(),
+        mesh.n_edges(),
+        "u_n must have one value per edge"
+    );
+    debug_assert_eq!(
+        out.len(),
+        mesh.n_cells(),
+        "out must have one value per cell"
+    );
+    for (c, u) in out.iter_mut().enumerate() {
+        let (xc, yc) = (mesh.x_cell[c], mesh.y_cell[c]);
+        let (mut sx, mut sy) = (0.0, 0.0);
+        for (&e, &s) in mesh.edges_on_cell[c].iter().zip(&mesh.edge_sign_on_cell[c]) {
+            let flux = s * mesh.dv_edge[e] * u_n[e];
+            sx += flux * (mesh.x_edge[e] - xc);
+            sy += flux * (mesh.y_edge[e] - yc);
+        }
+        *u = [sx / mesh.area_cell[c], sy / mesh.area_cell[c]];
+    }
 }
 
 /// 移流項を保存型風上差分で陽的に評価し、F u_j = u_j − Δt (移流加速度)_j を `out` に書く。

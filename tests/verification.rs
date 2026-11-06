@@ -9,10 +9,11 @@
 //! cargo test --test verification v01      # 1ケースだけ
 //! ```
 
+use std::path::Path;
 use vormorph::config::{ChannelLayout, Config};
 use vormorph::hydro;
-use vormorph::mesh::Mesh;
 use vormorph::mesh::channel::{self, ChannelSpec};
+use vormorph::mesh::{Mesh, file};
 
 const LAYOUTS: [ChannelLayout; 2] = [ChannelLayout::Rectangular, ChannelLayout::Hexagonal];
 
@@ -25,6 +26,15 @@ fn channel_mesh(layout: ChannelLayout, cell_size: f64) -> Mesh {
         layout,
     })
     .expect("the verification channel must be a valid mesh")
+}
+
+/// 格子生成ツール（`tools/make_mesh.py`）で作った、島のある池の格子。
+///
+/// 内部は重心ボロノイ分割に近いが母点はセルの重心と一致せず、境界は鏡映対の母点で作った
+/// 不規則な格子（`tests/mesh_file.rs` と同じデータ）。
+fn island_mesh() -> Mesh {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/island_coarse.mesh.toml");
+    file::read(&path).expect("the island fixture must be a valid mesh")
 }
 
 /// V01 格子幾何：総面積、直交誤差、各セルが閉じていること。
@@ -65,23 +75,43 @@ fn v01_mesh_geometry() {
 }
 
 /// V02 Perot 再構成：一様流で厳密に一致すること（境界セルを含む）。
+///
+/// 直線水路の2つの配置に加え、格子生成ツールで作った不規則な格子でも確かめる。
+/// 結果の値は `cargo test --test verification v02 -- --nocapture` で表示される。
 #[test]
-#[ignore = "未実装: hydro::reconstruct_cell_velocity"]
 fn v02_perot_uniform_flow() {
     let (ux, uy) = (0.7, -0.3);
-    for layout in LAYOUTS {
-        let mesh = channel_mesh(layout, 2.0);
+    let meshes = [
+        (
+            "channel, rectangular",
+            channel_mesh(ChannelLayout::Rectangular, 2.0),
+        ),
+        (
+            "channel, hexagonal",
+            channel_mesh(ChannelLayout::Hexagonal, 2.0),
+        ),
+        ("island (tools/make_mesh.py)", island_mesh()),
+    ];
+    for (name, mesh) in &meshes {
         let u_n: Vec<f64> = mesh
             .normal_edge
             .iter()
             .map(|n| ux * n[0] + uy * n[1])
             .collect();
         let mut u_cell = vec![[0.0; 2]; mesh.n_cells()];
-        hydro::reconstruct_cell_velocity(&mesh, &u_n, &mut u_cell);
+        hydro::reconstruct_cell_velocity(mesh, &u_n, &mut u_cell);
+        let max_error = u_cell
+            .iter()
+            .map(|u| (u[0] - ux).abs().max((u[1] - uy).abs()))
+            .fold(0.0, f64::max);
+        println!(
+            "V02 {name}: {} cells, max error {max_error:.1e} m/s",
+            mesh.n_cells()
+        );
         for (c, u) in u_cell.iter().enumerate() {
             assert!(
                 (u[0] - ux).abs() <= 1e-12 && (u[1] - uy).abs() <= 1e-12,
-                "{layout:?}: cell {c}: reconstructed {u:?}, expected [{ux}, {uy}]"
+                "{name}: cell {c}: reconstructed {u:?}, expected [{ux}, {uy}]"
             );
         }
     }
