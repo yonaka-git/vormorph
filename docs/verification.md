@@ -102,7 +102,7 @@ cargo test --test verification v06      # 1ケースだけ
 考察：…
 ```
 
-### V01 格子幾何（2026-11-06）
+### V01 格子幾何（2026-11-06, commit 9f7b51d）
 
 `cargo test --test verification v01 -- --nocapture` の出力です。
 
