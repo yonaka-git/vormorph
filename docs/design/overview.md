@@ -2,7 +2,7 @@
 
 この文書は、vormorph の支配方程式、ボロノイ C 格子上の離散式、1ステップの計算手順をまとめたものです。設計判断の理由は [ADR](adr/README.md) に記録しています。
 
-> **状態**：v0.1.0 の時点では、ここに書いた離散式はまだ実装していません。実装の過程で式や手順を変えた場合は、この文書と ADR を同時に更新します。末尾の「[未決事項](#8-未決事項)」も参照してください。
+> **状態**：流れの半陰解法（4.1〜4.3節）、wet/dry、Perot 法による再構成（4.5節）、境界条件（6章）は実装済みです。移流（4.4節）と流砂（4.6〜4.8節）はまだ実装していません。実装の過程で式や手順を変えた場合は、この文書と ADR を同時に更新します。末尾の「[未決事項](#8-未決事項)」も参照してください。
 
 ## 目次
 
@@ -135,7 +135,7 @@ $$
 u_j^{n+1} = F u_j^n - \frac{g\Delta t}{\delta_j}\left[\theta\left(\eta_{2(j)}^{n+1} - \eta_{1(j)}^{n+1}\right) + (1-\theta)\left(\eta_{2(j)}^{n} - \eta_{1(j)}^{n}\right)\right] - \Delta t\,\gamma_j\,u_j^{n+1}
 $$
 
-$F u_j^n$ は移流を評価した後の流速（4.4節）です。$\gamma_j$ は摩擦係数で、時刻 $n$ の値で線形化します。
+$F u_j^n$ は移流を評価した後の流速（4.4節）です。移流は次の段階で実装し、それまでは $F u_j^n = u_j^n$ とします。$\gamma_j$ は摩擦係数で、時刻 $n$ の値で線形化します。
 
 $$
 \gamma_j = \frac{g n^2 \lvert\mathbf{u}\rvert_j^n}{\left(H_j^n\right)^{4/3}}
@@ -157,7 +157,19 @@ $$
 H_j^n = \max\left(\eta_{\mathrm{up}(j)}^n - z_{b,j},\ 0\right), \qquad z_{b,j} = \max\left(z_{b,1(j)},\ z_{b,2(j)}\right)
 $$
 
-辺の河床高に両側の高い方を使うと、床止めのような段差で、天端を越える流れの水深を正しく表せます。$H_j^n$ が閾値 `dry_depth` 未満の辺は乾いているとみなし、$u_j^{n+1} = 0$ とします。
+辺の河床高に両側の高い方を使うと、床止めのような段差で、天端を越える流れの水深を正しく表せます。細部は次のとおりです（[ADR-0006](adr/0006-wet-dry-and-newton.md)）。
+
+- 風上側は $u_j^n$ の向きで決めます。$u_j^n = 0$ のときは、両側の水位の高い方を使います。
+- $H_j^n$ が閾値 `dry_depth` 未満の辺は乾いているとみなし、$H_j^n = 0$、$u_j^{n+1} = 0$ とします（水位の連立方程式からも外れます）。セルの体積関数（4.2節）には閾値を入れません。
+- 静水（$\eta$ が一定、$u = 0$）では、水面より高い乾いたセル（水位を河床高に揃えている。4.3節）と接する辺の水深は $z_b - z_b = 0$ になります。したがって、wet/dry の境界で偽の流れは生じません（検証ケース V03）。
+
+摩擦係数の $\lvert\mathbf{u}\rvert_j^n$ は、法線成分 $u_j^n$ と、両側のセルの Perot 流速（4.5節）の平均の接線成分 $\bar{\mathbf{u}}_j\cdot\mathbf{t}_j$ から求めます。
+
+$$
+\lvert\mathbf{u}\rvert_j^n = \sqrt{\left(u_j^n\right)^2 + \left(\bar{\mathbf{u}}_j\cdot\mathbf{t}_j\right)^2}, \qquad \bar{\mathbf{u}}_j = \tfrac{1}{2}\left(\mathbf{u}_{1(j)}^n + \mathbf{u}_{2(j)}^n\right)
+$$
+
+Perot 法は一様流で厳密なので（V02）、一様流ではこれも元の速さに厳密に一致します。境界辺では内側のセルの流速を使います。
 
 ### 4.2 連続式（セル）
 
@@ -195,10 +207,29 @@ $$
 \left[\mathsf{P}^{(m)} + \mathsf{T}\right]\boldsymbol{\eta}^{(m+1)} = \mathbf{b} - \mathbf{V}\left(\boldsymbol{\eta}^{(m)}\right) + \mathsf{P}^{(m)}\boldsymbol{\eta}^{(m)}
 $$
 
-- $\mathsf{P}^{(m)}$ は $\mathbf{V}$ の微分で、wet セル（$\eta_i^{(m)} > z_{b,i}$）では $A_i$、dry セルでは 0 の対角行列です。
-- $\mathsf{P} + \mathsf{T}$ は、各連結成分に wet セルか水位境界が1つでもあれば対称正定値です。各段の線形系は、行列を組み立てずに前処理付き共役勾配法（Jacobi 前処理）で解きます。
+- $\mathsf{P}^{(m)}$ は $\mathbf{V}$ の微分で、$\eta_i^{(m)} \ge z_{b,i}$ のセルでは $A_i$、それ以外のセルでは 0 の対角行列です。折れ点（$\eta_i = z_{b,i}$）では右側の微分 $A_i$ をとります。
+- $\mathsf{P} + \mathsf{T}$ は、各連結成分に $\mathsf{P}_i > 0$ のセルか水位境界が1つでもあれば対称正定値です。各段の線形系は、行列を組み立てずに前処理付き共役勾配法（Jacobi 前処理）で解きます。
 - 行列とベクトルの積はセル単位のループで計算し、各セルが自分の成分だけを書き込むようにします。将来 rayon で並列化するときに、書き込みの競合が起きないようにするためです。
-- Newton 反復の初期値の選び方と収束の条件は、Casulli (2009) と Casulli & Zanolli (2012) に従います（実装時に確認）。
+
+実装では、同じ式を修正量 $\boldsymbol{\delta}^{(m)} = \boldsymbol{\eta}^{(m+1)} - \boldsymbol{\eta}^{(m)}$ の形に書き直して解きます（[ADR-0006](adr/0006-wet-dry-and-newton.md)）。
+
+$$
+\left[\mathsf{P}^{(m)} + \mathsf{T}\right]\boldsymbol{\delta}^{(m)} = \mathbf{r}^{(m)}, \qquad \mathbf{r}^{(m)} = \mathbf{b} - \mathbf{V}\left(\boldsymbol{\eta}^{(m)}\right) - \mathsf{T}\boldsymbol{\eta}^{(m)}
+$$
+
+- PCG の相対判定値は $\mathbf{r}^{(m)}$ に対してかかります。Newton 反復が進むほど解の精度が上がり、最終的な残差（水の収支の誤差になる）は収束判定値よりずっと小さくなります。
+- 収束判定は $\max_i \lvert r_i\rvert / A_i \le$ `newton_tol` です。乾いたセルも含めて判定するので、負の体積が必要な解は、収束の失敗として検出されます。
+
+**初期値と収束**：初期値は $\boldsymbol{\eta}^{(0)} = \boldsymbol{\eta}^n$ とします。各ステップの最後に乾いたセルの水位を河床高に揃える（$\eta_i \leftarrow \max(\eta_i, z_{b,i})$。$V_i$ は変わりません）ので、全セルで $\eta_i^n \ge z_{b,i}$ です。したがって、最初の段の係数行列は $\mathrm{diag}(A) + \mathsf{T}$ で、対称正定値です。
+
+収束は次のように示せます。$\mathbf{f}(\boldsymbol{\eta}) = \mathbf{V}(\boldsymbol{\eta}) + \mathsf{T}\boldsymbol{\eta} - \mathbf{b}$、解を $\boldsymbol{\eta}^\ast$、$\mathsf{J}^{(m)} = \mathsf{P}^{(m)} + \mathsf{T}$ とします。
+
+1. $V_i$ は凸なので、任意の $\boldsymbol{\eta}$ について $\mathbf{f}(\boldsymbol{\eta}) \ge \mathbf{f}(\boldsymbol{\eta}^{(m)}) + \mathsf{J}^{(m)}(\boldsymbol{\eta} - \boldsymbol{\eta}^{(m)})$（成分ごと）です。
+2. $\boldsymbol{\eta} = \boldsymbol{\eta}^\ast$ とおくと $\mathsf{J}^{(m)}(\boldsymbol{\eta}^{(m+1)} - \boldsymbol{\eta}^\ast) \ge \mathbf{0}$ が得られます。$\mathsf{J}^{(m)}$ は非対角成分が 0 以下の正定値行列（M 行列）なので逆行列の成分は非負で、$\boldsymbol{\eta}^{(m+1)} \ge \boldsymbol{\eta}^\ast$ です。
+3. $\boldsymbol{\eta} = \boldsymbol{\eta}^{(m+1)}$ とおくと $\mathbf{f}(\boldsymbol{\eta}^{(m+1)}) \ge \mathbf{0}$ なので、次の修正量は 0 以下で、2段目以降の反復値は単調に減少します。
+4. 反復値は解以上にあるので、解で wet のセルは wet のままで、係数行列は正定値を保ちます。$\mathbf{V}$ は区分線形なので、wet/dry の判定が変わらなくなった段で収束します。
+
+これは Casulli (2009)、Casulli & Zanolli (2012) と同じ議論です。壁で囲まれ、乾いた辺（$w_j = 0$）で区切られた領域では、辺の流量が打ち消し合うので $\sum_i b_i = \sum_i V_i^n \ge 0$ です。したがって、水があれば解でも wet のセルが残り、解が存在します。
 
 $\boldsymbol{\eta}^{n+1}$ が求まったら、4.1節の式で $u_j^{n+1}$ を更新します。
 
@@ -289,32 +320,41 @@ $$
 
 | 段階 | 処理 | 主なモジュール |
 |---|---|---|
-| 流れ 1 | 辺の水深 $H_j^n$ と wet/dry の判定 | `hydro::edge_depths` |
-| 流れ 2 | Perot 法でセル中心の流速 $\mathbf{u}_i^n$ を再構成 | `hydro::reconstruct_cell_velocity` |
-| 流れ 3 | 移流を陽的に評価して $F u_j^n$ を求める | `hydro::advection` |
-| 流れ 4 | 摩擦係数 $\gamma_j$、$G_j$、重み $w_j$、右辺 $b_i$ を組み立てる | `hydro::HydroSolver::step` |
-| 流れ 5 | Newton 法＋行列フリー PCG で $\boldsymbol{\eta}^{n+1}$ を求める | `hydro::WaterLevelOperator`, `linsolve::pcg` |
-| 流れ 6 | $u_j^{n+1}$ を更新し、θ 平均流量 $q_j^{\theta}$ を保存する | `hydro::HydroSolver::step` |
+| 流れ 1 | 辺の役割（内部・壁・境界）、辺の水深 $H_j^n$ と wet/dry の判定 | `hydro::edge_depths` |
+| 流れ 2 | 移流を陽的に評価して $F u_j^n$ を求める（次の段階で実装。現在は $F u_j^n = u_j^n$） | `hydro::advection` |
+| 流れ 3 | 摩擦係数 $\gamma_j$、$G_j$、重み $w_j$、右辺 $b_i$ を組み立てる | `hydro::HydroSolver::step` |
+| 流れ 4 | Newton 法＋行列フリー PCG で $\boldsymbol{\eta}^{n+1}$ を求める | `hydro::WaterLevelOperator`, `linsolve::pcg` |
+| 流れ 5 | $u_j^{n+1}$ を更新し、θ 平均流量 $q_j^{\theta}$ を保存する | `hydro::HydroSolver::step` |
+| 流れ 6 | 乾いたセルの水位を河床高に揃え、Perot 法でセル中心の流速 $\mathbf{u}_i^{n+1}$ を再構成 | `hydro::reconstruct_cell_velocity` |
 | 流砂 7 | 辺の掃流砂量 $q_{b,j}$（勾配補正、非侵食層の頭打ち） | `sediment::SedimentSolver::compute_bedload` |
 | 流砂 8 | 浮遊砂 $(hC)^{n+1}$（沈降は陰的） | `sediment::SedimentSolver::step_suspended` |
 | 流砂 9 | Exner 式（MORFAC）、安息角補正、水位の調整 | `sediment::SedimentSolver::update_bed` |
 | 収支 10 | 水と土砂の質量収支を更新し、出力時刻なら VTK を書く | `model`, `io` |
 
-流砂の段階（7〜9）は、時刻が `time.morphology_start` を過ぎてから行います。
+セル中心の流速 $\mathbf{u}_i^n$（摩擦と移流に使う）は、前のステップの最後（初期状態ではモデルの組み立て時）に再構成した値です。流砂の段階（7〜9）は、時刻が `time.morphology_start` を過ぎてから行います。
 
 ## 6. 境界条件
 
 | 境界 | 流れ | 流砂 |
 |---|---|---|
 | 壁 | $u_j = 0$。辺を水位方程式から除く | 掃流砂・拡散フラックスとも 0 |
-| 上流端（流量） | 流量 $Q$ を境界辺に通水能 $K_j = L_j H_j^{5/3}/n$ に比例して配分し、既知の流入 $Q_i$ として右辺に入れる | 平衡給砂（境界セルの流砂量と同じ量）、または給砂なし |
-| 下流端（水位固定） | 母点を辺に関して鏡映した点の水位を既知の値 $\eta_b$ とし、$w_j\eta_b$ を右辺へ移す。$\delta_j$ には鏡映点までの距離を使う | 風上側の値で自由に流出 |
+| 上流端（流量） | 流量 $Q$ を境界辺に通水能 $K_j = L_j H_j^{5/3}/n$ に比例して配分し、既知の流入 $Q_i$ として右辺に入れる。$H_j = \max(\eta_s - z_{b,i},\ $`dry_depth`$)$ で、$\eta_s$ は上流端の湿ったセルの水位の平均（断面で共通の水位） | 平衡給砂（境界セルの流砂量と同じ量）、または給砂なし |
+| 下流端（水位固定） | 与えた水位 $\eta_b$ を境界辺の上の値とし、母点から辺までの距離 $\delta_j/2$ で水位勾配を評価する。$w_j\eta_b$ を右辺へ移す | 風上側の値で自由に流出 |
 | 下流端（水深一定） | 境界セルの河床高に一定の水深を加えた値を $\eta_b$ とする | 同上 |
+
+開境界の決め方の理由は [ADR-0007](adr/0007-open-boundaries.md) にあります。
+
+- 水位を境界辺の上に置くと、等流が離散解として厳密に成り立ちます（検証ケース V06）。鏡映点に置くと、水面に勾配がある流れで $O(I\delta_j)$ の誤差が出ます。
+- 通水能の水深を各セルの水深から求めると、深くなったセルほど流入が増える正のフィードバックで、横断方向に不安定になります。断面で共通の水位を使うと、配分は河床高の違いだけで決まります。
+- 流量境界の辺の流速 $u_j$ は、単位幅流量 $Q_j/L_j$ を内側のセルの新しい水深で割った値にします（Perot 再構成と出力に使う）。
+- 下流端の辺の水深の風上は、流出なら内側のセルの水位、流入なら $\eta_b$ で決め、河床高には内側のセルの値を使います。
 
 ## 7. 時間刻みの制約
 
 - **重力波**：水位勾配を陰的に扱うので、重力波の Courant 条件 $(\lvert\mathbf{u}\rvert + \sqrt{gh})\Delta t / \Delta x \le 1$ には制約されません。
 - **移流**：移流は陽的な風上差分なので、セルから1ステップで流出する体積がセルの体積を超えないことが必要です。おおよそ $\lvert\mathbf{u}\rvert\Delta t/\Delta x \lesssim 1$ です。
+  - 運動量の移流がなくても、この制約はかかります。連続式の辺の水深 $H_j^n$ を時刻 $n$ の風上側からとるので、水深を陽的な風上差分で移流しているのと同じになるためです。
+  - V06（流速 1.87 m/s、格子幅 2 m）では、クーラン数 0.47 で安定、1.9 で不安定でした。0.93 では、正方形配置は安定、六角形配置は不安定でした（六角形のセルは体積に対する流出量が大きく、上の条件を満たさないセルがある）。
 
 $$
 \Delta t \sum_{j\in\partial i,\ s_{i,j} q_j > 0} s_{i,j}\, L_j\, q_j \le V_i
@@ -328,7 +368,6 @@ $$
 
 実装の過程で決め、結果を ADR に記録します。
 
-- 辺の水深 $H_j$ の定義の細部（wet/dry の境界付近、$u_j = 0$ のときの扱い）
 - 移流の重み $\alpha_j$、2次精度化と制限関数
 - 運動量保存形とエネルギー水頭保存形を切り替える判定方法
 - セル内の河床の起伏（サブグリッド地形、Casulli, 2009）を体積関数に入れるかどうか

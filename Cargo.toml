@@ -21,3 +21,8 @@ missing_docs = "warn"
 
 [lints.clippy]
 dbg_macro = "warn"
+
+# 検証テスト（tests/verification.rs）は数千セルの計算を数百ステップ進めるので、
+# `cargo test` のビルドも最適化する（デバッグ用の検査 debug-assertions と overflow-checks は残る）。
+[profile.test]
+opt-level = 2

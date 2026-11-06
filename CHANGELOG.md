@@ -33,4 +33,15 @@
 - CI：fmt・clippy・test（ubuntu・windows）、MSRV の check、`cargo doc`、`tools/` の pytest
 - 環境変数 `VORMORPH_REQUIRE_GMSH=1` で、gmsh を読み込めないときに `tools/tests/test_gmsh.py` を飛ばさずに失敗させる。CI と Codespaces で設定し、共有ライブラリの不足を見逃さないようにする
 - GitHub Codespaces の開発環境 `.devcontainer/`（Rust、uv、gmsh 用の共有ライブラリ、tmux、SSH サーバー。作成時にリリースビルドと `uv sync` を実行）と、使い方の文書 `docs/codespaces.md`（アイドルタイムアウト、結果の取り出し、無料枠）。README に「Open in GitHub Codespaces」のボタン
+- 行列フリーの Jacobi 前処理付き共役勾配法 `linsolve::pcg`。右辺が 0 のとき、作業配列の長さが違うとき、正定値でない行列（対角が負、pᵀAp ≤ 0）、反復の打ち切りを単体テストで確かめる
+- 半陰解法の1ステップ `hydro::HydroSolver::step`（壁で囲んだ水域）：辺の水深 `hydro::edge_depths`（風上の水位と高い方の河床高、`dry_depth` 未満の辺は乾いた辺）、陰的な摩擦（|u| は Perot 流速の接線成分を含む）、行列フリーの係数行列 `hydro::WaterLevelOperator`、修正量の形の Newton 法と PCG、θ 平均流量、乾いたセルの水位を河床高に揃える処理。移流は次の段階で実装し、それまでは移流項を省く
+- ADR-0006（wet/dry を辺の水深で判定し、水位の連立方程式を修正量の形の Newton 法で解く）。`docs/design/overview.md` に Newton 法の初期値と単調収束の根拠を追記
+- 時間ループ `model::Model`：`with_state`（与えた格子と状態から組み立てる。乾いたセルの水位と壁の流速を整え、配列の長さと境界条件の対応を検査して `ModelError::Setup` を返す）、`step`（時刻は開始時刻 + ステップ数 × Δt）、`run`、`write_output`、水の収支（上流端・下流端の流量は θ 平均流量から）
+- `hydro.manning_n = 0`（摩擦なし）を許す。`[sediment]` があるときは正の値を要求する
+- 検証ケース V03（静水保持）と V04（閉鎖水域の振動）を実装。V03 は流速・水位の変化が厳密に 0、V04 は体積の相対誤差が $10^{-13}$ 程度。V04 の解析解との比較は、移流がないため振動が減衰するので、移流の実装後に基準を決める。結果は `docs/verification.md` に記録
+- 環境変数 `VORMORPH_VERIFICATION_OUTPUT` で、検証ケースの VTK を書き出す
+- `cargo test` のビルドを最適化する（`[profile.test] opt-level = 2`。検証テストの実行時間を短くするため）
+- 開境界 `hydro::HydroSolver::step`：上流端の流量境界（断面で共通の水位から求めた通水能で配分）、下流端の水位境界と水深一定の境界（水位を境界辺の上に置き、母点から辺までの距離で勾配を評価）
+- ADR-0007（開境界の水位を境界辺の上に置き、流量は断面で共通の水位から求めた通水能で配分する）。`docs/design/overview.md` の第6章（境界条件）と第7章（辺の水深を風上からとることによるクーラン数の制約）を更新
+- 検証ケース V06（等流）を実装。3つの格子で中央部の水深の相対誤差が $10^{-9}$ 程度（合格基準を $10^{-4}$ に確定）。図 `docs/images/v06_uniform_flow.png` と、検証ケースの図を描く `tools/plot_verification.py`（pytest のテストつき）
 - ライセンス：MIT OR Apache-2.0
