@@ -402,13 +402,19 @@ pub enum UpstreamBoundary {
     Wall,
 }
 
-/// 上流端の給砂の条件。
+/// 上流端の給砂の条件（ADR-0011、ADR-0013）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SedimentSupply {
-    /// 平衡給砂：境界セルの流砂量と同じ量を供給する。
+    /// 平衡給砂：各ステップの上流端の流れから求めた掃流砂量（流砂量式の値）を供給する。
+    /// 給砂量は上流端の流れに追従するので、長い時間では河床勾配が初期の状態に戻るとは
+    /// 限らない。
     #[default]
     Equilibrium,
+    /// 一定の給砂量：河床変動を始めた最初のステップの平衡給砂量の合計を保ち、各ステップの
+    /// 平衡給砂量に比例して辺に配る。上流端の流れが時間とともに速くなる条件（構造物の水面低下が
+    /// 上流端に届く場合など）では、上流の区間が給砂不足で下がり、流路が分化しうる（ADR-0013）。
+    Constant,
     /// 給砂しない。
     None,
 }
@@ -772,6 +778,7 @@ impl SedimentSupply {
     fn name(self) -> &'static str {
         match self {
             Self::Equilibrium => "equilibrium",
+            Self::Constant => "constant",
             Self::None => "none",
         }
     }

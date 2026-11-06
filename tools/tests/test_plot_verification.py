@@ -20,6 +20,8 @@ from plot_verification import (
     V07_Q,
     bump_depth,
     bump_jump_solution,
+    bump_linear_celerity,
+    crest_position,
     dam_break_depth,
     normal_depth,
     read_collection,
@@ -123,3 +125,15 @@ def test_bump_jump_satisfies_belanger_and_matches_swashes() -> None:
     # 跳水で全水頭が失われ、下流の水深は境界条件の 0.33 m
     assert upstream > downstream
     assert bump_depth(np.array([20.0]))[0] == pytest.approx(0.33, abs=1e-9)
+
+
+def test_bump_linear_celerity_matches_the_rust_value() -> None:
+    # tests/verification.rs の V11 が表示する線形理論の値（0.1184 m/s）
+    assert bump_linear_celerity() == pytest.approx(0.1184, abs=5e-5)
+
+
+@pytest.mark.parametrize("peak", [10.3, 10.5, 10.74])
+def test_crest_position_is_exact_for_a_parabola(peak: float) -> None:
+    x = np.arange(0.0, 20.0, 0.5)
+    b = 1.0 - (x - peak) ** 2
+    assert crest_position(x, b) == pytest.approx(peak, abs=1e-12)

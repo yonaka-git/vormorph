@@ -1141,16 +1141,227 @@ fn v10_bend_scour() {
     todo!("湾曲水路の外岸洗掘")
 }
 
-/// V11 床止め下流の局所洗掘：洗掘深と格子依存性（`examples/sill.toml`）。
+/// V11 の条件（河床のこぶの移動）。
+mod bump {
+    /// 水路延長 \[m\]（x = 0 が上流端）。こぶの背水が上流端に届いて給砂量を変えないよう、
+    /// こぶの上流に 200 m とる。
+    pub const LENGTH: f64 = 300.0;
+    /// 河床勾配 \[-\]。
+    pub const SLOPE: f64 = 0.002;
+    /// マニングの粗度係数。
+    pub const MANNING_N: f64 = 0.025;
+    /// 単位幅流量 \[m²/s\]。
+    pub const UNIT_DISCHARGE: f64 = 2.0;
+    /// こぶの中心の初期位置 \[m\]。
+    pub const CENTER: f64 = 200.0;
+    /// こぶの幅（ガウス分布の σ）\[m\]。
+    pub const SIGMA: f64 = 4.0;
+    /// 河床変動を始める時刻（固定床の助走の後）\[s\]。
+    pub const MORPHOLOGY_START: f64 = 300.0;
+    /// 河床変動を計算する時間（流れの時間。MORFAC 10 で地形の時間 3000 s）\[s\]。
+    pub const DURATION: f64 = 300.0;
+
+    /// 等流水深 h_n \[m\]。
+    pub fn normal_depth() -> f64 {
+        (MANNING_N * UNIT_DISCHARGE / SLOPE.sqrt()).powf(0.6)
+    }
+
+    /// こぶを除いた河床高 \[m\]（下流端で 0）。
+    pub fn base(x: f64) -> f64 {
+        SLOPE * (LENGTH - x)
+    }
+}
+
+/// V11 の1ケースの結果。
+struct BumpRun {
+    /// 終了時の、こぶ（河床高 − 基準の河床高）の縦断形（x の小さい順）。
+    profile: Vec<(f64, f64)>,
+    /// 終了時の山の位置（3点の放物線で補間）と高さ \[m\]。
+    crest: (f64, f64),
+    /// 土砂の収支の誤差（給砂量に対する比）。
+    sediment_error: f64,
+}
+
+impl BumpRun {
+    /// 山の移動速度（流れの時間あたり）\[m/s\]。
+    fn crest_speed(&self) -> f64 {
+        (self.crest.0 - bump::CENTER) / bump::DURATION
+    }
+}
+
+/// こぶ（高さ `amplitude`）の移動を、幅1セルの正方形配置の水路で解く。
+fn bump_run(cell_size: f64, amplitude: f64, case: &str) -> BumpRun {
+    use bump::*;
+    let h_n = normal_depth();
+    let width = cell_size;
+    let boundary = format!(
+        r#"
+[boundary.upstream]
+kind = "discharge"
+discharge = {:?}
+
+[boundary.downstream]
+kind = "water_level"
+level = {h_n:?}
+"#,
+        UNIT_DISCHARGE * width
+    );
+    let end = MORPHOLOGY_START + DURATION;
+    let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, DURATION / 4.0);
+    config.time.dt = None;
+    config.time.courant = Some(0.5);
+    config.time.dt_max = Some(0.5);
+    config.time.morphology_start = MORPHOLOGY_START;
+    config.sediment = Some(sill_sediment());
+
+    let mesh = basin_mesh(ChannelLayout::Rectangular, LENGTH, width, cell_size);
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        let x = mesh.x_cell[c];
+        state.zb[c] = base(x) + amplitude * (-((x - CENTER) / SIGMA).powi(2)).exp();
+        state.eta[c] = base(x) + h_n;
+    }
+    for e in 0..mesh.n_edges() {
+        state.u_n[e] = UNIT_DISCHARGE / h_n * mesh.normal_edge[e][0];
+    }
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    if output_root().is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+    while !model.finished() {
+        model.step().expect("the step must succeed");
+    }
+
+    let (mesh, state) = (model.mesh(), model.state());
+    let mut profile: Vec<(f64, f64)> = (0..mesh.n_cells())
+        .map(|c| (mesh.x_cell[c], state.zb[c] - base(mesh.x_cell[c])))
+        .collect();
+    profile.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let k = (1..profile.len() - 1)
+        .max_by(|&a, &b| profile[a].1.total_cmp(&profile[b].1))
+        .expect("the profile has interior points");
+    let (b0, b1, b2) = (profile[k - 1].1, profile[k].1, profile[k + 1].1);
+    let crest = profile[k].0 + 0.5 * cell_size * (b0 - b2) / (b0 - 2.0 * b1 + b2);
+    let sediment = model.sediment_balance();
+    BumpRun {
+        crest: (crest, b1),
+        sediment_error: sediment.error() / sediment.inflow,
+        profile,
+    }
+}
+
+/// 線形理論のこぶの移動速度（流れの時間あたり）\[m/s\]。
 ///
-/// 格子幅を 3 段階に変え、最大洗掘深とその位置が格子幅に対して収束することを確かめる。
+/// 小さなこぶでは、流量一定の準定常な流れの水深の変化は δh = −δz / (1 − Fr²) で（こぶの長さが
+/// 摩擦の効く長さ h/C_f ≈ 180 m よりずっと短いので、摩擦の影響を省く）、河床の式は
+/// 速さ c = M / (1 − λ) · ∂q_b/∂z_b の移流になる。q_b は MPM 式で、
+/// ∂q_b/∂h = √(s g d³) · 12 (τ* − τ*_c)^{1/2} · (−7/3) τ*/h。
+fn bump_linear_celerity(sediment: &SedimentConfig) -> f64 {
+    use bump::*;
+    let (g, h) = (9.81, normal_depth());
+    let s = sediment.density / 1000.0 - 1.0;
+    let d = sediment.grain_size;
+    let u = UNIT_DISCHARGE / h;
+    let tau = MANNING_N * MANNING_N * u * u / (h.cbrt() * s * d);
+    let tau_c = sediment.bedload.critical_shields;
+    let dqb_dh = (s * g * d * d * d).sqrt() * 12.0 * (tau - tau_c).sqrt() * (-7.0 / 3.0) * tau / h;
+    let froude2 = u * u / (g * h);
+    let dqb_dz = -dqb_dh / (1.0 - froude2);
+    sediment.morfac / (1.0 - sediment.porosity) * dqb_dz
+}
+
+/// 2つの縦断形の差の L1 ノルム ∫ |b_1 − b_2| dx \[m²\]（細かい方の点で、粗い方を線形補間）。
+fn profile_difference(coarse: &[(f64, f64)], fine: &[(f64, f64)]) -> f64 {
+    let interpolate = |x: f64| {
+        let k = coarse
+            .partition_point(|p| p.0 < x)
+            .clamp(1, coarse.len() - 1);
+        let ((x0, b0), (x1, b1)) = (coarse[k - 1], coarse[k]);
+        b0 + (b1 - b0) * ((x - x0) / (x1 - x0)).clamp(0.0, 1.0)
+    };
+    let dx = fine[1].0 - fine[0].0;
+    fine.iter()
+        .map(|&(x, b)| (b - interpolate(x)).abs() * dx)
+        .sum()
+}
+
+/// V11 河床のこぶの移動：縦断形が格子を細かくすると収束すること、小さなこぶの移動速度。
+///
+/// 勾配 1/500 の等流（単位幅流量 2 m²/s、水深 1.069 m）の河床に、σ = 4 m のガウス型のこぶを
+/// 置き、固定床で 300 s 助走した後、河床変動を 300 s（MORFAC 10 で地形の時間 3000 s）解く。
+/// 流砂の条件は `examples/sill.toml` と同じ（d = 2 mm、MPM 式）で、上流端は平衡給砂。
+/// 1次元の流れを、幅1セルの正方形配置で解く。次を確かめる。
+///
+/// - 高さ 0.1 m のこぶを格子幅 1・0.5・0.25 m で解き、縦断形の差（L1）が格子を細かくするたびに
+///   減り、細かい2つの差がこぶの初期の体積の 15% 以下であること。こぶの前面は切り立って
+///   衝撃波になるので、1次精度の風上差分に相当する収束の遅さ（差の比 0.7 程度）を見込む
+/// - 高さ 0.02 m の小さなこぶ（格子幅 0.25 m）の山の移動速度が、線形理論の値の 5% 以内であること
+/// - 土砂の収支の誤差が給砂量の 10⁻¹⁰ 以下であること
 #[test]
-#[ignore = "未実装: model::Model（流れ・流砂・非侵食層）"]
-fn v11_sill_local_scour() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sill.toml");
-    let config = Config::load(path).expect("examples/sill.toml must be valid");
-    let _ = config;
-    todo!("格子幅を変えた計算と洗掘深の比較")
+fn v11_bump_migration() {
+    let celerity = bump_linear_celerity(&sill_sediment());
+    let initial_volume = 0.1 * bump::SIGMA * std::f64::consts::PI.sqrt();
+    let cases = [(1.0, 0.1), (0.5, 0.1), (0.25, 0.1), (0.25, 0.02)];
+    let runs: Vec<BumpRun> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .map(|(cell_size, amplitude)| {
+                scope.spawn(move || {
+                    bump_run(
+                        cell_size,
+                        amplitude,
+                        &format!("v11_{cell_size}m_{amplitude}m"),
+                    )
+                })
+            })
+            .into_iter()
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("the run must not panic"))
+            .collect()
+    });
+    let mut differences = Vec::new();
+    for (k, ((cell_size, amplitude), run)) in cases.iter().zip(&runs).enumerate() {
+        let difference =
+            (k > 0 && k < 3).then(|| profile_difference(&runs[k - 1].profile, &run.profile));
+        println!(
+            "V11 {cell_size} m, bump {amplitude} m: crest {:.2} m, height {:.4} m, \
+             crest speed {:.4} m/s ({:+.1}% of the linear theory {celerity:.4} m/s), \
+             L1 difference from the coarser grid {}, sediment balance error {:.1e}",
+            run.crest.0,
+            run.crest.1,
+            run.crest_speed(),
+            100.0 * (run.crest_speed() / celerity - 1.0),
+            difference.map_or("-".to_owned(), |d| format!(
+                "{d:.4} m^2 ({:.1}% of the bump)",
+                100.0 * d / initial_volume
+            )),
+            run.sediment_error
+        );
+        differences.extend(difference);
+        assert!(
+            run.sediment_error.abs() <= 1e-10,
+            "{cell_size} m: sediment balance {:e}",
+            run.sediment_error
+        );
+    }
+    assert!(
+        differences[1] < differences[0],
+        "the profile must converge: {differences:?}"
+    );
+    assert!(
+        differences[1] <= 0.15 * initial_volume,
+        "the finest difference {} m^2 exceeds 15% of the bump",
+        differences[1]
+    );
+    let small = &runs[3];
+    assert!(
+        (small.crest_speed() / celerity - 1.0).abs() <= 0.05,
+        "small bump: crest speed {} m/s against {celerity} m/s",
+        small.crest_speed()
+    );
 }
 
 /// 格子生成ツール（`tools/make_mesh.py`）で作った、延長 60 m・幅 10 m の直線水路の格子。
@@ -1193,12 +1404,14 @@ struct EquilibriumRun {
     dt: (f64, f64),
 }
 
-/// 勾配 1/500 の水路に、単位幅流量 2 m²/s の等流と平衡給砂を与え、河床変動を `end` 秒解く。
+/// 勾配 1/500 の水路に、単位幅流量 2 m²/s の等流と給砂（`supply` は `sediment_supply` の値）を
+/// 与え、河床変動を `end` 秒解く。
 fn equilibrium_bed_run(
     mesh: Mesh,
     length: f64,
     width: f64,
     end: f64,
+    supply: &str,
     case: &str,
 ) -> EquilibriumRun {
     const SLOPE: f64 = 0.002;
@@ -1211,7 +1424,7 @@ fn equilibrium_bed_run(
 [boundary.upstream]
 kind = "discharge"
 discharge = {:?}
-sediment_supply = "equilibrium"
+sediment_supply = "{supply}"
 
 [boundary.downstream]
 kind = "water_level"
@@ -1285,6 +1498,8 @@ level = {h_n:?}
 ///   母点の x が行ごとに半間隔ずれるので、通水能による流量の配分が偏り（V06）、上流端の近くの
 ///   流れがわずかに一様でなくなるため
 /// - 土砂と水の収支の誤差が、給砂量・流入量の 10⁻¹⁰ 以下
+/// - 一定の給砂量（ADR-0013）でも、六角形配置 2 m で中央部の変化が 10⁻³ m 以下、上流端に接する
+///   セルの変化が 10⁻² m 以下（辺ごとに給砂量を保つと、上流端のセルの偏りが増え続けたため）
 #[test]
 fn v12_equilibrium_bed() {
     const END: f64 = 600.0;
@@ -1313,7 +1528,7 @@ fn v12_equilibrium_bed() {
     for (name, mesh, length, width) in cases {
         let cells = mesh.n_cells();
         let case = format!("v12_{}", name.replace([',', ' '], "_").replace("__", "_"));
-        let run = equilibrium_bed_run(mesh, length, width, END, &case);
+        let run = equilibrium_bed_run(mesh, length, width, END, "equilibrium", &case);
         println!(
             "V12 {name}: {cells} cells, dt {:.3}..{:.3} s, max |dz_b| {:.1e} m (all), \
              {:.1e} m (central), {:.1e} m (inlet cells), supply {:.3} m^3, \
@@ -1359,4 +1574,27 @@ fn v12_equilibrium_bed() {
         hexagonal_central[1] <= 0.25 * hexagonal_central[0],
         "{hexagonal_central:?}"
     );
+
+    // 一定の給砂量（ADR-0013）：等流では最初の平衡給砂量のままなので、平衡給砂と同じ結果になる
+    let mesh = basin_mesh(ChannelLayout::Hexagonal, 200.0, 20.0, 2.0);
+    let run = equilibrium_bed_run(
+        mesh,
+        200.0,
+        20.0,
+        END,
+        "constant",
+        "v12_hexagonal_2m_constant",
+    );
+    println!(
+        "V12 hexagonal, 2 m, constant supply: max |dz_b| {:.1e} m (all), {:.1e} m (central), \
+         {:.1e} m (inlet cells), supply {:.3} m^3, sediment balance error {:.1e}",
+        run.max_change,
+        run.max_change_central,
+        run.max_change_inlet,
+        run.supply,
+        run.sediment_error
+    );
+    assert!(run.sediment_error.abs() <= 1e-10);
+    assert!(run.max_change_central <= 1e-3, "{}", run.max_change_central);
+    assert!(run.max_change_inlet <= 1e-2, "{}", run.max_change_inlet);
 }

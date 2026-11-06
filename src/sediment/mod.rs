@@ -24,6 +24,10 @@
 //!   の法線成分を使う。上流端は流入だけ、下流端は流出だけを許す。勾配を内側のセルから
 //!   外挿するので、一様な勾配の等流では境界辺の流砂量も内部の辺と一致し、平衡河床が保たれる
 //!   （検証ケース V12）。
+//! - 上流端の給砂：平衡給砂（`equilibrium`）は、各ステップの上流端の流れから求めた上の量。
+//!   一定の給砂量（`constant`）は、河床変動を始めた最初のステップの平衡給砂量の合計
+//!   Σ L_j q_{b,j} を保ち、各ステップの平衡給砂量に比例して辺に配る（ADR-0013）。給砂しない
+//!   （`none`）なら 0。
 //!
 //! **非侵食層（床止め）**：セル i から1ステップで流出する土砂量
 //! O_i = M Δt Σ_{流出} s L q_b と、時刻 n に非侵食層より上にある土砂量
@@ -180,6 +184,9 @@ pub struct SedimentSolver {
     avalanche_flux: Vec<f64>,
     /// 更新前の河床高 \[m\]
     zb_old: Vec<f64>,
+    /// 一定の給砂量（`constant`）で保つ、上流端からの給砂量の合計 Σ L_j q_{b,j}（流入を負）
+    /// \[m³/s\]（最初の [`SedimentSolver::compute_bedload`] で決める。それまでは `None`）
+    held_supply: Option<f64>,
     /// セルの浮上量 E_i \[m/s\]
     #[expect(dead_code, reason = "浮遊砂（V08）の実装で使う")]
     entrainment: Vec<f64>,
@@ -200,6 +207,7 @@ impl SedimentSolver {
             cap_factor: vec![1.0; n_cells],
             avalanche_flux: vec![0.0; n_edges],
             zb_old: vec![0.0; n_cells],
+            held_supply: None,
             entrainment: vec![0.0; n_cells],
             deposition: vec![0.0; n_cells],
         }
@@ -226,12 +234,33 @@ impl SedimentSolver {
             edge_depth,
             outside_level,
             cap_factor,
+            held_supply,
             ..
         } = self;
         hydro::edge_depths(mesh, state, outside_level, params.dry_depth, edge_depth);
         let scale = params.bedload_scale();
         for (e, q) in bedload_flux.iter_mut().enumerate() {
             *q = edge_capacity(params, mesh, state, edge_depth, scale, e);
+        }
+        // 一定の給砂量：最初のステップの合計を保ち、今の平衡給砂量に比例して辺に配る。辺ごとに
+        // 値を保つと、河床が上がって流量の配分が減った辺にも同じ量を入れ続けるので、上流端の
+        // セルの河床の偏りが増え続ける（ADR-0013）
+        if params.supply == Some(SedimentSupply::Constant) {
+            let inlet = || (0..mesh.n_edges()).filter(|&e| mesh.edge_kind[e] == EdgeKind::Upstream);
+            let total: f64 = inlet().map(|e| mesh.dv_edge[e] * bedload_flux[e]).sum();
+            let held = *held_supply.get_or_insert(total);
+            if total < 0.0 {
+                let ratio = held / total;
+                for e in inlet() {
+                    bedload_flux[e] *= ratio;
+                }
+            } else if held < 0.0 {
+                // 平衡給砂量が 0（流れが止まった）なら、辺の長さに比例して配る
+                let length: f64 = inlet().map(|e| mesh.dv_edge[e]).sum();
+                for e in inlet() {
+                    bedload_flux[e] = held / length;
+                }
+            }
         }
 
         // 非侵食層の頭打ち：セルごとに倍率を求め、辺は流出側のセルの倍率を掛ける
@@ -354,7 +383,11 @@ fn edge_capacity(
         ),
         EdgeKind::Upstream => {
             // 法線は領域の外を向くので、流入は u < 0
-            if params.supply != Some(SedimentSupply::Equilibrium) || u >= 0.0 {
+            let supplied = matches!(
+                params.supply,
+                Some(SedimentSupply::Equilibrium | SedimentSupply::Constant)
+            );
+            if !supplied || u >= 0.0 {
                 return 0.0;
             }
             (state.depth(c1), boundary_slope(mesh, &state.zb, e))
@@ -638,6 +671,32 @@ mod tests {
             let bed = solver.update_bed(&mesh, &mut state, 0.1);
             assert!(bed.max_change < 1e-15, "{layout:?}: {}", bed.max_change);
             assert_eq!(bed.avalanche_iterations, 0);
+        }
+    }
+
+    /// 一定の給砂量は、最初のステップの平衡給砂量の合計を保ち、上流端の流れが変わっても
+    /// 変えない（辺への配り方は今の平衡給砂量に比例）。平衡給砂は流れに追従する。
+    #[test]
+    fn constant_supply_keeps_the_first_equilibrium_rate() {
+        let mesh = mesh(10.0, 2.0, 1.0, ChannelLayout::Rectangular);
+        let fast = uniform_flow(&mesh, 0.002, 1.0, 2.0);
+        let slow = uniform_flow(&mesh, 0.002, 1.0, 1.6);
+        let mut constant = SedimentSolver::new(&mesh, params(Some(SedimentSupply::Constant), true));
+        let mut equilibrium =
+            SedimentSolver::new(&mesh, params(Some(SedimentSupply::Equilibrium), true));
+        let first = constant.compute_bedload(&mesh, &fast, 0.1);
+        let reference = equilibrium.compute_bedload(&mesh, &fast, 0.1);
+        assert!(first.inflow > 0.0);
+        assert_eq!(first.inflow, reference.inflow);
+        let later = constant.compute_bedload(&mesh, &slow, 0.1);
+        assert!((later.inflow / first.inflow - 1.0).abs() < 1e-14);
+        let following = equilibrium.compute_bedload(&mesh, &slow, 0.1);
+        assert!(following.inflow < 0.5 * first.inflow, "{following:?}");
+        // 辺への配り方は、今の平衡給砂量に比例する
+        let ratio = later.inflow / following.inflow;
+        for e in (0..mesh.n_edges()).filter(|&e| mesh.edge_kind[e] == EdgeKind::Upstream) {
+            let (q, q_eq) = (constant.bedload_flux()[e], equilibrium.bedload_flux()[e]);
+            assert!((q - ratio * q_eq).abs() <= 1e-14 * q.abs(), "edge {e}");
         }
     }
 
