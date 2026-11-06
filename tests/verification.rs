@@ -460,11 +460,80 @@ fn v05_dam_break() {
 
 /// V06 等流：マニング式の等流水深に一致すること。
 ///
-/// 直線水路（壁は滑り）で、中央部の水深が h_n = (n q / √I)^(3/5) と相対誤差 0.1% 以内。
+/// 直線水路（延長 200 m、幅 20 m、勾配 1/500、側壁は滑り）に流量 40 m³/s を与え、下流端の
+/// 水位を等流水位に固定する（`examples/sill.toml` と同じ流量・勾配・粗度）。一様な水深・
+/// 流速 0 から 1200 s 進め、中央部（50 m ≤ x ≤ 150 m）の水深と h_n = (n q / √I)^(3/5) の
+/// 相対誤差の最大値が 1e-4 以下であることを確かめる。格子は 2 m の正方形配置・六角形配置と、
+/// 上下流端に短い境界辺ができる 1 m の六角形配置（sill と同じ）。時間刻みは、辺の水深を
+/// 風上側からとることによるクーラン数の制約 U Δt / Δx ≤ 1 に対して、約 0.47 になるようにする。
 #[test]
-#[ignore = "未実装: model::Model（摩擦・流量境界）"]
 fn v06_uniform_flow() {
-    todo!("等流水深との比較")
+    const LENGTH: f64 = 200.0;
+    const WIDTH: f64 = 20.0;
+    const SLOPE: f64 = 0.002;
+    const DISCHARGE: f64 = 40.0;
+    const MANNING_N: f64 = 0.025;
+    const END: f64 = 1200.0;
+    let q = DISCHARGE / WIDTH;
+    let h_n = (MANNING_N * q / SLOPE.sqrt()).powf(0.6);
+    let boundary = format!(
+        r#"
+[boundary.upstream]
+kind = "discharge"
+discharge = {DISCHARGE:?}
+
+[boundary.downstream]
+kind = "water_level"
+level = {h_n:?}
+"#
+    );
+
+    let cases = [
+        ("rectangular, 2 m", ChannelLayout::Rectangular, 2.0),
+        ("hexagonal, 2 m", ChannelLayout::Hexagonal, 2.0),
+        ("hexagonal, 1 m", ChannelLayout::Hexagonal, 1.0),
+    ];
+    for (name, layout, cell_size) in cases {
+        let mesh = basin_mesh(layout, LENGTH, WIDTH, cell_size);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            state.zb[c] = SLOPE * (LENGTH - mesh.x_cell[c]);
+            state.eta[c] = state.zb[c] + h_n;
+        }
+        let case = format!("v06_{}_{cell_size}m", format!("{layout:?}").to_lowercase());
+        let dt = 0.25 * cell_size;
+        let config = flow_config(&case, dt, END, MANNING_N, &boundary, 300.0);
+        let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+        if output_root().is_some() {
+            model
+                .write_output()
+                .expect("the initial state must be written");
+        }
+        let mut pcg = 0;
+        while model.state().time < END {
+            let report = model.step().expect("the step must succeed");
+            pcg = pcg.max(report.pcg_iterations);
+        }
+
+        let (mesh, state) = (model.mesh(), model.state());
+        let relative_error = |c: usize| (state.depth(c) - h_n) / h_n;
+        let central = (0..mesh.n_cells()).filter(|&c| (50.0..=150.0).contains(&mesh.x_cell[c]));
+        let max_error = central.fold(0.0_f64, |m, c| m.max(relative_error(c).abs()));
+        let overall = (0..mesh.n_cells()).fold(0.0_f64, |m, c| m.max(relative_error(c).abs()));
+        let max_v = state.u_cell.iter().fold(0.0_f64, |m, u| m.max(u[1].abs()));
+        let balance = model.water_balance();
+        println!(
+            "V06 {name}: {} cells, dt {dt} s, h_n = {h_n:.6} m, max relative error {max_error:.1e} \
+             (central), {overall:.1e} (all cells), max |v| {max_v:.1e} m/s, \
+             water balance error {:.1e} of inflow, max PCG iterations {pcg}",
+            mesh.n_cells(),
+            balance.error() / balance.inflow
+        );
+        assert!(
+            max_error <= 1e-4,
+            "{name}: relative depth error {max_error:e}"
+        );
+    }
 }
 
 /// V07 跳水：共役水深と跳水位置。

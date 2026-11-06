@@ -322,7 +322,8 @@ pub struct BoundaryConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UpstreamBoundary {
-    /// 流量を与える。各境界辺へは通水能 K_j = L_j H_j^(5/3) / n に比例して配分する。
+    /// 流量を与える。各境界辺へは通水能 K_j = L_j H_j^(5/3) / n に比例して配分する。H_j は、
+    /// 上流端の湿ったセルの水位の平均（断面で共通の水位）から内側のセルの河床高を引いた値。
     Discharge {
         /// 流量 Q \[m³/s\]。
         discharge: f64,
@@ -349,12 +350,12 @@ pub enum SedimentSupply {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DownstreamBoundary {
-    /// 水位を固定する。
+    /// 水位を固定する（境界辺の上の水位）。
     WaterLevel {
         /// 水位 η \[m\]。
         level: f64,
     },
-    /// 水深を一定に保つ（境界セルの河床高に `depth` を加えた値を水位とする）。
+    /// 水深を一定に保つ（境界セルの河床高に `depth` を加えた値を、境界辺の上の水位とする）。
     Depth {
         /// 水深 h \[m\]。
         depth: f64,

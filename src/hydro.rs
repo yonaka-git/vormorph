@@ -40,10 +40,23 @@
 //!   係数行列は diag(A) + T（対称正定値）になる。V が凸なので、2段目以降の反復値は解以上に
 //!   あり、単調に減少して有限回で収束する（`docs/design/overview.md` の第4.3節）。
 //!
+//! ## 境界条件
+//!
+//! - 壁：u_j = 0、w_j = 0。
+//! - 上流端（流量）：Q を通水能 K_j = L_j max(η_s − z_{b,i}, `dry_depth`)^{5/3} / n に比例して
+//!   配分し、既知の流入 Q_j として右辺 b_i に入れる（w_j = 0）。η_s は上流端の湿ったセルの
+//!   水位の平均（断面で共通の水位。ADR-0007）、z_{b,i} は内側のセルの河床高。境界辺の u_j は、
+//!   単位幅流量 Q_j / L_j を新しい水深で割った値にする（Perot 再構成と出力に使う）。
+//! - 下流端（水位・水深）：境界辺の上の水位 η_b を既知とし、母点から辺までの距離
+//!   δ_j = `dc_edge` / 2 で水位勾配を評価する（ADR-0007）。w_j η_b を右辺へ移す。水深一定の
+//!   境界では η_b = z_{b,i} + 水深（z_{b,i} は内側のセルの河床高）。辺の水深の風上は、流出なら
+//!   内側のセル、流入なら η_b、u_j = 0 なら高い方の水位で決め、河床高は内側のセルの値を使う。
+//!
 //! ## 1ステップの手順
 //!
-//! 1. 辺の役割（内部・壁）と辺の水深 H_j^n を決める（[`edge_depths`]）。H_j は風上側の水位から
-//!    辺の河床高 max(z_{b,1}, z_{b,2}) を引いた値（Stelling & Duinmeijer, 2003）。
+//! 1. 辺の役割（内部・壁・流量境界・水位境界）と辺の水深 H_j^n を決める（[`edge_depths`]）。
+//!    H_j は風上側の水位から辺の河床高 max(z_{b,1}, z_{b,2}) を引いた値（Stelling & Duinmeijer,
+//!    2003）。上流端の流量 Q を、通水能に比例して境界辺に配分する（下の「境界条件」）。
 //! 2. 移流を評価して F u_j^n を求める。**移流は次の段階で実装する**（[`advection`]）。
 //!    それまでは F u_j^n = u_j^n とする。
 //! 3. 摩擦係数 γ_j、G_j、重み w_j、右辺 b_i を組み立てる。
@@ -158,32 +171,77 @@ enum EdgeRole {
     Interior,
     /// 壁（法線流速 0）。
     Wall,
+    /// 流量境界（流入量を与える）。
+    Discharge,
+    /// 水位境界。値は境界辺の上の水位 η_b \[m\]。
+    Level(f64),
 }
 
-/// 辺 `e` の役割を決める。
-fn edge_role(mesh: &Mesh, boundary: &BoundaryConfig, e: usize) -> EdgeRole {
+/// 辺 `e` の役割を決める。水深一定の境界では、内側のセルの河床高に水深を加えた値を η_b とする。
+fn edge_role(mesh: &Mesh, state: &State, boundary: &BoundaryConfig, e: usize) -> EdgeRole {
     match mesh.edge_kind[e] {
         EdgeKind::Interior => EdgeRole::Interior,
         EdgeKind::Wall => EdgeRole::Wall,
         EdgeKind::Upstream => match boundary.upstream {
             UpstreamBoundary::Wall => EdgeRole::Wall,
-            UpstreamBoundary::Discharge { .. } => todo!("上流端の流量境界"),
+            UpstreamBoundary::Discharge { .. } => EdgeRole::Discharge,
         },
         EdgeKind::Downstream => match boundary.downstream {
             DownstreamBoundary::Wall => EdgeRole::Wall,
-            DownstreamBoundary::WaterLevel { .. } | DownstreamBoundary::Depth { .. } => {
-                todo!("下流端の水位・水深境界")
+            DownstreamBoundary::WaterLevel { level } => EdgeRole::Level(level),
+            DownstreamBoundary::Depth { depth } => {
+                EdgeRole::Level(state.zb[mesh.cells_on_edge[e][0]] + depth)
             }
         },
     }
 }
 
-/// 水位勾配を評価する辺なら (η_{1(j)}, η_{2(j)}, δ_j) を返す。壁なら `None`。
+/// 水位勾配を評価する辺なら (η_{1(j)}, η_{2(j)}, δ_j) を返す。壁と流量境界なら `None`。
+///
+/// 水位境界では、η_2 を境界辺の上の水位 η_b、δ_j を母点から辺までの距離（`dc_edge` の半分）
+/// とする（ADR-0007）。
 fn gradient_points(mesh: &Mesh, role: EdgeRole, eta: &[f64], e: usize) -> Option<(f64, f64, f64)> {
     let [c1, c2] = mesh.cells_on_edge[e];
     match role {
         EdgeRole::Interior => Some((eta[c1], eta[c2], mesh.dc_edge[e])),
-        EdgeRole::Wall => None,
+        EdgeRole::Level(level) => Some((eta[c1], level, 0.5 * mesh.dc_edge[e])),
+        EdgeRole::Wall | EdgeRole::Discharge => None,
+    }
+}
+
+/// 流量境界の辺 `e` の通水能の重み L_j max(η_s − z_{b,i}, `dry_depth`)^{5/3}。
+///
+/// η_s は上流端の断面の水位（[`inflow_section_level`]）、z_{b,i} は内側のセルの河床高。
+/// 粗度係数は辺によらないので、配分の比 K_j / Σ K_j では打ち消し合う。水深の下限を
+/// `dry_depth` とするので、上流端のセルがすべて乾いていれば辺の長さに比例して配分される。
+fn conveyance(mesh: &Mesh, state: &State, section_level: f64, dry_depth: f64, e: usize) -> f64 {
+    let h = (section_level - state.zb[mesh.cells_on_edge[e][0]]).max(dry_depth);
+    mesh.dv_edge[e] * h.powf(5.0 / 3.0)
+}
+
+/// 上流端の断面の水位 η_s \[m\]：流量境界の辺の内側の湿ったセル（水深 ≥ `dry_depth`）の水位を、
+/// 辺の長さで重み付けして平均した値。湿ったセルがなければ −∞。
+///
+/// 各セルの水深で通水能を計算すると、深くなったセルほど流入が増えてさらに深くなる正の
+/// フィードバックが生じ、横断方向に不安定になる（ADR-0007）。断面で共通の水位を使うと、
+/// 配分は河床高の違いだけで決まる。
+fn inflow_section_level(mesh: &Mesh, state: &State, role: &[EdgeRole], dry_depth: f64) -> f64 {
+    let (mut sum, mut length) = (0.0, 0.0);
+    for (e, _) in role
+        .iter()
+        .enumerate()
+        .filter(|&(_, &r)| r == EdgeRole::Discharge)
+    {
+        let c = mesh.cells_on_edge[e][0];
+        if state.depth(c) >= dry_depth {
+            sum += mesh.dv_edge[e] * state.eta[c];
+            length += mesh.dv_edge[e];
+        }
+    }
+    if length > 0.0 {
+        sum / length
+    } else {
+        f64::NEG_INFINITY
     }
 }
 
@@ -291,19 +349,35 @@ impl HydroSolver {
 
         // 1. 辺の役割と辺の水深
         for (e, (r, level)) in role.iter_mut().zip(outside_level.iter_mut()).enumerate() {
-            *r = edge_role(mesh, boundary, e);
-            *level = f64::NEG_INFINITY;
+            *r = edge_role(mesh, state, boundary, e);
+            *level = match *r {
+                EdgeRole::Level(eta_b) => eta_b,
+                _ => f64::NEG_INFINITY,
+            };
         }
         edge_depths(mesh, state, outside_level, params.dry_depth, edge_depth);
+        let discharge = match boundary.upstream {
+            UpstreamBoundary::Discharge { discharge, .. } => discharge,
+            UpstreamBoundary::Wall => 0.0,
+        };
+        let section_level = inflow_section_level(mesh, state, role, params.dry_depth);
+        let total_conveyance: f64 = (0..mesh.n_edges())
+            .filter(|&e| role[e] == EdgeRole::Discharge)
+            .map(|e| conveyance(mesh, state, section_level, params.dry_depth, e))
+            .sum();
 
         // 2. 移流（次の段階で実装する）
         advected.copy_from_slice(&state.u_n);
 
-        // 3. 摩擦係数、G_j、重み w_j、右辺に入る流量
+        // 3. 摩擦係数、G_j、重み w_j、右辺に入る流量（流量境界では配分した流入量）
         for e in 0..mesh.n_edges() {
             let h = edge_depth[e];
             let (mut gamma, mut big_g, mut w, mut flux) = (0.0, 0.0, 0.0, 0.0);
-            if h > 0.0 {
+            if role[e] == EdgeRole::Discharge {
+                // 法線は領域の外を向くので、流入は負の流量
+                flux = -discharge * conveyance(mesh, state, section_level, params.dry_depth, e)
+                    / total_conveyance;
+            } else if h > 0.0 {
                 if let Some((eta1, eta2, delta)) = gradient_points(mesh, role[e], &state.eta, e) {
                     gamma = g * n2 * edge_speed(mesh, state, e) / h.powf(4.0 / 3.0);
                     let denom = 1.0 + dt * gamma;
@@ -374,7 +448,12 @@ impl HydroSolver {
         for e in 0..mesh.n_edges() {
             let h = edge_depth[e];
             let (mut u_new, mut q) = (0.0, 0.0);
-            if h > 0.0 {
+            if role[e] == EdgeRole::Discharge {
+                // 流入の単位幅流量を与え、流速は新しい水深から求める（Perot 再構成と出力用）
+                q = explicit_flux[e] / mesh.dv_edge[e];
+                let depth = state.depth(mesh.cells_on_edge[e][0]).max(params.dry_depth);
+                u_new = q / depth;
+            } else if h > 0.0 {
                 if let Some((eta1, eta2, delta)) = gradient_points(mesh, role[e], &state.eta, e) {
                     u_new = explicit_part[e]
                         - theta * g * dt * (eta2 - eta1) / (delta * (1.0 + dt * friction[e]));
@@ -746,6 +825,58 @@ mod tests {
         }
         assert_eq!(state.eta, initial.eta);
         assert!(state.u_n.iter().all(|&u| u == 0.0));
+    }
+
+    /// 上流端の流量は、断面で共通の水位から求めた通水能に比例して配分される。
+    #[test]
+    fn discharge_is_distributed_by_conveyance_with_a_common_level() {
+        let mesh = mesh(4.0, 4.0, 1.0, ChannelLayout::Rectangular);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            // 横断方向に河床高が変わる断面。水位は一様。
+            state.zb[c] = 0.1 * mesh.y_cell[c];
+            state.eta[c] = 1.0;
+        }
+        let boundary = BoundaryConfig {
+            upstream: UpstreamBoundary::Discharge {
+                discharge: 3.0,
+                sediment_supply: crate::config::SedimentSupply::None,
+            },
+            downstream: DownstreamBoundary::Depth { depth: 0.5 },
+        };
+        let mut solver = HydroSolver::new(&mesh, params(0.03));
+        let zb_before = state.zb.clone();
+        solver.step(&mesh, &mut state, &boundary, 0.1).unwrap();
+
+        let upstream: Vec<usize> = (0..mesh.n_edges())
+            .filter(|&e| mesh.edge_kind[e] == EdgeKind::Upstream)
+            .collect();
+        assert_eq!(upstream.len(), 4);
+        let inflow: f64 = upstream
+            .iter()
+            .map(|&e| -mesh.dv_edge[e] * solver.theta_flux()[e])
+            .sum();
+        assert!((inflow - 3.0).abs() < 1e-12, "inflow {inflow}");
+        for &e in &upstream {
+            let c = mesh.cells_on_edge[e][0];
+            let expected = 3.0 * (1.0 - zb_before[c]).powf(5.0 / 3.0)
+                / upstream
+                    .iter()
+                    .map(|&f| (1.0 - zb_before[mesh.cells_on_edge[f][0]]).powf(5.0 / 3.0))
+                    .sum::<f64>();
+            let share = -mesh.dv_edge[e] * solver.theta_flux()[e];
+            assert!((share - expected).abs() < 1e-12, "{share} != {expected}");
+            assert!(state.u_n[e] < 0.0, "inflow must point into the domain");
+        }
+
+        // 水深一定の境界の水位は、内側のセルの河床高 + 水深
+        for e in (0..mesh.n_edges()).filter(|&e| mesh.edge_kind[e] == EdgeKind::Downstream) {
+            let c = mesh.cells_on_edge[e][0];
+            assert_eq!(
+                edge_role(&mesh, &state, &boundary, e),
+                EdgeRole::Level(state.zb[c] + 0.5)
+            );
+        }
     }
 
     /// 1ステップの計算を `steps` 回繰り返し、体積の保存、Newton 法の収束、η ≥ z_b を確かめる。
