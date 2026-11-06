@@ -33,4 +33,5 @@
 - CI：fmt・clippy・test（ubuntu・windows）、MSRV の check、`cargo doc`、`tools/` の pytest
 - 環境変数 `VORMORPH_REQUIRE_GMSH=1` で、gmsh を読み込めないときに `tools/tests/test_gmsh.py` を飛ばさずに失敗させる。CI と Codespaces で設定し、共有ライブラリの不足を見逃さないようにする
 - GitHub Codespaces の開発環境 `.devcontainer/`（Rust、uv、gmsh 用の共有ライブラリ、tmux、SSH サーバー。作成時にリリースビルドと `uv sync` を実行）と、使い方の文書 `docs/codespaces.md`（アイドルタイムアウト、結果の取り出し、無料枠）。README に「Open in GitHub Codespaces」のボタン
+- 行列フリーの Jacobi 前処理付き共役勾配法 `linsolve::pcg`。右辺が 0 のとき、作業配列の長さが違うとき、正定値でない行列（対角が負、pᵀAp ≤ 0）、反復の打ち切りを単体テストで確かめる
 - ライセンス：MIT OR Apache-2.0
