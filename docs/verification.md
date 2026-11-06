@@ -553,7 +553,7 @@ uv run --project tools python tools/plot_verification.py v11 output/verification
 - 床止めの直下の側壁沿いのセル（横断方向の流速 0.23 m/s が出るセル）の河床の変化は、同じ断面の平均から 0.19 m ずれました。内部は 0.06 m 以下、直線の壁ぎわは 0.04 m 以下、水路の四隅は 0.0002 m です。母点が重心からずれた壁ぎわのセルで、落差による流速の急な変化があるところの Perot 法の誤差によるものです（[mesh-generation.md](design/mesh-generation.md) の第3節）。
 - 最初は下流端を水深一定にしていましたが、下流の区間全体が 1.7〜2.3 m 低下したので、水位固定に変えました（[ADR-0011](design/adr/0011-edge-bedload.md)）。
 
-### V01・V02・V06・V12：周期境界（2026-11-07, commit PERIODICCOMMIT）
+### V01・V02・V06・V12：周期境界（2026-11-07, commit 7e87101）
 
 上流端と下流端をつないだ周期的な水路（[ADR-0014](design/adr/0014-periodic-channel.md)）の結果です。`cargo test --release --test verification -- v01 v02 v06 v12 --nocapture` の出力から抜き出しました。開境界の水路の結果は、上の各ケースの記録から変わっていません。
 
