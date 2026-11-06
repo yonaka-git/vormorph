@@ -478,7 +478,7 @@ uv run --project tools python tools/plot_verification.py v06 output/verification
 - 境界辺で河床勾配を外挿しない場合（勾配の項を 0 にする。一時的に変えて計算）は、上流端のセルで 5.0〜13 mm、中央部で 0.9〜4.4 mm 変わりました。格子を細かくしても減りません（六角形配置 1 m の中央部で 2.3 mm）。外挿は、平衡河床を保つための条件になっています（[ADR-0011](design/adr/0011-edge-bedload.md)）。
 - 給砂量（161 m³）は、単位幅の掃流砂量 $q_{b0}(1 + \gamma I)$ = 1.34×10⁻³ m²/s × 幅 20 m × 地形の時間 6000 s に一致します。
 
-### V11 河床のこぶの移動（2026-11-06, commit V11COMMIT）
+### V11 河床のこぶの移動（2026-11-06, commit ec28b0d）
 
 `cargo test --release --test verification v11 -- --nocapture` の出力です（河床変動 300 s 後、地形の時間 3000 s）。線形理論の移動速度は 0.1184 m/s です。
 
@@ -508,7 +508,7 @@ uv run --project tools python tools/plot_verification.py v11 output/verification
 - こぶの上流の区間は、全体が 0.5 mm 程度堆積しました。こぶの背水で上流の水深が増え、掃流力が下がるためで、物理的な応答です。そのため、重心ではなく山の位置で、線形理論と比べています。
 - 計算時間は、4ケースを並列にして 4 s 程度です（リリースビルド）。
 
-### V12 平衡河床の保持：一定の給砂量（2026-11-06, commit V11COMMIT）
+### V12 平衡河床の保持：一定の給砂量（2026-11-06, commit ec28b0d）
 
 六角形配置 2 m で、一定の給砂量（[ADR-0013](design/adr/0013-constant-sediment-supply.md)）でも平衡河床が保たれることを確かめました。河床の変化の最大値は $2.1\times10^{-3}$ m（上流端に接するセル）、中央部は $3.6\times10^{-4}$ m、給砂量は 161.1 m³、土砂の収支の誤差は $-5.3\times10^{-16}$ です。平衡給砂（$3.1\times10^{-3}$ m、$4.2\times10^{-4}$ m）と同じ水準です。
 
