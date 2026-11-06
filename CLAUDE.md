@@ -92,10 +92,22 @@ scope: config, mesh, hydro, linsolve, sediment, model, io, tools など（任意
 例   : feat(hydro): implement Perot velocity reconstruction
 ```
 
+## GitHub の運用
+
+作業ブランチの push、PR の作成とマージは、作者の確認を取らずに次の手順で行ってよい。
+
+1. main から作業ブランチを作る（`feat/...`, `fix/...`, `docs/...` など）。main には直接コミットしない。
+2. コミットのたびに「検証の方針」のコマンドをすべて通す。
+3. push して PR を作る。
+   - タイトルは Conventional Commits 形式（英語）。本文は日本語で、変更点・検証の結果（検証ケースの値を含む）・設計上の判断を書く。
+   - 本文に生成ツールの表記（「Generated with Claude Code」など）は入れない。AI との協働は、コミットの `Co-Authored-By` で示す。
+4. CI がすべて通ったら、merge commit でマージしてブランチを消す（`gh pr merge --merge --delete-branch`）。`docs/verification.md` がコミットのハッシュを参照するので、squash と rebase は使わない。検証の結果にハッシュを書き足すコミットは、同じ PR に入れる。
+5. CI が失敗したら、ブランチで直して push し直す。失敗したままマージしない。直せないときは作者に報告する。
+
 ## 恒久ルール
 
-1. GitHub のリモートリポジトリの作成と push は、必ず作者の確認を取ってから行う。
-2. メールの送信、GitHub の issue・PR・Discussion へのコメント、掲示板などへの書き込みは一切しない。
+1. main への直接の push、force push などの履歴の書き換え、リポジトリの作成・設定の変更・削除、タグと GitHub Releases の作成、issue の作成は、必ず作者の確認を取ってから行う（作業ブランチと PR は「GitHub の運用」の手順で行ってよい）。
+2. メールの送信、他人が作った issue・PR・Discussion へのコメント、掲示板などへの書き込みは一切しない。
 3. 作者の勤務先の業務データ・コード・社名を含めない。例題・テストデータは、すべて合成データか公開データにする。
 4. 参考文献の PDF はリポジトリにコミットしない（著作権のため）。`references/` に置き、`.gitignore` で除外する。一覧は `docs/references.md`。
 
