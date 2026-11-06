@@ -145,6 +145,89 @@ def binned_depth(mesh: meshio.Mesh, bin_width: float) -> tuple[np.ndarray, np.nd
     )
 
 
+# V07 こぶを越える跳水（tests/verification.rs の bump_jump モジュールと同じ条件）
+V07_Q = 0.18
+"""単位幅流量 [m²/s]。"""
+V07_H_DOWNSTREAM = 0.33
+"""下流端の水深 [m]。"""
+V07_Z_MAX = 0.2
+"""こぶの頂部の高さ [m]。"""
+V07_WIDTH = 0.2
+"""水路の幅 [m]。"""
+V07_G = 9.81
+"""重力加速度 [m/s²]。"""
+V07_CASES = (
+    ("v07_rectangular_0.1m", 0.1, "rectangular, 0.1 m", "-"),
+    ("v07_rectangular_0.05m", 0.05, "rectangular, 0.05 m", "-"),
+    ("v07_hexagonal_0.05m", 0.05, "hexagonal, 0.05 m", (0, (4, 2))),
+)
+"""（ケース名, 格子幅 [m], 凡例, 線種）。"""
+
+
+def bump_bed(x: np.ndarray) -> np.ndarray:
+    """V07 の河床高 z = 0.2 − 0.05 (x − 10)²（8 m < x < 12 m）[m]。"""
+    x = np.asarray(x, dtype=float)
+    return np.where((x > 8.0) & (x < 12.0), V07_Z_MAX - 0.05 * (x - 10.0) ** 2, 0.0)
+
+
+def bump_depth_for_head(head: float, z: float, supercritical: bool) -> float:
+    """全水頭 `head` の流れの、河床高 `z` での射流側または常流側の水深 [m]（なければ NaN）。"""
+    hc = (V07_Q**2 / V07_G) ** (1.0 / 3.0)
+    energy = head - z
+
+    def specific_energy(h: float) -> float:
+        return h + V07_Q**2 / (2.0 * V07_G * h * h)
+
+    if energy < specific_energy(hc):
+        return float("nan")
+    lo, hi = (1e-6, hc) if supercritical else (hc, energy)
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if (specific_energy(mid) > energy) == supercritical:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def bump_jump_solution() -> tuple[float, float, float, float, float]:
+    """V07 の解析解の（跳水の位置 [m], 共役水深 h₁, h₂ [m], 上流側・下流側の全水頭 [m]）。"""
+    hc = (V07_Q**2 / V07_G) ** (1.0 / 3.0)
+    upstream = V07_Z_MAX + 1.5 * hc
+    downstream = V07_H_DOWNSTREAM + V07_Q**2 / (2.0 * V07_G * V07_H_DOWNSTREAM**2)
+
+    def balance(x: float) -> float:
+        z = float(bump_bed(x))
+        h1 = bump_depth_for_head(upstream, z, True)
+        h2 = bump_depth_for_head(downstream, z, False)
+        return V07_Q**2 * (1.0 / h1 - 1.0 / h2) + 0.5 * V07_G * (h1 * h1 - h2 * h2)
+
+    lo, hi = 10.0, 12.0
+    while np.isnan(balance(lo)):
+        lo += 1e-3
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if balance(mid) > 0.0 else (lo, mid)
+    x_s = 0.5 * (lo + hi)
+    z = float(bump_bed(x_s))
+    h1 = bump_depth_for_head(upstream, z, True)
+    h2 = bump_depth_for_head(downstream, z, False)
+    return x_s, h1, h2, upstream, downstream
+
+
+def bump_depth(x: np.ndarray) -> np.ndarray:
+    """V07 の解析解の水深 [m]。"""
+    x_s, _, _, upstream, downstream = bump_jump_solution()
+    return np.array(
+        [
+            bump_depth_for_head(upstream, float(bump_bed(xi)), xi > 10.0)
+            if xi < x_s
+            else bump_depth_for_head(downstream, float(bump_bed(xi)), False)
+            for xi in np.atleast_1d(x)
+        ]
+    )
+
+
 def thacker_omega() -> float:
     """V04 の角振動数 ω = √(2 g h₀) / a [1/s]。"""
     return float(np.sqrt(2.0 * V04_G * V04_H0) / V04_A)
@@ -340,13 +423,83 @@ def plot_v05(root: Path, output: Path) -> None:
     fig.savefig(output, dpi=150)
 
 
+def plot_v07(root: Path, output: Path) -> None:
+    """V07 の図：水面の縦断形、跳水の近くの水深、横断方向の流速。"""
+    x_s, h1, h2, _, _ = bump_jump_solution()
+    fig, (top, middle, bottom) = plt.subplots(3, 1, figsize=(10, 9.5), constrained_layout=True)
+    line = np.linspace(0.0, 25.0, 2501)
+    exact = bump_depth(line)
+    bed = bump_bed(line)
+    zoom = (line > 10.8) & (line < 12.6)
+    top.plot(line, bed + exact, color=REFERENCE, lw=3.0, label="analytic")
+    middle.plot(line[zoom], exact[zoom], color=REFERENCE, lw=3.0, label="analytic")
+    for (case, dx, label, style), color in zip(V07_CASES, SERIES, strict=True):
+        time, mesh = last_step(root / case)
+        x, _, eta = longitudinal_profile(mesh, y_center=0.5 * V07_WIDTH, half_band=V07_WIDTH, bin_width=dx)
+        top.plot(x, eta, color=color, ls=style, lw=1.2, label=label)
+        x, h = binned_depth(mesh, dx)
+        near = (x > 10.8) & (x < 12.6)
+        middle.plot(x[near], h[near], color=color, ls=style, lw=1.2, marker="o", ms=3, label=label)
+        blocks = mesh.cell_data["velocity"]
+        v = np.abs(np.concatenate([np.asarray(b).reshape(len(b), -1) for b in blocks])[:, 1])
+        xc = cell_field(mesh, "x_cell")
+        index = np.floor(xc / dx).astype(int)
+        bins = np.unique(index)
+        bottom.semilogy(
+            [xc[index == k].mean() for k in bins],
+            np.maximum([v[index == k].max() for k in bins], 1e-16),
+            color=color,
+            ls=style,
+            lw=1.2,
+            label=label,
+        )
+    top.plot(line, bed, color=BED, lw=1.2, label="bed")
+    top.set_xlim(5.0, 16.0)
+    top.set_ylim(-0.02, 0.48)
+    top.set_xlabel("x [m]")
+    top.set_ylabel("elevation [m]")
+    top.set_title(f"(a) water surface, t = {time:g} s", loc="left", fontsize="medium")
+    top.legend(loc="upper right", fontsize="small", ncol=2)
+    top.grid(alpha=0.3)
+
+    middle.plot([x_s, x_s], [h1, h2], color=BED, lw=0.8, ls=":")
+    for depth, name, offset in ((h1, "h₁", (8, -4)), (h2, "h₂", (-80, 0))):
+        middle.annotate(
+            f"{name} = {depth:.3f} m",
+            (x_s, depth),
+            xytext=offset,
+            textcoords="offset points",
+            fontsize="small",
+            va="center",
+        )
+    middle.set_ylim(0.06, 0.345)
+    middle.set_xlabel("x [m]")
+    middle.set_ylabel("depth [m]")
+    middle.set_title(
+        f"(b) depth near the jump (analytic jump at x = {x_s:.2f} m, h₂/h₁ = {h2 / h1:.2f})",
+        loc="left",
+        fontsize="medium",
+    )
+    middle.legend(loc="lower right", fontsize="small")
+    middle.grid(alpha=0.3)
+
+    bottom.set_xlim(5.0, 16.0)
+    bottom.set_ylim(1e-16, 1.0)
+    bottom.set_xlabel("x [m]")
+    bottom.set_ylabel("max |v| in the cross-section [m/s]")
+    bottom.set_title("(c) transverse velocity", loc="left", fontsize="medium")
+    bottom.legend(loc="center right", fontsize="small")
+    bottom.grid(alpha=0.3)
+    fig.savefig(output, dpi=150)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("case", choices=["v04", "v05", "v06"], help="verification case")
+    parser.add_argument("case", choices=["v04", "v05", "v06", "v07"], help="verification case")
     parser.add_argument("root", type=Path, help="VORMORPH_VERIFICATION_OUTPUT of the test run")
     parser.add_argument("-o", "--output", type=Path, required=True, help="output image")
     args = parser.parse_args(argv)
-    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06}
+    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06, "v07": plot_v07}
     plots[args.case](args.root, args.output)
     print(f"wrote {args.output}")
     return 0

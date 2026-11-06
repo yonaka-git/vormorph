@@ -16,6 +16,10 @@ from plot_verification import (
     V05_L,
     V05_T,
     V05_X0,
+    V07_G,
+    V07_Q,
+    bump_depth,
+    bump_jump_solution,
     dam_break_depth,
     normal_depth,
     read_collection,
@@ -107,3 +111,15 @@ def test_stoker_state_satisfies_the_shock_relations() -> None:
     # SWASHES の値（h_m ≈ 2.54 mm、x_C(6 s) ≈ 6.26 m）
     assert hm == pytest.approx(2.539e-3, abs=1e-6)
     assert V05_X0 + V05_T * s == pytest.approx(6.2598, abs=1e-3)
+
+
+def test_bump_jump_satisfies_belanger_and_matches_swashes() -> None:
+    x_s, h1, h2, upstream, downstream = bump_jump_solution()
+    froude = V07_Q / (h1 * np.sqrt(V07_G * h1))
+    assert h2 / h1 == pytest.approx((np.sqrt(1.0 + 8.0 * froude**2) - 1.0) / 2.0, rel=1e-9)
+    # SWASHES の図の跳水の位置（約 11.7 m）と、上流の水深（約 0.41 m）
+    assert x_s == pytest.approx(11.6656, abs=1e-3)
+    assert bump_depth(np.array([2.0]))[0] == pytest.approx(0.4137, abs=1e-3)
+    # 跳水で全水頭が失われ、下流の水深は境界条件の 0.33 m
+    assert upstream > downstream
+    assert bump_depth(np.array([20.0]))[0] == pytest.approx(0.33, abs=1e-9)

@@ -49,4 +49,5 @@
 - ADR-0008（移流は、セルの運動量収支を、陽的に進めた水深の和で割って辺へ配る）。`docs/design/overview.md` の第4.4節（移流の離散式）、第5章、第7章、第8章を更新
 - 検証ケース V04 に、Thacker の解析解との比較の合格基準を追加（水塊の重心の誤差が 1周期後 0.12 m・3周期後 0.25 m 以下、水深の L1 誤差が 1周期後 20%・3周期後 40% 以下）。図 `docs/images/v04_thacker.png` と `tools/plot_verification.py v04`。VTK を書き出すときは、移流なしの計算と重心の時系列（`centroid.csv`）も書く。検証の図の色を、検証済みのカテゴリ配色にそろえる
 - 検証ケース V05（ダム破壊）を実装。SWASHES と同じ条件の Stoker（下流が湛水）と Ritter（下流が乾燥）の解析解と比べ、格子幅 0.1〜0.0125 m で L1 誤差の平均の収束次数 0.65〜0.70、Stoker の衝撃波の位置の誤差が格子幅の 1.2 倍以下。図 `docs/images/v05_dam_break.png` と `tools/plot_verification.py v05`
+- 検証ケース V07（跳水）を実装。SWASHES と同じ条件のこぶを越える流れ（頂部で射流に変わり、下流側の斜面で跳水する）を正方形配置で解き、跳水の位置の誤差が格子幅の 0.6 倍、跳水の直前と直後の水深の誤差が格子幅 0.05 m で 0.5% 以内。図 `docs/images/v07_hydraulic_jump.png` と `tools/plot_verification.py v07`。六角形配置で跳水の位置に横断方向の流れが生じる問題を、未決事項として記録
 - ライセンス：MIT OR Apache-2.0

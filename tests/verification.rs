@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use vormorph::config::{AdvectionScheme, ChannelLayout, Config};
 use vormorph::hydro;
 use vormorph::mesh::channel::{self, ChannelSpec};
-use vormorph::mesh::{Mesh, NONE, file};
+use vormorph::mesh::{EdgeKind, Mesh, NONE, file};
 use vormorph::model::Model;
 use vormorph::state::State;
 
@@ -814,14 +814,306 @@ level = {h_n:?}
     }
 }
 
-/// V07 跳水：共役水深と跳水位置。
+/// V07 のこぶを越える跳水（SWASHES の "transcritical flow with shock"）の諸元と解析解。
+mod bump_jump {
+    /// 水路の延長 \[m\]。
+    pub const L: f64 = 25.0;
+    /// 水路の幅 \[m\]（1次元の流れを、側壁が滑り条件の細い水路で解く）。
+    pub const WIDTH: f64 = 0.2;
+    /// 単位幅流量 \[m²/s\]。
+    pub const Q: f64 = 0.18;
+    /// 下流端の水深（= 水位。下流端の河床高は 0）\[m\]。
+    pub const H_DOWNSTREAM: f64 = 0.33;
+    /// こぶの頂部の高さ \[m\]。
+    pub const Z_MAX: f64 = 0.2;
+    /// 重力加速度 \[m/s²\]（設定の既定値）。
+    pub const G: f64 = 9.81;
+
+    /// 河床高 z(x) = 0.2 − 0.05 (x − 10)²（8 m < x < 12 m）、それ以外は 0 \[m\]。
+    pub fn bed(x: f64) -> f64 {
+        if 8.0 < x && x < 12.0 {
+            Z_MAX - 0.05 * (x - 10.0).powi(2)
+        } else {
+            0.0
+        }
+    }
+
+    /// 限界水深 h_c = (q² / g)^(1/3) \[m\]。
+    pub fn critical_depth() -> f64 {
+        (Q * Q / G).cbrt()
+    }
+
+    /// 比エネルギー E(h) = h + q² / (2 g h²) \[m\]。
+    fn specific_energy(h: f64) -> f64 {
+        h + Q * Q / (2.0 * G * h * h)
+    }
+
+    /// 全水頭 `head` の流れの、河床高 `z` での水深 \[m\]。`supercritical` なら射流側
+    /// （h < h_c）、そうでなければ常流側の根。比エネルギーが足りなければ `None`。
+    pub fn depth_for_head(head: f64, z: f64, supercritical: bool) -> Option<f64> {
+        let (hc, e) = (critical_depth(), head - z);
+        if e < specific_energy(hc) {
+            return None;
+        }
+        // 射流側では E は h について減少、常流側では増加する
+        let (mut lo, mut hi) = if supercritical { (1e-6, hc) } else { (hc, e) };
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            let above = specific_energy(mid) > e;
+            if above == supercritical {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(0.5 * (lo + hi))
+    }
+
+    /// 上流側の全水頭（こぶの頂部で限界流）\[m\]。
+    pub fn upstream_head() -> f64 {
+        Z_MAX + 1.5 * critical_depth()
+    }
+
+    /// 下流側の全水頭 \[m\]。
+    pub fn downstream_head() -> f64 {
+        H_DOWNSTREAM + Q * Q / (2.0 * G * H_DOWNSTREAM * H_DOWNSTREAM)
+    }
+
+    /// 跳水の位置 x_s \[m\]：射流側の水深 h₁ と下流側の常流の水深 h₂ が
+    /// q² (1/h₁ − 1/h₂) + g (h₁² − h₂²) / 2 = 0（Bélanger の式）を満たす位置。
+    pub fn jump_position() -> f64 {
+        let balance = |x: f64| {
+            let z = bed(x);
+            let h1 = depth_for_head(upstream_head(), z, true)?;
+            let h2 = depth_for_head(downstream_head(), z, false)?;
+            Some(Q * Q * (1.0 / h1 - 1.0 / h2) + 0.5 * G * (h1 * h1 - h2 * h2))
+        };
+        // 下流側の常流の根がある範囲で、頂部側（運動量が射流の方が大きい）から二分法
+        let (mut lo, mut hi) = (10.0, 12.0);
+        while balance(lo).is_none() {
+            lo += 1e-3;
+        }
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if balance(mid).is_some_and(|b| b > 0.0) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// 跳水の位置での共役水深 (h₁, h₂) \[m\]。
+    pub fn conjugate_depths() -> (f64, f64) {
+        let z = bed(jump_position());
+        let h1 = depth_for_head(upstream_head(), z, true).expect("h1 exists at the jump");
+        let h2 = depth_for_head(downstream_head(), z, false).expect("h2 exists at the jump");
+        (h1, h2)
+    }
+
+    /// 解析解の水深 \[m\]。跳水より上流は上流側の全水頭（頂部より上流は常流、下流は射流）、
+    /// 跳水より下流は下流側の全水頭の常流。
+    pub fn depth(x: f64) -> f64 {
+        let z = bed(x);
+        let h = if x < jump_position() {
+            depth_for_head(upstream_head(), z, x > 10.0)
+        } else {
+            depth_for_head(downstream_head(), z, false)
+        };
+        h.expect("the analytic solution exists everywhere")
+    }
+}
+
+/// V07 の1回の計算の結果。
+struct JumpRun {
+    /// 跳水の位置（x 方向に平均した水深が (h₁ + h₂)/2 を上回る位置）\[m\]。
+    jump: f64,
+    /// 跳水の直前（解析解の跳水の位置から 0.3 m 上流）の水深の相対誤差。
+    before: f64,
+    /// 跳水の直後（同じく 0.3 m 下流）の水深の相対誤差。
+    after: f64,
+    /// 跳水の位置（解析解・計算値）から格子幅の 3 倍以上離れた範囲の水深の相対誤差の最大値と、
+    /// その位置 \[m\]。
+    max_error: (f64, f64),
+    /// 下流端の流出量と上流端の流入量の比 − 1。
+    discharge_error: f64,
+    /// 横断方向の流速の最大値 \[m/s\]。
+    max_v: f64,
+}
+
+/// V07 の条件で、`end` 秒まで解く。
+fn bump_jump_run(layout: ChannelLayout, cell_size: f64, end: f64, case: &str) -> JumpRun {
+    use bump_jump::{H_DOWNSTREAM, L, Q, WIDTH};
+    let boundary = format!(
+        r#"
+[boundary.upstream]
+kind = "discharge"
+discharge = {:?}
+
+[boundary.downstream]
+kind = "water_level"
+level = {H_DOWNSTREAM:?}
+"#,
+        Q * WIDTH
+    );
+    // 跳水の直前の流速 q/h₁ ≈ 2.4 m/s に対するクーラン数が 0.5 以下
+    let dt = 0.5 * cell_size / 2.5;
+    let mesh = basin_mesh(layout, L, WIDTH, cell_size);
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        state.zb[c] = bump_jump::bed(mesh.x_cell[c]);
+        state.eta[c] = H_DOWNSTREAM;
+    }
+    let config = flow_config(case, dt, end, 0.0, &boundary, end / 4.0);
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    if output_root().is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+    while model.state().time < end - 1e-9 * dt {
+        model.step().expect("the step must succeed");
+    }
+    let (mesh, state) = (model.mesh(), model.state());
+
+    // x 方向に格子幅ごとのビンで平均した水深
+    let bins = (L / cell_size).round() as usize;
+    let (mut x_sum, mut h_sum, mut count) = (vec![0.0; bins], vec![0.0; bins], vec![0.0; bins]);
+    for c in 0..mesh.n_cells() {
+        let k = ((mesh.x_cell[c] / cell_size) as usize).min(bins - 1);
+        x_sum[k] += mesh.x_cell[c];
+        h_sum[k] += state.depth(c);
+        count[k] += 1.0;
+    }
+    let profile: Vec<(f64, f64)> = (0..bins)
+        .filter(|&k| count[k] > 0.0)
+        .map(|k| (x_sum[k] / count[k], h_sum[k] / count[k]))
+        .collect();
+    let error = |x: f64, h: f64| h / bump_jump::depth(x) - 1.0;
+    let error_near = |x0: f64| {
+        let &(x, h) = profile
+            .iter()
+            .min_by(|a, b| (a.0 - x0).abs().total_cmp(&(b.0 - x0).abs()))
+            .expect("the profile is not empty");
+        error(x, h)
+    };
+
+    let x_s = bump_jump::jump_position();
+    let (h1, h2) = bump_jump::conjugate_depths();
+    let threshold = 0.5 * (h1 + h2);
+    let jump = profile
+        .windows(2)
+        .find(|w| w[0].0 > 10.5 && w[0].1 < threshold && w[1].1 >= threshold)
+        .map(|w| w[0].0 + (threshold - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0))
+        .expect("the jump must be found downstream of the crest");
+    let max_error = profile
+        .iter()
+        .filter(|(x, _)| (x - x_s).abs() >= 3.0 * cell_size && (x - jump).abs() >= 3.0 * cell_size)
+        .map(|&(x, h)| (error(x, h).abs(), x))
+        .fold((0.0, f64::NAN), |m, e| if e.0 > m.0 { e } else { m });
+    let (inflow, outflow) = mesh
+        .edge_kind
+        .iter()
+        .zip(model.hydro().theta_flux())
+        .zip(&mesh.dv_edge)
+        .fold((0.0, 0.0), |(i, o), ((&kind, &q), &l)| match kind {
+            EdgeKind::Upstream => (i - l * q, o),
+            EdgeKind::Downstream => (i, o + l * q),
+            EdgeKind::Interior | EdgeKind::Wall => (i, o),
+        });
+    JumpRun {
+        jump,
+        before: error_near(x_s - 0.3),
+        after: error_near(x_s + 0.3),
+        max_error,
+        discharge_error: outflow / inflow - 1.0,
+        max_v: state.u_cell.iter().fold(0.0_f64, |m, u| m.max(u[1].abs())),
+    }
+}
+
+/// V07 跳水：こぶを越える流れの跳水の位置と、跳水の前後の水深。
 ///
-/// 射流で流入し、下流端の水位で跳水を起こす。共役水深比が Bélanger の式
-/// h₂/h₁ = (√(1 + 8 Fr₁²) − 1) / 2 と 2% 以内、跳水位置が運動量の釣り合いと整合すること。
+/// SWASHES（Delestre et al., 2013）の §3.1.5 と同じ条件（延長 25 m、こぶの高さ 0.2 m、
+/// q = 0.18 m²/s、下流端の水深 0.33 m、摩擦なし）で、こぶの頂部で常流から射流に変わり、
+/// 下流側で跳水して常流に戻る流れを、幅 0.2 m の水路で 300 s 解く。格子は正方形配置の
+/// 0.1 m と 0.05 m。次を確かめる。
+///
+/// - 定常になっている：下流端の流出量と上流端の流入量の差が 0.1% 以下
+/// - 跳水の位置（水深が共役水深の平均を上回る位置）の誤差が格子幅の 2 倍以下
+/// - 跳水の直前と直後（解析解の跳水の位置から 0.3 m 上流・下流）の水深の誤差が 2% 以下
+///   （解析解の共役水深の比 h₂/h₁ = 3.41 は Bélanger の式を満たす）
+/// - 跳水の近く（格子幅の 3 倍以内）を除く水深の誤差の最大値が 4% 以下で、格子を細かくすると
+///   減る
+///
+/// 六角形配置では、跳水の位置で側壁沿いに横断方向の流れが生じて定常にならないので、
+/// 合格基準には含めない（`docs/verification.md`）。
 #[test]
-#[ignore = "未実装: model::Model（保存型移流）"]
 fn v07_hydraulic_jump() {
-    todo!("共役水深と跳水位置")
+    let x_s = bump_jump::jump_position();
+    let (h1, h2) = bump_jump::conjugate_depths();
+    println!(
+        "V07: jump at {x_s:.4} m, conjugate depths {h1:.4} m / {h2:.4} m (ratio {:.3}), \
+         h_c = {:.4} m",
+        h2 / h1,
+        bump_jump::critical_depth()
+    );
+    let mut previous_max = f64::INFINITY;
+    for cell_size in [0.1, 0.05] {
+        let layout = ChannelLayout::Rectangular;
+        let case = format!("v07_{}_{cell_size}m", format!("{layout:?}").to_lowercase());
+        let run = bump_jump_run(layout, cell_size, 300.0, &case);
+        println!(
+            "V07 {layout:?}, {cell_size} m: jump at {:.3} m (error {:+.3} m = {:+.1} dx), \
+             depth error {:+.2}% before / {:+.2}% after the jump, \
+             max {:.2}% at x = {:.2} m, outflow / inflow − 1 = {:.1e}, max |v| {:.1e} m/s",
+            run.jump,
+            run.jump - x_s,
+            (run.jump - x_s) / cell_size,
+            100.0 * run.before,
+            100.0 * run.after,
+            100.0 * run.max_error.0,
+            run.max_error.1,
+            run.discharge_error,
+            run.max_v
+        );
+        assert!(
+            run.discharge_error.abs() <= 1e-3,
+            "{cell_size} m: not steady ({:e})",
+            run.discharge_error
+        );
+        assert!(
+            (run.jump - x_s).abs() <= 2.0 * cell_size,
+            "{cell_size} m: jump at {} m, exact {x_s} m",
+            run.jump
+        );
+        assert!(
+            run.before.abs() <= 0.02 && run.after.abs() <= 0.02,
+            "{cell_size} m: depth error {} before / {} after the jump",
+            run.before,
+            run.after
+        );
+        assert!(
+            run.max_error.0 <= 0.04 && run.max_error.0 < previous_max,
+            "{cell_size} m: max depth error {} at {} m",
+            run.max_error.0,
+            run.max_error.1
+        );
+        previous_max = run.max_error.0;
+    }
+    if output_root().is_some() {
+        // 図のために六角形配置も計算する（合格基準には含めない）
+        let run = bump_jump_run(ChannelLayout::Hexagonal, 0.05, 300.0, "v07_hexagonal_0.05m");
+        println!(
+            "V07 Hexagonal, 0.05 m (for the figure): jump at {:.3} m, depth error {:+.2}% before / \
+             {:+.2}% after the jump, outflow / inflow − 1 = {:.1e}, max |v| {:.1e} m/s",
+            run.jump,
+            100.0 * run.before,
+            100.0 * run.after,
+            run.discharge_error,
+            run.max_v
+        );
+    }
 }
 
 /// V08 トレンチ移動：浮遊砂の検証。
