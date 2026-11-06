@@ -20,7 +20,7 @@
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
-use vormorph::config::{ChannelLayout, Config};
+use vormorph::config::{AdvectionScheme, ChannelLayout, Config};
 use vormorph::hydro;
 use vormorph::mesh::channel::{self, ChannelSpec};
 use vormorph::mesh::{Mesh, NONE, file};
@@ -333,118 +333,174 @@ mod thacker {
     }
 }
 
-/// V04 閉鎖水域の振動：質量保存、負の水深が出ないこと。
+/// V04 の1回の計算の結果。
+struct ThackerRun {
+    /// 水の体積の相対誤差。
+    volume_error: f64,
+    /// 全ステップ・全セルの連続式の残差の最大値 \[m\]。
+    max_continuity: f64,
+    /// Newton 法の収束判定値 \[m\]。
+    newton_tol: f64,
+    /// Newton 法の反復回数の最大値。
+    max_newton: usize,
+    /// 1周期ごとの（水深の L1 誤差の解析解の体積に対する比、水塊の重心の誤差 \[m\]）。
+    errors: Vec<(f64, f64)>,
+}
+
+/// V04 の条件で `layout` の格子を `periods` 周期解く。
 ///
-/// 放物面の容器内で、平面の水面が回りながら振動する Thacker (1981) の解析解の条件で、
-/// 汀線が動く流れを3周期解く（摩擦なし）。次を確かめる。
-///
-/// - 水の体積の相対誤差 ≤ 1e-10
-/// - 全ステップで、乾いたセルを含む全セルの連続式の残差 |V_i^{n+1} − V_i^n + Δt Σ_j s L q^θ| / A_i
-///   が Newton 法の収束判定値以下（負の体積を避けるために水を作り出していない）
-///
-/// 半周期ごとの水深の L1 誤差と水塊の重心の誤差も表示する。移流がまだないので、新しく濡れた
-/// 辺が流速 0 から始まり、汀線が遅れて振動が減衰する。解析解との比較の合格基準は、移流を
-/// 実装する段階で決める（`docs/verification.md`）。
-#[test]
-fn v04_closed_basin_oscillation() {
+/// VTK を書き出すときは、ステップごとの水塊の重心と水深の L1 誤差を `centroid.csv` にも書く
+/// （`tools/plot_verification.py v04` の入力）。
+fn thacker_run(layout: ChannelLayout, advection: AdvectionScheme, case: &str) -> ThackerRun {
     const CELL_SIZE: f64 = 0.05;
     const STEPS_PER_PERIOD: u64 = 200;
     const PERIODS: u64 = 3;
     let period = 2.0 * PI / thacker::omega();
     let dt = period / STEPS_PER_PERIOD as f64;
 
+    let mesh = basin_mesh(layout, thacker::L, thacker::L, CELL_SIZE);
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
+        state.zb[c] = thacker::bed(x, y);
+        state.eta[c] = thacker::surface(x, y, 0.0).max(state.zb[c]);
+    }
+    let [u0, v0] = thacker::velocity(0.0);
+    for e in 0..mesh.n_edges() {
+        let [c1, c2] = mesh.cells_on_edge[e];
+        if c2 != NONE && state.depth(c1) > 0.0 && state.depth(c2) > 0.0 {
+            let [nx, ny] = mesh.normal_edge[e];
+            state.u_n[e] = u0 * nx + v0 * ny;
+        }
+    }
+
+    let mut config = flow_config(case, dt, PERIODS as f64 * period, 0.0, CLOSED, period / 8.0);
+    config.hydro.advection = advection;
+    let newton_tol = config.hydro.solver.newton_tol;
+    let record = output_root()
+        .is_some()
+        .then(|| config.output.dir.join("centroid.csv"));
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    if record.is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+
+    let mut csv = String::from("time,centroid_x,centroid_y,l1_error\n");
+    let mut result = ThackerRun {
+        volume_error: 0.0,
+        max_continuity: 0.0,
+        newton_tol,
+        max_newton: 0,
+        errors: Vec::new(),
+    };
+    for step in 1..=PERIODS * STEPS_PER_PERIOD {
+        let before = cell_volumes(model.mesh(), model.state());
+        let report = model.step().expect("the step must succeed");
+        result.max_newton = result.max_newton.max(report.newton_iterations);
+        let (mesh, state, q) = (model.mesh(), model.state(), model.hydro().theta_flux());
+        let after = cell_volumes(mesh, state);
+        for c in 0..mesh.n_cells() {
+            let outflow: f64 = mesh.edges_on_cell[c]
+                .iter()
+                .zip(&mesh.edge_sign_on_cell[c])
+                .map(|(&e, &s)| s * mesh.dv_edge[e] * q[e])
+                .sum();
+            let r = (after[c] - before[c] + dt * outflow).abs() / mesh.area_cell[c];
+            result.max_continuity = result.max_continuity.max(r);
+        }
+
+        let t = state.time;
+        let (mut l1, mut total, mut volume) = (0.0, 0.0, 0.0);
+        let (mut cx, mut cy) = (0.0, 0.0);
+        for (c, &v) in after.iter().enumerate() {
+            let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
+            let exact = thacker::depth(x, y, t);
+            l1 += mesh.area_cell[c] * (state.depth(c) - exact).abs();
+            total += mesh.area_cell[c] * exact;
+            volume += v;
+            cx += v * x;
+            cy += v * y;
+        }
+        let (l1, cx, cy) = (l1 / total, cx / volume, cy / volume);
+        csv.push_str(&format!("{t:?},{cx:?},{cy:?},{l1:?}\n"));
+        if step % (STEPS_PER_PERIOD / 2) == 0 {
+            let [ex, ey] = thacker::centroid(t);
+            let centroid_error = (cx - ex).hypot(cy - ey);
+            println!(
+                "  t = {:.2} T: L1 error of h {:.2}%, centroid error {:.4} m",
+                t / period,
+                100.0 * l1,
+                centroid_error
+            );
+            if step % STEPS_PER_PERIOD == 0 {
+                result.errors.push((l1, centroid_error));
+            }
+        }
+    }
+    let balance = model.water_balance();
+    result.volume_error = balance.error().abs() / balance.initial_volume;
+    println!(
+        "  volume error {:.1e}, max continuity residual {:.1e} m (tolerance {newton_tol:e}), \
+         max Newton iterations {}",
+        result.volume_error, result.max_continuity, result.max_newton
+    );
+    if let Some(path) = record {
+        std::fs::write(&path, csv).expect("the centroid history must be written");
+    }
+    result
+}
+
+/// V04 閉鎖水域の振動：質量保存、負の水深が出ないこと、Thacker の解析解との比較。
+///
+/// 放物面の容器内で、平面の水面が回りながら振動する Thacker (1981) の解析解の条件で、
+/// 汀線が動く流れを3周期解く（摩擦なし、格子幅 0.05 m、時間刻み T/200）。次を確かめる。
+///
+/// - 水の体積の相対誤差 ≤ 1e-10
+/// - 全ステップで、乾いたセルを含む全セルの連続式の残差 |V_i^{n+1} − V_i^n + Δt Σ_j s L q^θ| / A_i
+///   が Newton 法の収束判定値以下（負の体積を避けるために水を作り出していない）
+/// - 水塊の重心の誤差が 1周期後に 0.12 m 以下、3周期後に 0.25 m 以下
+/// - 水深の L1 誤差（解析解の体積に対する比）が 1周期後に 20% 以下、3周期後に 40% 以下
+///
+/// 解析解との基準は、移流がない場合（1周期後に重心の誤差 0.27 m、L1 誤差 46%）を検出できる
+/// 水準で、1次精度の誤差（格子幅を半分にすると約 0.6 倍）に余裕を持たせて決めた
+/// （`docs/verification.md`）。VTK を書き出すときは、図のために移流なしの計算も行う。
+#[test]
+fn v04_closed_basin_oscillation() {
     for layout in LAYOUTS {
         let case = format!("v04_{}", format!("{layout:?}").to_lowercase());
-        let mesh = basin_mesh(layout, thacker::L, thacker::L, CELL_SIZE);
-        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
-        for c in 0..mesh.n_cells() {
-            let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
-            state.zb[c] = thacker::bed(x, y);
-            state.eta[c] = thacker::surface(x, y, 0.0).max(state.zb[c]);
-        }
-        let [u0, v0] = thacker::velocity(0.0);
-        for e in 0..mesh.n_edges() {
-            let [c1, c2] = mesh.cells_on_edge[e];
-            if c2 != NONE && state.depth(c1) > 0.0 && state.depth(c2) > 0.0 {
-                let [nx, ny] = mesh.normal_edge[e];
-                state.u_n[e] = u0 * nx + v0 * ny;
-            }
-        }
-
-        let config = flow_config(
-            &case,
-            dt,
-            PERIODS as f64 * period,
-            0.0,
-            CLOSED,
-            period / 8.0,
-        );
-        let tol = config.hydro.solver.newton_tol;
-        let mut model = Model::with_state(config, mesh, state).expect("valid setup");
-        if output_root().is_some() {
-            model
-                .write_output()
-                .expect("the initial state must be written");
-        }
-
-        let mut max_continuity = 0.0_f64;
-        let mut newton = 0;
-        println!(
-            "V04 {layout:?}: {} cells, dt = {dt:.4} s",
-            model.mesh().n_cells()
-        );
-        for step in 1..=PERIODS * STEPS_PER_PERIOD {
-            let before = cell_volumes(model.mesh(), model.state());
-            let report = model.step().expect("the step must succeed");
-            newton = newton.max(report.newton_iterations);
-            let (mesh, state, q) = (model.mesh(), model.state(), model.hydro().theta_flux());
-            let after = cell_volumes(mesh, state);
-            for c in 0..mesh.n_cells() {
-                let outflow: f64 = mesh.edges_on_cell[c]
-                    .iter()
-                    .zip(&mesh.edge_sign_on_cell[c])
-                    .map(|(&e, &s)| s * mesh.dv_edge[e] * q[e])
-                    .sum();
-                let r = (after[c] - before[c] + dt * outflow).abs() / mesh.area_cell[c];
-                max_continuity = max_continuity.max(r);
-            }
-
-            if step % (STEPS_PER_PERIOD / 2) == 0 {
-                let t = state.time;
-                let (mut l1, mut total, mut volume) = (0.0, 0.0, 0.0);
-                let (mut cx, mut cy) = (0.0, 0.0);
-                for (c, &v) in after.iter().enumerate() {
-                    let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
-                    let exact = thacker::depth(x, y, t);
-                    l1 += mesh.area_cell[c] * (state.depth(c) - exact).abs();
-                    total += mesh.area_cell[c] * exact;
-                    volume += v;
-                    cx += v * x;
-                    cy += v * y;
-                }
-                let [ex, ey] = thacker::centroid(t);
-                let centroid_error = (cx / volume - ex).hypot(cy / volume - ey);
-                println!(
-                    "  t = {:.2} T: L1 error of h {:.2}%, centroid error {:.4} m",
-                    t / period,
-                    100.0 * l1 / total,
-                    centroid_error
-                );
-            }
-        }
-        let balance = model.water_balance();
-        let volume_error = balance.error().abs() / balance.initial_volume;
-        println!(
-            "  volume error {volume_error:.1e}, max continuity residual {max_continuity:.1e} m, \
-             max Newton iterations {newton}"
+        println!("V04 {layout:?}:");
+        let run = thacker_run(layout, AdvectionScheme::Upwind, &case);
+        assert!(
+            run.volume_error <= 1e-10,
+            "{layout:?}: volume error {:e}",
+            run.volume_error
         );
         assert!(
-            volume_error <= 1e-10,
-            "{layout:?}: volume error {volume_error:e}"
+            run.max_continuity <= run.newton_tol,
+            "{layout:?}: continuity residual {:e} m",
+            run.max_continuity
         );
-        assert!(
-            max_continuity <= tol,
-            "{layout:?}: continuity residual {max_continuity:e} m"
+        let limits = [(1, 0.20, 0.12), (3, 0.40, 0.25)];
+        for (periods, max_l1, max_centroid) in limits {
+            let (l1, centroid) = run.errors[periods - 1];
+            assert!(
+                l1 <= max_l1,
+                "{layout:?}: L1 error {l1} after {periods} periods"
+            );
+            assert!(
+                centroid <= max_centroid,
+                "{layout:?}: centroid error {centroid} m after {periods} periods"
+            );
+        }
+    }
+    if output_root().is_some() {
+        println!("V04 Rectangular, without advection (for the figure):");
+        thacker_run(
+            ChannelLayout::Rectangular,
+            AdvectionScheme::Disabled,
+            "v04_rectangular_none",
         );
     }
 }

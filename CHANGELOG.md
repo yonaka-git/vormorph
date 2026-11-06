@@ -47,4 +47,5 @@
 - 運動量の移流 `hydro::advection`（保存型の1次風上差分）：セルの運動量収支を流入側の辺から求め、時刻 n の流量で連続式を陽的に進めた水深の和で割って辺へ配る。局所クーラン数が 1 を超える辺では増分を縮める（安全策）。`StepReport` に局所クーラン数の最大値 `max_courant` と、増分を縮めた辺の数 `limited_edges` を追加
 - 設定 `[hydro] advection = "upwind" | "none"`（既定は `"upwind"`。`"none"` は移流項を省く検証用）
 - ADR-0008（移流は、セルの運動量収支を、陽的に進めた水深の和で割って辺へ配る）。`docs/design/overview.md` の第4.4節（移流の離散式）、第5章、第7章、第8章を更新
+- 検証ケース V04 に、Thacker の解析解との比較の合格基準を追加（水塊の重心の誤差が 1周期後 0.12 m・3周期後 0.25 m 以下、水深の L1 誤差が 1周期後 20%・3周期後 40% 以下）。図 `docs/images/v04_thacker.png` と `tools/plot_verification.py v04`。VTK を書き出すときは、移流なしの計算と重心の時系列（`centroid.csv`）も書く。検証の図の色を、検証済みのカテゴリ配色にそろえる
 - ライセンス：MIT OR Apache-2.0
