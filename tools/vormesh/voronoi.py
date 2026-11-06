@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import shapely
@@ -219,14 +219,20 @@ def voronoi_cells(real: np.ndarray, ghosts: np.ndarray) -> list[np.ndarray]:
 
 
 def polygon_area_centroid(poly: np.ndarray) -> tuple[float, np.ndarray]:
-    """反時計回りの多角形の面積と重心。"""
-    x, y = poly[:, 0], poly[:, 1]
+    """反時計回りの多角形の面積と重心。
+
+    頂点の平均を原点にした座標で shoelace の式を計算し、重心に原点を足し戻す。座標のまま
+    計算すると、原点から X 離れた面積 A の多角形で、重心におよそ εX³/A（ε は倍精度の丸めの
+    単位）の桁落ちが生じる（X = 10⁵ m、A = 1 m² で約 0.1 m）。
+    """
+    origin = poly.mean(axis=0)
+    x, y = poly[:, 0] - origin[0], poly[:, 1] - origin[1]
     xn, yn = np.roll(x, -1), np.roll(y, -1)
     cross = x * yn - xn * y
     area = 0.5 * float(cross.sum())
     cx = float(((x + xn) * cross).sum()) / (6.0 * area)
     cy = float(((y + yn) * cross).sum()) / (6.0 * area)
-    return area, np.array([cx, cy])
+    return area, origin + np.array([cx, cy])
 
 
 @dataclass
@@ -248,6 +254,11 @@ class LloydResult:
     @property
     def iterations(self) -> int:
         return len(self.displacement)
+
+    def translated(self, offset: np.ndarray) -> LloydResult:
+        """母点とセルの頂点を `offset` だけ平行移動した結果。"""
+        shift = np.asarray(offset, dtype=float)
+        return replace(self, generators=self.generators + shift, cells=[c + shift for c in self.cells])
 
 
 def lloyd(
@@ -316,6 +327,17 @@ class PolygonMesh:
     def cell_polygon(self, i: int) -> np.ndarray:
         idx = self.cells[i]
         return np.column_stack([self.x_vertex[idx], self.y_vertex[idx]])
+
+    def translated(self, offset: np.ndarray) -> PolygonMesh:
+        """母点と頂点を `offset` だけ平行移動した格子（接続はそのまま）。"""
+        dx, dy = float(offset[0]), float(offset[1])
+        return replace(
+            self,
+            x_cell=self.x_cell + dx,
+            y_cell=self.y_cell + dy,
+            x_vertex=self.x_vertex + dx,
+            y_vertex=self.y_vertex + dy,
+        )
 
     def directed_edges(self):
         """(頂点 a, 頂点 b, セル) を、セルの番号順・反時計回りに返す。"""

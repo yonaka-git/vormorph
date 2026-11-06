@@ -9,6 +9,10 @@
 3. 母点をヒルベルト曲線の順に並べ替え、頂点もその順に番号をつける（`hilbert`）。
 4. 面積・直交性・境界の規約を検査して書き出す（`voronoi.check`, `meshfile`）。
 
+2〜4 は、領域の近くに原点を移した局所座標で計算し、最後に原点を足し戻す
+（`Discretization.local_origin`）。平面直角座標のように座標の値が大きくても、面積・重心・
+辺の向きが桁落ちしないようにするためである。
+
 手順の説明と格子ファイルの仕様は `docs/design/mesh-generation.md` にある。
 """
 
@@ -42,12 +46,18 @@ def generate(domain: Domain, verbose: bool = False) -> MeshResult:
 def generate_from_discretization(
     disc: Discretization, cell_size: float, settings: LloydSettings
 ) -> MeshResult:
-    """境界の折れ線と初期母点から格子を作る（gmsh を使わない部分）。"""
-    boundary = Boundary.from_discretization(disc)
-    result = lloyd(disc.interior_points, boundary, cell_size, settings.iterations, settings.tolerance)
+    """境界の折れ線と初期母点から格子を作る（gmsh を使わない部分）。
+
+    計算は `disc.local_origin()` を原点にした局所座標で行い、返す格子と Lloyd 法の結果の座標には
+    原点を足し戻す。検査の値（`quality`）は平行移動で変わらない量だけである。
+    """
+    origin = disc.local_origin()
+    local = disc.translated(-origin)
+    boundary = Boundary.from_discretization(local)
+    result = lloyd(local.interior_points, boundary, cell_size, settings.iterations, settings.tolerance)
     perm = hilbert_order(result.generators)
     generators = result.generators[perm]
     cells = [result.cells[k] for k in perm]
     mesh = build_polygon_mesh(generators, cells, boundary, cell_size)
     quality = check(mesh, boundary.polygon.area, cell_size)
-    return MeshResult(mesh, quality, result, disc)
+    return MeshResult(mesh.translated(origin), quality, result.translated(origin), disc)

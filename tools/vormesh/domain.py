@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -220,6 +220,28 @@ class Discretization:
     def rings(self) -> list[np.ndarray]:
         """外周と穴の閉じた折れ線（始点を繰り返さない頂点列）。先頭が外周。"""
         return [_ring(self.outer)] + [_ring(h) for h in self.holes]
+
+    def local_origin(self) -> np.ndarray:
+        """局所座標の原点 [m]：外周の外接矩形の左下の点を、1 m 単位に切り下げたもの。
+
+        原点を整数にしておくと、座標の大きさに比べて領域が小さい場合（平面直角座標など）は、
+        原点を引く計算と足し戻す計算が丸めなしで済み、境界の節点の座標が元の値に戻る。
+        """
+        return np.floor(_ring(self.outer).min(axis=0))
+
+    def translated(self, offset: np.ndarray) -> Discretization:
+        """境界の折れ線と初期母点を `offset` だけ平行移動したもの。"""
+        shift = np.asarray(offset, dtype=float)
+
+        def move(pieces: list[BoundaryPiece]) -> list[BoundaryPiece]:
+            return [replace(p, points=p.points + shift) for p in pieces]
+
+        return replace(
+            self,
+            outer=move(self.outer),
+            holes=[move(h) for h in self.holes],
+            interior_points=self.interior_points + shift,
+        )
 
 
 def _ring(pieces: list[BoundaryPiece]) -> np.ndarray:

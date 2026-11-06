@@ -9,6 +9,7 @@ import shapely
 from vormesh import generate_from_discretization, meshfile
 from vormesh.domain import BoundaryPiece, Discretization, LloydSettings
 from vormesh.hilbert import hilbert_order
+from vormesh.voronoi import polygon_area_centroid
 
 H = 1.0
 
@@ -124,3 +125,74 @@ def test_mesh_file_round_trip(tmp_path):
     np.testing.assert_array_equal(back.y_vertex, mesh.y_vertex)
     assert back.cells == mesh.cells
     assert back.boundary == {k: [tuple(p) for p in v] for k, v in mesh.boundary.items()}
+
+
+# --- 平面直角座標のような、原点から遠い座標 --------------------------------------------------------
+
+FAR = np.array([1.0e5, 1.0e5])
+"""平面直角座標の桁の平行移動 [m]。"""
+
+
+def dyadic(points, bits=20):
+    """座標を 2^-bits の倍数に丸める（FAR だけ平行移動しても丸めが起きない値にする）。"""
+    return np.round(np.asarray(points, dtype=float) * 2.0**bits) / 2.0**bits
+
+
+def dyadic_disc(disc):
+    """境界の折れ線と初期母点の座標を `dyadic` で丸めた Discretization。"""
+
+    def move(pieces):
+        return [BoundaryPiece(p.kind, dyadic(p.points)) for p in pieces]
+
+    return Discretization(move(disc.outer), [move(h) for h in disc.holes], dyadic(disc.interior_points))
+
+
+def test_centroid_does_not_lose_digits_far_from_the_origin():
+    # 格子幅 0.5 m 程度の六角形（面積 0.22 m²）。座標のまま shoelace の式を使うと、FAR だけ
+    # 離れた位置で重心が 0.5 m 程度ずれる
+    angles = np.arange(6) * np.pi / 3.0 + 0.1
+    hexagon = dyadic(np.column_stack([0.29 * np.cos(angles) + 3.7, 0.29 * np.sin(angles) + 1.3]))
+    area, centroid = polygon_area_centroid(hexagon)
+    far_area, far_centroid = polygon_area_centroid(hexagon + FAR)
+    assert far_area == pytest.approx(area, rel=1e-12)
+    np.testing.assert_allclose(far_centroid - FAR, centroid, rtol=0.0, atol=1e-10)
+    # 頂点が中心について対称なので、重心は中心に一致する
+    np.testing.assert_allclose(centroid, [3.7, 1.3], rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("make", [rectangle_disc, l_shape_disc, hole_disc])
+def test_translated_input_gives_the_same_mesh(make):
+    # 座標を丸めておき、FAR の平行移動を厳密にする。局所座標での計算がまったく同じになるので、
+    # 格子は足し戻しの丸め（10⁻¹¹ m 程度）の範囲で一致する
+    disc = dyadic_disc(make())
+    near = generate_from_discretization(disc, H, SETTINGS)
+    far = generate_from_discretization(disc.translated(FAR), H, SETTINGS)
+    assert far.quality == near.quality
+    assert far.mesh.cells == near.mesh.cells
+    assert far.mesh.boundary == near.mesh.boundary
+    for axis, names in enumerate((("x_cell", "x_vertex"), ("y_cell", "y_vertex"))):
+        for name in names:
+            moved = getattr(far.mesh, name) - FAR[axis]
+            np.testing.assert_allclose(moved, getattr(near.mesh, name), rtol=0.0, atol=1e-10)
+
+
+@pytest.mark.parametrize("make", [rectangle_disc, l_shape_disc, hole_disc])
+def test_mesh_far_from_the_origin_satisfies_the_conventions(make):
+    # 丸めの起きる平行移動（負の座標を含む）。格子は近くの値と完全には一致しないが、規約と
+    # 品質は原点の近くと同じ基準を満たす
+    shift = np.array([123456.789, -98765.4321])
+    result = generate_from_discretization(make().translated(shift), H, SETTINGS)
+    q = result.quality
+    assert q.area_error < 1e-12
+    assert q.max_orthogonality_error < 1e-10
+    assert q.min_boundary_distance > 0.2
+    assert q.max_centroid_offset < 0.05
+    assert result.lloyd.displacement[-1] < result.lloyd.displacement[0]
+    mesh = result.mesh
+    assert mesh.x_vertex.min() == pytest.approx(shift[0], abs=1e-9)
+    assert mesh.y_vertex.min() == pytest.approx(shift[1], abs=1e-9)
+    # どのセルでも、重心がセルの内側にある
+    for i in range(mesh.n_cells):
+        poly = mesh.cell_polygon(i)
+        _, c = polygon_area_centroid(poly)
+        assert shapely.Polygon(poly).contains(shapely.Point(*c)), f"centroid of cell {i} is outside"
