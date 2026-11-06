@@ -11,14 +11,17 @@
 //! 格子ファイルの形式を変えたら、このファイルも作り直す。
 
 use std::collections::HashMap;
-use std::path::Path;
-use vormorph::mesh::EdgeKind;
-use vormorph::mesh::file::{CellOrder, MeshFile};
+use std::path::{Path, PathBuf};
+use vormorph::mesh::file::{self, CellOrder, MeshFile};
 use vormorph::mesh::voronoi::PolygonMesh;
+use vormorph::mesh::{EdgeKind, NONE};
+
+fn fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/island_coarse.mesh.toml")
+}
 
 fn load() -> MeshFile {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/island_coarse.mesh.toml");
-    MeshFile::load(&path).expect("the fixture must be a valid mesh file")
+    MeshFile::load(&fixture()).expect("the fixture must be a valid mesh file")
 }
 
 fn meta_f64(file: &MeshFile, key: &str) -> f64 {
@@ -165,5 +168,50 @@ fn consecutive_cells_are_close_in_hilbert_order() {
     assert!(
         median < 1.5 * h,
         "median step {median} is not local (h = {h})"
+    );
+}
+
+/// Rust 側で接続配列と幾何量を組み立て、格子生成ツールの検査と同じ結果になることを確かめる。
+#[test]
+fn rust_builds_connectivity_and_geometry() {
+    let file = load();
+    let mesh = file::read(&fixture()).expect("the fixture must build into a mesh");
+    assert_eq!(mesh.n_cells(), file.cells.x.len());
+    assert_eq!(mesh.n_vertices(), file.vertices.x.len());
+
+    let n_boundary = (0..mesh.n_edges())
+        .filter(|&e| mesh.is_boundary_edge(e))
+        .count();
+    assert_eq!(n_boundary, file.n_boundary_edges());
+    assert!(
+        (0..mesh.n_edges())
+            .all(|e| mesh.is_boundary_edge(e) == (mesh.edge_kind[e] == EdgeKind::Wall))
+    );
+    // 内部の辺の [0] は番号の小さいセル
+    assert!(
+        mesh.cells_on_edge
+            .iter()
+            .all(|&[c0, c1]| c1 == NONE || c0 < c1)
+    );
+    // オイラー標数：島が1つ（穴が1つ）の領域では V − E + C = 0
+    let euler = mesh.n_vertices() as i64 - mesh.n_edges() as i64 + mesh.n_cells() as i64;
+    assert_eq!(euler, 0);
+
+    let report = mesh.check_geometry();
+    let domain_area = meta_f64(&file, "domain_area");
+    assert!(
+        ((report.total_area - domain_area) / domain_area).abs() < 1e-12,
+        "total area {} != domain area {domain_area}",
+        report.total_area
+    );
+    assert!(
+        report.max_orthogonality_error < 1e-10,
+        "orthogonality error {:e}",
+        report.max_orthogonality_error
+    );
+    assert!(
+        report.max_closure_error < 1e-12,
+        "closure error {:e}",
+        report.max_closure_error
     );
 }

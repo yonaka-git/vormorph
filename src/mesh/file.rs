@@ -31,7 +31,7 @@
 //! [`Mesh::check_geometry`](super::Mesh::check_geometry) で行う。
 
 use super::voronoi::{self, BoundaryEdge, PolygonMesh};
-use super::{EdgeKind, Jagged, Mesh};
+use super::{EdgeKind, Jagged, Mesh, MeshError};
 use serde::Deserialize;
 use std::error::Error;
 use std::fmt;
@@ -130,6 +130,8 @@ pub enum MeshFileError {
     Parse(toml::de::Error),
     /// 値が規約を満たさない（すべての問題を列挙する）。
     Invalid(Vec<String>),
+    /// 接続配列を組み立てられない（[`voronoi::build`] の誤り）。
+    Mesh(MeshError),
 }
 
 impl fmt::Display for MeshFileError {
@@ -144,6 +146,7 @@ impl fmt::Display for MeshFileError {
                 }
                 Ok(())
             }
+            Self::Mesh(err) => write!(f, "{err}"),
         }
     }
 }
@@ -154,6 +157,7 @@ impl Error for MeshFileError {
             Self::Io { source, .. } => Some(source),
             Self::Parse(err) => Some(err),
             Self::Invalid(_) => None,
+            Self::Mesh(err) => Some(err),
         }
     }
 }
@@ -297,7 +301,7 @@ impl MeshFile {
 /// 格子ファイルを読み込み、接続配列と幾何量を組み立てる。
 pub fn read(path: &Path) -> Result<Mesh, MeshFileError> {
     let file = MeshFile::load(path)?;
-    Ok(voronoi::build(&file.to_polygons()))
+    voronoi::build(&file.to_polygons()).map_err(MeshFileError::Mesh)
 }
 
 impl BoundarySection {

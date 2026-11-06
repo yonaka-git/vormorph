@@ -14,7 +14,7 @@
 //! | `vertices_on_cell` | `verticesOnCell` | セル | セルの頂点（反時計回り） |
 //! | `edge_sign_on_cell` | `edgeSignOnCell`（符号が逆、下記） | セル | 辺の法線がセルから外向きなら +1 |
 //! | `cells_on_edge` | `cellsOnEdge` | 辺 | 辺を挟む2セル。法線は `[0]` から `[1]` へ向く |
-//! | `vertices_on_edge` | `verticesOnEdge` | 辺 | 辺の両端の頂点 |
+//! | `vertices_on_edge` | `verticesOnEdge` | 辺 | 辺の両端の頂点（`[0]` → `[1]` は `cells_on_edge[e][0]` から見て反時計回り） |
 //! | `dc_edge` | `dcEdge` | 辺 | 母点間の距離 δ_j \[m\] |
 //! | `dv_edge` | `dvEdge` | 辺 | 辺（ボロノイ辺）の長さ L_j \[m\] |
 //! | `x_edge`, `y_edge` | （定義が異なる、下記） | 辺 | 辺の中点 \[m\] |
@@ -34,6 +34,12 @@
 //! - 境界辺では `cells_on_edge[e] = [c, NONE]`（領域の内側が `[0]`）で、法線は領域の外を向く。
 //! - `edges_on_cell[c][k]` は頂点 `vertices_on_cell[c][k]` と `vertices_on_cell[c][(k + 1) % n]`
 //!   を結ぶ（この並びはこのクレートの約束。外部データを読むときに合わせる）。
+//! - `vertices_on_edge[e] = [a, b]` は、セル `cells_on_edge[e][0]` が反時計回りにたどる向き
+//!   （a → b）に並べる。辺の接線 t = (x_b − x_a)/L は k × n に等しく、MPAS の
+//!   `verticesOnEdge` と同じ向きになる。
+//! - `normal_edge` は母点を結ぶ向きからではなく、辺の接線を時計回りに 90° 回して作る
+//!   （n = (t_y, −t_x)）。こうするとセルの閉合 Σ_k s L n = 0 が丸め誤差の範囲で成り立ち、
+//!   直交性（母点を結ぶ線分と辺が直交すること）は [`Mesh::check_geometry`] で別に測れる。
 //! - `dc_edge` は、境界辺では母点を辺に関して鏡映した点までの距離（母点から辺までの距離の
 //!   2倍）とする。下流端の水位境界で水位勾配を評価するために使う。
 //! - `x_edge`, `y_edge` は辺の両端の頂点の中点。Perot 法の再構成が一様流で厳密になるのは
@@ -57,10 +63,69 @@ pub mod channel;
 pub mod file;
 pub mod voronoi;
 
+use std::error::Error;
+use std::fmt;
 use std::ops::{Index, IndexMut};
 
 /// 領域の外側を表すセル番号。
 pub const NONE: usize = usize::MAX;
+
+/// 直交誤差の計算から除く短い辺の長さ（代表長さ √(平均セル面積) に対する比）。
+///
+/// 格子生成ツールの検査（`tools/vormesh/voronoi.py` の `SHORT_EDGE`）と同じ値。ほぼ縮退した
+/// 頂点の近くの短い辺は、向きが丸め誤差で決まるので、直交性を測る意味がない。
+pub const SHORT_EDGE: f64 = 1.0e-6;
+
+/// 格子が規約を満たさないことを表す誤り。
+///
+/// 見つかった問題をすべて列挙する（表示するのは先頭の [`MeshError::MAX_SHOWN`] 件まで）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshError {
+    problems: Vec<String>,
+}
+
+impl MeshError {
+    /// 表示する問題の最大数。
+    pub const MAX_SHOWN: usize = 20;
+
+    /// 問題の一覧から作る。
+    pub fn new(problems: Vec<String>) -> Self {
+        Self { problems }
+    }
+
+    /// 問題が1つもなければ `Ok(())`、あれば `Err` を返す。
+    pub fn check(problems: Vec<String>) -> Result<(), Self> {
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Self::new(problems))
+        }
+    }
+
+    /// 見つかった問題の一覧。
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
+impl fmt::Display for MeshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid mesh:")?;
+        for p in self.problems.iter().take(Self::MAX_SHOWN) {
+            write!(f, "\n  - {p}")?;
+        }
+        if self.problems.len() > Self::MAX_SHOWN {
+            write!(
+                f,
+                "\n  ... and {} more",
+                self.problems.len() - Self::MAX_SHOWN
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for MeshError {}
 
 /// 行ごとに長さが異なる2次元配列（CSR 形式）。
 ///
@@ -259,8 +324,69 @@ impl Mesh {
     }
 
     /// 格子の幾何を検査する（検証ケース V01）。
+    ///
+    /// - 直交誤差は、母点と頂点の座標から直接計算する（格納した `normal_edge` は使わない）。
+    ///   長さが代表長さ √(平均セル面積) の [`SHORT_EDGE`] 倍に満たない辺は除く。
+    /// - 閉合誤差は、格納した `dv_edge`・`normal_edge`・`edge_sign_on_cell` から計算する。
+    ///   符号と法線の向きの取り違えを検出するためである。
+    ///
+    /// 値に NaN が含まれる場合は、最大値も NaN になる（誤りを隠さないため）。
     pub fn check_geometry(&self) -> GeometryReport {
-        todo!("総面積・直交誤差・閉合誤差の計算")
+        let total_area: f64 = self.area_cell.iter().sum();
+        let short = if self.n_cells() > 0 {
+            SHORT_EDGE * (total_area / self.n_cells() as f64).sqrt()
+        } else {
+            0.0
+        };
+
+        let max_orthogonality_error = (0..self.n_edges())
+            .filter(|&e| !self.is_boundary_edge(e))
+            .filter_map(|e| {
+                let [c0, c1] = self.cells_on_edge[e];
+                let [a, b] = self.vertices_on_edge[e];
+                let (tx, ty) = (
+                    self.x_vertex[b] - self.x_vertex[a],
+                    self.y_vertex[b] - self.y_vertex[a],
+                );
+                let length = tx.hypot(ty);
+                if length < short {
+                    return None;
+                }
+                let (dx, dy) = (
+                    self.x_cell[c1] - self.x_cell[c0],
+                    self.y_cell[c1] - self.y_cell[c0],
+                );
+                Some((dx * tx + dy * ty).abs() / (dx.hypot(dy) * length))
+            })
+            .fold(0.0, nan_max);
+
+        let max_closure_error = (0..self.n_cells())
+            .map(|c| {
+                let (mut sx, mut sy, mut perimeter) = (0.0, 0.0, 0.0);
+                for (&e, &s) in self.edges_on_cell[c].iter().zip(&self.edge_sign_on_cell[c]) {
+                    let [nx, ny] = self.normal_edge[e];
+                    sx += s * self.dv_edge[e] * nx;
+                    sy += s * self.dv_edge[e] * ny;
+                    perimeter += self.dv_edge[e];
+                }
+                sx.hypot(sy) / perimeter
+            })
+            .fold(0.0, nan_max);
+
+        GeometryReport {
+            total_area,
+            max_orthogonality_error,
+            max_closure_error,
+        }
+    }
+}
+
+/// NaN を伝える最大値（`f64::max` は NaN を無視する）。
+fn nan_max(acc: f64, x: f64) -> f64 {
+    if acc.is_nan() || x.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(x)
     }
 }
 
@@ -270,6 +396,7 @@ pub struct GeometryReport {
     /// 全セル面積の和 \[m²\]。
     pub total_area: f64,
     /// 内部の辺の直交誤差の最大値 max_j |cos(母点間ベクトル, 辺の向き)| \[-\]。
+    /// 短い辺（[`SHORT_EDGE`]）は除く。
     pub max_orthogonality_error: f64,
     /// セルの閉合誤差の最大値 max_i |Σ_k s_ik L_k n_k| / Σ_k L_k \[-\]。
     pub max_closure_error: f64,
