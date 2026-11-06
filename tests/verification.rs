@@ -40,6 +40,17 @@ fn channel_mesh(layout: ChannelLayout, cell_size: f64) -> Mesh {
     .expect("the verification channel must be a valid mesh")
 }
 
+/// 検証用の周期的な直線水路（延長 200 m、幅 20 m。上流端と下流端をつなぐ。ADR-0014）。
+fn periodic_channel_mesh(layout: ChannelLayout, cell_size: f64) -> Mesh {
+    channel::build_periodic(&ChannelSpec {
+        length: 200.0,
+        width: 20.0,
+        cell_size,
+        layout,
+    })
+    .expect("the periodic verification channel must be a valid mesh")
+}
+
 /// 長方形の水域の格子（四辺は壁として扱う）。
 fn basin_mesh(layout: ChannelLayout, length: f64, width: f64, cell_size: f64) -> Mesh {
     channel::build(&ChannelSpec {
@@ -129,44 +140,51 @@ fn island_mesh() -> Mesh {
 
 /// V01 格子幾何：総面積、直交誤差、各セルが閉じていること。
 ///
-/// 結果の値は `cargo test --test verification v01 -- --nocapture` で表示される
-/// （`docs/verification.md` の記録に使う）。
+/// 直線水路の2つの配置と、上流端と下流端をつないだ周期的な水路（継ぎ目の辺の直交誤差は、
+/// 平行移動した母点との間で測る）で確かめる。結果の値は
+/// `cargo test --test verification v01 -- --nocapture` で表示される（`docs/verification.md` の
+/// 記録に使う）。
 #[test]
 fn v01_mesh_geometry() {
     for layout in LAYOUTS {
-        let mesh = channel_mesh(layout, 2.0);
-        let report = mesh.check_geometry();
-        let exact_area = 200.0 * 20.0;
-        let area_error = (report.total_area - exact_area).abs() / exact_area;
-        println!(
-            "V01 {layout:?}: {} cells, {} edges, area error {area_error:.1e}, \
-             orthogonality {:.1e}, closure {:.1e}",
-            mesh.n_cells(),
-            mesh.n_edges(),
-            report.max_orthogonality_error,
-            report.max_closure_error
-        );
-        assert!(
-            area_error <= 1e-12,
-            "{layout:?}: total area {} != {exact_area}",
-            report.total_area
-        );
-        assert!(
-            report.max_orthogonality_error <= 1e-12,
-            "{layout:?}: orthogonality error {:e}",
-            report.max_orthogonality_error
-        );
-        assert!(
-            report.max_closure_error <= 1e-12,
-            "{layout:?}: closure error {:e}",
-            report.max_closure_error
-        );
+        for (kind, mesh) in [
+            ("open", channel_mesh(layout, 2.0)),
+            ("periodic", periodic_channel_mesh(layout, 2.0)),
+        ] {
+            let report = mesh.check_geometry();
+            let exact_area = 200.0 * 20.0;
+            let area_error = (report.total_area - exact_area).abs() / exact_area;
+            println!(
+                "V01 {layout:?}, {kind}: {} cells, {} edges, area error {area_error:.1e}, \
+                 orthogonality {:.1e}, closure {:.1e}",
+                mesh.n_cells(),
+                mesh.n_edges(),
+                report.max_orthogonality_error,
+                report.max_closure_error
+            );
+            assert!(
+                area_error <= 1e-12,
+                "{layout:?}, {kind}: total area {} != {exact_area}",
+                report.total_area
+            );
+            assert!(
+                report.max_orthogonality_error <= 1e-12,
+                "{layout:?}, {kind}: orthogonality error {:e}",
+                report.max_orthogonality_error
+            );
+            assert!(
+                report.max_closure_error <= 1e-12,
+                "{layout:?}, {kind}: closure error {:e}",
+                report.max_closure_error
+            );
+        }
     }
 }
 
 /// V02 Perot 再構成：一様流で厳密に一致すること（境界セルを含む）。
 ///
-/// 直線水路の2つの配置に加え、格子生成ツールで作った不規則な格子でも確かめる。
+/// 直線水路の2つの配置と周期的な水路（継ぎ目の辺の中点をセルの側の座標で使う）に加え、
+/// 格子生成ツールで作った不規則な格子でも確かめる。
 /// 結果の値は `cargo test --test verification v02 -- --nocapture` で表示される。
 #[test]
 fn v02_perot_uniform_flow() {
@@ -179,6 +197,14 @@ fn v02_perot_uniform_flow() {
         (
             "channel, hexagonal",
             channel_mesh(ChannelLayout::Hexagonal, 2.0),
+        ),
+        (
+            "periodic channel, rectangular",
+            periodic_channel_mesh(ChannelLayout::Rectangular, 2.0),
+        ),
+        (
+            "periodic channel, hexagonal",
+            periodic_channel_mesh(ChannelLayout::Hexagonal, 2.0),
         ),
         ("island (tools/make_mesh.py)", island_mesh()),
     ];
@@ -744,6 +770,11 @@ fn v05_dam_break() {
 /// 相対誤差の最大値が 1e-4 以下であることを確かめる。格子は 2 m の正方形配置・六角形配置と、
 /// 上下流端に短い境界辺ができる 1 m の六角形配置（sill と同じ）。時間刻みは、辺の水深を
 /// 風上側からとることによるクーラン数の制約 U Δt / Δx ≤ 1 に対して、約 0.47 になるようにする。
+///
+/// 周期境界（ADR-0014）でも、2 m の正方形配置・六角形配置で確かめる。水深 h_n・流速 0 の
+/// 静止状態から、勾配の体積力 g I n_x で加速した流れが、摩擦と釣り合う等流の流速 q / h_n に
+/// 収束すること（相対誤差 1e-4 以下）と、水深が一様なままであることを確かめる。体積力の
+/// 符号と大きさを確かめるケースにあたる。
 #[test]
 fn v06_uniform_flow() {
     const LENGTH: f64 = 200.0;
@@ -810,6 +841,62 @@ level = {h_n:?}
         assert!(
             max_error <= 1e-4,
             "{name}: relative depth error {max_error:e}"
+        );
+    }
+
+    // 周期境界：静止状態から体積力で加速し、等流に収束する
+    let boundary = format!(
+        r#"
+[bed]
+slope = {SLOPE:?}
+
+[boundary.upstream]
+kind = "periodic"
+discharge = {DISCHARGE:?}
+
+[boundary.downstream]
+kind = "periodic"
+"#
+    );
+    let u_n = q / h_n;
+    for layout in LAYOUTS {
+        let cell_size = 2.0;
+        let mesh = periodic_channel_mesh(layout, cell_size);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        state.eta.fill(h_n);
+        let case = format!(
+            "v06_periodic_{}_{cell_size}m",
+            format!("{layout:?}").to_lowercase()
+        );
+        let dt = 0.25 * cell_size;
+        let config = flow_config(&case, dt, END, MANNING_N, &boundary, 300.0);
+        let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+        while model.state().time < END {
+            model.step().expect("the step must succeed");
+        }
+        let (mesh, state) = (model.mesh(), model.state());
+        let velocity_error = state
+            .u_cell
+            .iter()
+            .fold(0.0_f64, |m, u| m.max((u[0] - u_n).abs() / u_n));
+        let max_v = state.u_cell.iter().fold(0.0_f64, |m, u| m.max(u[1].abs()));
+        let depth_error =
+            (0..mesh.n_cells()).fold(0.0_f64, |m, c| m.max((state.depth(c) - h_n).abs() / h_n));
+        let balance = model.water_balance();
+        println!(
+            "V06 periodic {layout:?}, {cell_size} m: {} cells, u_n = {u_n:.6} m/s, \
+             max relative velocity error {velocity_error:.1e}, max |v| {max_v:.1e} m/s, \
+             max relative depth error {depth_error:.1e}, water balance error {:.1e} of volume",
+            mesh.n_cells(),
+            balance.error() / balance.initial_volume
+        );
+        assert!(
+            velocity_error <= 1e-4,
+            "periodic {layout:?}: relative velocity error {velocity_error:e}"
+        );
+        assert!(
+            depth_error <= 1e-10,
+            "periodic {layout:?}: relative depth error {depth_error:e}"
         );
     }
 }
@@ -1500,6 +1587,8 @@ level = {h_n:?}
 /// - 土砂と水の収支の誤差が、給砂量・流入量の 10⁻¹⁰ 以下
 /// - 一定の給砂量（ADR-0013）でも、六角形配置 2 m で中央部の変化が 10⁻³ m 以下、上流端に接する
 ///   セルの変化が 10⁻² m 以下（辺ごとに給砂量を保つと、上流端のセルの偏りが増え続けたため）
+/// - 周期境界（ADR-0014。延長 200 m、幅 20 m、格子幅 2 m）：開境界がないので、六角形配置でも
+///   全セルで河床高の変化が 10⁻¹² m 以下。土砂の総量の変化が 10⁻¹⁰ m³ 以下
 #[test]
 fn v12_equilibrium_bed() {
     const END: f64 = 600.0;
@@ -1597,4 +1686,78 @@ fn v12_equilibrium_bed() {
     assert!(run.sediment_error.abs() <= 1e-10);
     assert!(run.max_change_central <= 1e-3, "{}", run.max_change_central);
     assert!(run.max_change_inlet <= 1e-2, "{}", run.max_change_inlet);
+
+    // 周期境界：勾配を除いた一様な河床の等流
+    for layout in LAYOUTS {
+        let (max_change, sediment_error, water_error) = periodic_equilibrium_run(layout, END);
+        println!(
+            "V12 periodic {layout:?}, 2 m: max |dz_b| {max_change:.1e} m, \
+             sediment balance error {sediment_error:.1e} m^3, water balance error {water_error:.1e}"
+        );
+        assert!(
+            max_change <= 1e-12,
+            "periodic {layout:?}: the bed must stay at rest, max change {max_change:e} m"
+        );
+        assert!(
+            sediment_error.abs() <= 1e-10,
+            "periodic {layout:?}: {sediment_error:e}"
+        );
+        assert!(
+            water_error.abs() <= 1e-10,
+            "periodic {layout:?}: {water_error:e}"
+        );
+    }
+}
+
+/// 周期的な水路（延長 200 m、幅 20 m、格子幅 2 m）の等流（勾配 1/500、単位幅流量 2 m²/s）で
+/// 河床変動を `end` 秒解き、河床高の変化の最大値 \[m\]、土砂の収支の誤差 \[m³\]、水の収支の誤差
+/// （体積に対する比）を返す。
+fn periodic_equilibrium_run(layout: ChannelLayout, end: f64) -> (f64, f64, f64) {
+    const SLOPE: f64 = 0.002;
+    const MANNING_N: f64 = 0.025;
+    const UNIT_DISCHARGE: f64 = 2.0;
+    let h_n = (MANNING_N * UNIT_DISCHARGE / SLOPE.sqrt()).powf(0.6);
+    let boundary = format!(
+        r#"
+[bed]
+slope = {SLOPE:?}
+
+[boundary.upstream]
+kind = "periodic"
+discharge = {:?}
+
+[boundary.downstream]
+kind = "periodic"
+"#,
+        UNIT_DISCHARGE * 20.0
+    );
+    let case = format!("v12_periodic_{}_2m", format!("{layout:?}").to_lowercase());
+    let mut config = flow_config(&case, 1.0, end, MANNING_N, &boundary, end / 4.0);
+    config.time.dt = None;
+    config.time.courant = Some(0.5);
+    config.time.dt_max = Some(1.0);
+    config.sediment = Some(sill_sediment());
+
+    let mesh = periodic_channel_mesh(layout, 2.0);
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    state.eta.fill(h_n);
+    for (u, n) in state.u_n.iter_mut().zip(&mesh.normal_edge) {
+        *u = UNIT_DISCHARGE / h_n * n[0];
+    }
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    if output_root().is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+    while !model.finished() {
+        model.step().expect("the step must succeed");
+    }
+    let max_change = model.state().zb.iter().fold(0.0_f64, |m, z| m.max(z.abs()));
+    let water = model.water_balance();
+    (
+        max_change,
+        model.sediment_balance().error(),
+        water.error() / water.initial_volume,
+    )
 }

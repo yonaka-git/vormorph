@@ -76,4 +76,5 @@
 - 床止めの例題の河床変動量の平面図と縦断図を描く `tools/plot_sill.py`（pytest のテストつき）。README の冒頭の図 `docs/images/hero.png` を、模式図から `examples/sill.toml` の計算結果に差し替え
 - 直線水路の周期境界（ADR-0014）：`mesh::channel::build_periodic` で上流端と下流端をつないだ周期的な水路の格子を作る（六角形配置は x 方向に周期的な三角格子にして、継ぎ目のセルも内部と同じ六角形にする）。`mesh::voronoi::connect_periodic`（平行移動で重なる上流端と下流端の辺を内部の辺に継ぐ）、`Mesh::edge_shift`（継ぎ目の辺の反対側の母点の位置への平行移動）、`Mesh::is_periodic`、`Mesh::edge_midpoint_from`、`Mesh::neighbor_position_from`。Perot 法・河床勾配の最小二乗・直交性の検査・`dc_edge` は、継ぎ目の辺でセルの側の座標を使う
 - 設定 `[boundary.upstream] kind = "periodic"`（`discharge` は初期の等流の流量）と `[boundary.downstream] kind = "periodic"`。河床高と水位は `[bed] slope` の勾配を除いた値で持ち、勾配は運動量式の体積力 g I n_x にする（`HydroParams::background_slope`）。掃流砂の勾配の項と安息角補正の高低差にも、除いた勾配を戻す（`SedimentParams::background_slope`）。`Model::new` は周期的な格子と等流の初期状態を作り、`Model::with_state` は周期境界と周期的な格子の対応を確かめる。`vormorph run` は、給砂も流出もないとき、土砂の収支の誤差を体積 [m³] で表示する
+- 周期的な水路を検証ケースに追加：V01・V02（幾何と Perot 法の厳密さ）、V06（静止状態から体積力で加速した流れが等流の流速に $2\times10^{-11}$ で収束）、V12（六角形配置でも平衡河床の変化が $10^{-14}$ m 以下）。周期 L と 2L の水路の解が丸め誤差の範囲で一致することを確かめるテスト `tests/periodic_channel.rs`。`docs/design/overview.md` の第3章・第4.1節・第4.5節・第4.6節・第4.8節・第6章を更新
 - ライセンス：MIT OR Apache-2.0
