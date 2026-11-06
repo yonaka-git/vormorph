@@ -21,13 +21,13 @@
 //! |---|---|---|
 //! | `title` | [`Config::title`] | 計算ケースの名前（出力ファイル名の接頭辞） |
 //! | `[mesh]` | [`MeshConfig`] | 格子。`kind = "channel"` で直線水路を生成、`"file"` で外部格子 |
-//! | `[bed]` | [`BedConfig`] | 初期河床（直線水路のとき必須） |
+//! | `[bed]` | [`BedConfig`] | 初期河床（直線水路のとき必須。周期境界では、流れを駆動する勾配にも使う） |
 //! | `[[structures]]` | [`StructureConfig`] | 床止めなどの構造物（任意、複数可） |
 //! | `[physics]` | [`PhysicsConfig`] | 物理定数（省略時は既定値） |
 //! | `[time]` | [`TimeConfig`] | 時間刻み・終了時刻・河床変動の開始時刻 |
 //! | `[hydro]` | [`HydroConfig`] | θ、粗度係数、wet/dry の閾値、移流、反復解法 |
 //! | `[sediment]` | [`SedimentConfig`] | 粒径・空隙率・流砂量式・MORFAC など（省略時は固定床） |
-//! | `[boundary]` | [`BoundaryConfig`] | 上流端・下流端の境界条件（それ以外の境界は壁） |
+//! | `[boundary]` | [`BoundaryConfig`] | 上流端・下流端の境界条件（それ以外の境界は壁。両端を `periodic` にすると周期境界） |
 //! | `[output]` | [`OutputConfig`] | 出力先と出力間隔 |
 
 use serde::Deserialize;
@@ -107,6 +107,10 @@ pub enum ChannelLayout {
 ///
 /// 河床高は z_b(x) = `z_downstream` + `slope` × (L − x)。床止めがある場合は
 /// [`StructureConfig::Sill`] の説明のとおり、床止めより上流をかさ上げする。
+///
+/// 周期境界（[`UpstreamBoundary::Periodic`]）では、河床高と水位を勾配を除いた値で持つので、
+/// 初期の河床高は一様に `z_downstream` になり、`slope` は運動量式の体積力 g I n_x の勾配として
+/// 使う（ADR-0014）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BedConfig {
@@ -376,6 +380,9 @@ pub enum EntrainmentFormula {
 }
 
 /// 境界条件。上流端・下流端以外の境界は壁（法線流速 0、流砂の出入りなし）とする。
+///
+/// 上流端と下流端をともに `kind = "periodic"` にすると、直線水路の上流端と下流端をつないだ
+/// 周期境界になる（[`UpstreamBoundary::Periodic`]）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundaryConfig {
@@ -383,6 +390,14 @@ pub struct BoundaryConfig {
     pub upstream: UpstreamBoundary,
     /// 下流端（直線水路では x = L）。
     pub downstream: DownstreamBoundary,
+}
+
+impl BoundaryConfig {
+    /// 周期境界（上流端が `periodic`）なら `true`。[`Config::validate`] は、下流端も `periodic`
+    /// であることを確かめる。
+    pub fn is_periodic(&self) -> bool {
+        matches!(self.upstream, UpstreamBoundary::Periodic { .. })
+    }
 }
 
 /// 上流端の境界条件。
@@ -400,6 +415,15 @@ pub enum UpstreamBoundary {
     },
     /// 壁（閉鎖水域の検証用）。
     Wall,
+    /// 周期境界：上流端を下流端とつなぐ（直線水路の格子だけ。下流端も `periodic` にする）。
+    ///
+    /// 河床高と水位は `[bed] slope` の勾配 I を除いた値で持ち、勾配は運動量式の体積力
+    /// g I n_x として与える（ADR-0014）。給砂と流出はなく、水と土砂の量は保たれる。流量は
+    /// 水の量と摩擦で決まり、河床が変わると変わる。
+    Periodic {
+        /// 初期の等流の流量 Q \[m³/s\]（[`crate::model::Model::new`] が初期状態を作るのに使う）。
+        discharge: f64,
+    },
 }
 
 /// 上流端の給砂の条件（ADR-0011、ADR-0013）。
@@ -439,6 +463,8 @@ pub enum DownstreamBoundary {
     },
     /// 壁（閉鎖水域の検証用）。
     Wall,
+    /// 周期境界（上流端も `periodic` にする。[`UpstreamBoundary::Periodic`]）。
+    Periodic,
 }
 
 /// 出力の設定。
@@ -696,11 +722,27 @@ impl Config {
         }
 
         match &self.boundary.upstream {
-            UpstreamBoundary::Discharge { discharge, .. } => require(
+            UpstreamBoundary::Discharge { discharge, .. }
+            | UpstreamBoundary::Periodic { discharge } => require(
                 discharge.is_finite() && *discharge >= 0.0,
                 "boundary.upstream.discharge must be >= 0",
             ),
             UpstreamBoundary::Wall => {}
+        }
+        let downstream_periodic = matches!(self.boundary.downstream, DownstreamBoundary::Periodic);
+        require(
+            self.boundary.is_periodic() == downstream_periodic,
+            "boundary: kind = \"periodic\" must be given at both the upstream and the downstream end",
+        );
+        if self.boundary.is_periodic() {
+            require(
+                self.bed.is_some(),
+                "[bed] is required with periodic boundaries (bed.slope drives the flow as a body force)",
+            );
+            require(
+                self.structures.is_empty(),
+                "structures cannot be used with periodic boundaries",
+            );
         }
         match &self.boundary.downstream {
             DownstreamBoundary::WaterLevel { level } => require(
@@ -714,7 +756,7 @@ impl Config {
                     "boundary.downstream: kind = \"depth\" cannot be used with [sediment] (the water level follows the outlet bed, so the outlet erodes or aggrades without limit); use kind = \"water_level\"",
                 );
             }
-            DownstreamBoundary::Wall => {}
+            DownstreamBoundary::Wall | DownstreamBoundary::Periodic => {}
         }
 
         require(
@@ -861,6 +903,10 @@ impl fmt::Display for Summary<'_> {
                 sediment_supply.name()
             )?,
             UpstreamBoundary::Wall => writeln!(f, "upstream   : wall")?,
+            UpstreamBoundary::Periodic { discharge } => writeln!(
+                f,
+                "upstream   : periodic (connected to the downstream end), initial discharge {discharge} m^3/s"
+            )?,
         }
         match &c.boundary.downstream {
             DownstreamBoundary::WaterLevel { level } => {
@@ -868,6 +914,7 @@ impl fmt::Display for Summary<'_> {
             }
             DownstreamBoundary::Depth { depth } => writeln!(f, "downstream : depth {depth} m")?,
             DownstreamBoundary::Wall => writeln!(f, "downstream : wall")?,
+            DownstreamBoundary::Periodic => writeln!(f, "downstream : periodic")?,
         }
         write!(
             f,

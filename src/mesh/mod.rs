@@ -20,6 +20,7 @@
 //! | `x_edge`, `y_edge` | （定義が異なる、下記） | 辺 | 辺の中点 \[m\] |
 //! | `normal_edge` | — | 辺 | 単位法線ベクトル n_j |
 //! | `edge_kind` | — | 辺 | 内部・壁・上流端・下流端の別 |
+//! | `edge_shift` | — | 辺 | 周期境界の継ぎ目の辺で、`[1]` の母点を `[0]` の側から見た位置へ移す平行移動（それ以外は 0） |
 //! | `x_vertex`, `y_vertex` | `xVertex`, `yVertex` | 頂点 | ボロノイ頂点の座標 \[m\] |
 //!
 //! ## 規約
@@ -46,6 +47,12 @@
 //! - `x_edge`, `y_edge` は辺の両端の頂点の中点。Perot 法の再構成が一様流で厳密になるのは
 //!   この点を使ったときなので、母点間の線分と辺の交点（MPAS の `xEdge` の定義に近い）とは
 //!   区別する。
+//! - **周期境界**（[`channel::build_periodic`]）：上流端と下流端を継いだ辺（継ぎ目の辺）は
+//!   内部の辺で、`cells_on_edge[e][1]` の母点を `[0]` の側から見た位置は
+//!   `x_cell[c1] + edge_shift[e]` になる。`vertices_on_edge`, `x_edge`, `y_edge`, `normal_edge` は
+//!   `[0]` の側の座標で持つ。位置の差を使う計算（Perot 法、河床勾配の最小二乗、直交性の検査）は
+//!   [`Mesh::edge_midpoint_from`] と [`Mesh::neighbor_position_from`] を通す。継ぎ目の頂点は
+//!   両側に別の番号で持つ（セルの多角形の面積と出力のため）。
 //!
 //! 接続配列は行ごとに長さが異なるので、CSR 形式の [`Jagged`] で持つ。
 //!
@@ -267,6 +274,9 @@ pub struct Mesh {
     pub normal_edge: Vec<[f64; 2]>,
     /// 辺の種類。
     pub edge_kind: Vec<EdgeKind>,
+    /// 周期境界の継ぎ目の辺で、`cells_on_edge[e][1]` の母点を `cells_on_edge[e][0]` の側から
+    /// 見た位置へ移す平行移動 \[m\]。継ぎ目でない辺では 0。
+    pub edge_shift: Vec<[f64; 2]>,
     /// ボロノイ頂点の x 座標 \[m\]（MPAS: `xVertex`）。
     pub x_vertex: Vec<f64>,
     /// ボロノイ頂点の y 座標 \[m\]（MPAS: `yVertex`）。
@@ -299,6 +309,43 @@ impl Mesh {
         let [c0, c1] = self.cells_on_edge[e];
         debug_assert!(c == c0 || c == c1, "cell {c} is not on edge {e}");
         if c == c0 { c1 } else { c0 }
+    }
+
+    /// 周期境界の継ぎ目の辺を持つ（周期的な格子）なら `true`。
+    pub fn is_periodic(&self) -> bool {
+        self.edge_shift.iter().any(|&[x, y]| x != 0.0 || y != 0.0)
+    }
+
+    /// 辺 `e` の継ぎ目の平行移動（継ぎ目でない辺、または `edge_shift` がない格子では 0）。
+    fn shift(&self, e: usize) -> [f64; 2] {
+        self.edge_shift.get(e).copied().unwrap_or([0.0, 0.0])
+    }
+
+    /// 辺 `e` の中点を、セル `c` の側の座標で返す \[m\]。
+    ///
+    /// 継ぎ目の辺では、`cells_on_edge[e][1]` の側から見た中点は `x_edge` から `edge_shift` を
+    /// 引いた位置になる。それ以外の辺では `(x_edge, y_edge)`。
+    pub fn edge_midpoint_from(&self, e: usize, c: usize) -> [f64; 2] {
+        let (x, y) = (self.x_edge[e], self.y_edge[e]);
+        if self.cells_on_edge[e][1] == c && self.cells_on_edge[e][0] != c {
+            let [sx, sy] = self.shift(e);
+            [x - sx, y - sy]
+        } else {
+            [x, y]
+        }
+    }
+
+    /// 内部の辺 `e` を挟んでセル `c` の反対側にあるセルの母点の位置を、`c` の側の座標で返す \[m\]。
+    ///
+    /// 継ぎ目の辺では、反対側の母点の位置に `edge_shift` を足す（または引く）。
+    pub fn neighbor_position_from(&self, e: usize, c: usize) -> [f64; 2] {
+        let [c0, c1] = self.cells_on_edge[e];
+        let [sx, sy] = self.shift(e);
+        if c == c0 {
+            [self.x_cell[c1] + sx, self.y_cell[c1] + sy]
+        } else {
+            [self.x_cell[c0] - sx, self.y_cell[c0] - sy]
+        }
     }
 
     /// 辺 `e` の法線がセル `c` から見て外向きなら `+1.0`、内向きなら `-1.0`。
@@ -343,7 +390,7 @@ impl Mesh {
         let max_orthogonality_error = (0..self.n_edges())
             .filter(|&e| !self.is_boundary_edge(e))
             .filter_map(|e| {
-                let [c0, c1] = self.cells_on_edge[e];
+                let c0 = self.cells_on_edge[e][0];
                 let [a, b] = self.vertices_on_edge[e];
                 let (tx, ty) = (
                     self.x_vertex[b] - self.x_vertex[a],
@@ -353,10 +400,8 @@ impl Mesh {
                 if length < short {
                     return None;
                 }
-                let (dx, dy) = (
-                    self.x_cell[c1] - self.x_cell[c0],
-                    self.y_cell[c1] - self.y_cell[c0],
-                );
+                let [x1, y1] = self.neighbor_position_from(e, c0);
+                let (dx, dy) = (x1 - self.x_cell[c0], y1 - self.y_cell[c0]);
                 Some((dx * tx + dy * ty).abs() / (dx.hypot(dy) * length))
             })
             .fold(0.0, nan_max);

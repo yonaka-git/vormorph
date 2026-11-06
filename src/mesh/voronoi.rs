@@ -28,7 +28,14 @@
 //! | `dv_edge` | 辺の両端の頂点の距離 L |
 //! | `x_edge`, `y_edge` | 辺の両端の頂点の中点 |
 //! | `normal_edge` | 辺の接線 t = (x_b − x_a)/L を時計回りに 90° 回したもの (t_y, −t_x) |
-//! | `dc_edge` | 内部の辺は母点間の距離。境界辺は母点から辺の直線までの距離の2倍 |
+//! | `dc_edge` | 内部の辺は母点間の距離（継ぎ目の辺では `edge_shift` で移した位置との距離）。境界辺は母点から辺の直線までの距離の2倍 |
+//!
+//! ## 周期境界
+//!
+//! [`connect_periodic`] は、上流端の境界辺と、それを平行移動した下流端の境界辺を対にして、
+//! 内部の辺（継ぎ目の辺）に継ぐ。継いだ辺は上流端の側の記録（頂点、中点、法線）を残し、
+//! 下流端の側のセルの母点を上流端の側から見た位置への平行移動を `edge_shift` に入れる
+//! （[`Mesh`] の規約）。
 //!
 //! ## 参考文献
 //!
@@ -103,6 +110,7 @@ pub fn build(polygons: &PolygonMesh) -> Result<Mesh, MeshError> {
         vertices_on_cell: polygons.vertices_on_cell.clone(),
         cells_on_edge: edges.cells_on_edge,
         vertices_on_edge: edges.vertices_on_edge,
+        edge_shift: vec![[0.0; 2]; edge_kind.len()],
         edge_kind,
         x_vertex: polygons.x_vertex.clone(),
         y_vertex: polygons.y_vertex.clone(),
@@ -114,11 +122,133 @@ pub fn build(polygons: &PolygonMesh) -> Result<Mesh, MeshError> {
     Ok(mesh)
 }
 
+/// 上流端の境界辺と、それを `translation` だけ平行移動した下流端の境界辺を対にし、内部の辺
+/// （継ぎ目の辺）に継ぐ（周期境界）。
+///
+/// 上流端の辺 [a, b] と、頂点が (b + T, a + T)（`tol` 以内）の下流端の辺を対にする（2つのセルは
+/// 辺を逆向きにたどる）。継いだ辺は、上流端の辺の頂点・中点・法線を残し、
+/// `cells_on_edge = [上流端の側のセル, 下流端の側のセル]`、`edge_shift = −T`（下流端の側の母点を
+/// 上流端の側から見た位置への平行移動）、種類を [`EdgeKind::Interior`] にする。下流端の辺は除き、
+/// 辺の番号を詰め直す（残る辺の順は変えない）。
+///
+/// 対にならない上流端・下流端の辺がある場合と、同じセルが継ぎ目の両側に来る場合（水路が
+/// 短すぎる）は、問題をすべて挙げて失敗する。
+pub fn connect_periodic(mesh: Mesh, translation: [f64; 2], tol: f64) -> Result<Mesh, MeshError> {
+    let n_edges = mesh.n_edges();
+    let vertex = |v: usize| [mesh.x_vertex[v], mesh.y_vertex[v]];
+    let close = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) <= tol;
+    let edge_kind = &mesh.edge_kind;
+    let of_kind = |kind: EdgeKind| (0..n_edges).filter(move |&e| edge_kind[e] == kind);
+    let downstream: Vec<usize> = of_kind(EdgeKind::Downstream).collect();
+
+    let mut problems = Vec::new();
+    // 下流端の辺 → 対にした上流端の辺
+    let mut partner = vec![NONE; n_edges];
+    for u in of_kind(EdgeKind::Upstream) {
+        let [a, b] = mesh.vertices_on_edge[u];
+        let moved = |v: usize| {
+            let [x, y] = vertex(v);
+            [x + translation[0], y + translation[1]]
+        };
+        let found = downstream.iter().copied().find(|&d| {
+            let [c, d_end] = mesh.vertices_on_edge[d];
+            partner[d] == NONE && close(vertex(c), moved(b)) && close(vertex(d_end), moved(a))
+        });
+        match found {
+            Some(d) => {
+                partner[d] = u;
+                let (cu, cd) = (mesh.cells_on_edge[u][0], mesh.cells_on_edge[d][0]);
+                if cu == cd {
+                    problems.push(format!(
+                        "cell {cu} lies on both sides of the periodic seam (the channel is too short)"
+                    ));
+                }
+            }
+            None => problems.push(format!(
+                "upstream edge ({a}, {b}) has no downstream edge translated by {translation:?}"
+            )),
+        }
+    }
+    for &d in &downstream {
+        if partner[d] == NONE {
+            let [a, b] = mesh.vertices_on_edge[d];
+            problems.push(format!(
+                "downstream edge ({a}, {b}) has no upstream edge translated by {translation:?}"
+            ));
+        }
+    }
+    MeshError::check(problems)?;
+
+    // 新しい辺の番号（下流端の辺は、対にした上流端の辺の番号）
+    let mut new_index = vec![NONE; n_edges];
+    let mut kept = Vec::with_capacity(n_edges - downstream.len());
+    for (e, index) in new_index.iter_mut().enumerate() {
+        if mesh.edge_kind[e] != EdgeKind::Downstream {
+            *index = kept.len();
+            kept.push(e);
+        }
+    }
+    for &d in &downstream {
+        new_index[d] = new_index[partner[d]];
+    }
+    // 上流端の辺 → 対にした下流端の辺の内側のセル
+    let mut across = vec![NONE; n_edges];
+    for &d in &downstream {
+        across[partner[d]] = mesh.cells_on_edge[d][0];
+    }
+
+    let shift = [-translation[0], -translation[1]];
+    let mut out = Mesh {
+        x_cell: mesh.x_cell.clone(),
+        y_cell: mesh.y_cell.clone(),
+        vertices_on_cell: mesh.vertices_on_cell.clone(),
+        edges_on_cell: Jagged::from_rows(
+            mesh.edges_on_cell
+                .rows()
+                .map(|row| row.iter().map(|&e| new_index[e]).collect::<Vec<_>>()),
+        ),
+        cells_on_edge: kept
+            .iter()
+            .map(|&e| {
+                let [c0, c1] = mesh.cells_on_edge[e];
+                if across[e] == NONE {
+                    [c0, c1]
+                } else {
+                    [c0, across[e]]
+                }
+            })
+            .collect(),
+        vertices_on_edge: kept.iter().map(|&e| mesh.vertices_on_edge[e]).collect(),
+        edge_kind: kept
+            .iter()
+            .map(|&e| {
+                if across[e] == NONE {
+                    mesh.edge_kind[e]
+                } else {
+                    EdgeKind::Interior
+                }
+            })
+            .collect(),
+        edge_shift: kept
+            .iter()
+            .map(|&e| if across[e] == NONE { [0.0; 2] } else { shift })
+            .collect(),
+        x_vertex: mesh.x_vertex.clone(),
+        y_vertex: mesh.y_vertex.clone(),
+        ..Mesh::default()
+    };
+    out.derive_cell_connectivity();
+    compute_geometry(&mut out);
+    MeshError::check(check_built(&out))?;
+    Ok(out)
+}
+
 /// 座標と接続から幾何量（`area_cell`, `dc_edge`, `dv_edge`, `x_edge`, `y_edge`,
 /// `normal_edge`）を計算する。定義は[モジュールの説明](self)の表のとおり。
 ///
 /// `x_cell`, `y_cell`, `x_vertex`, `y_vertex`, `vertices_on_cell`, `cells_on_edge`,
-/// `vertices_on_edge` が規約どおりに入っていることを前提にする。長さ 0 の辺の法線は NaN になる
+/// `vertices_on_edge`, `edge_shift` が規約どおりに入っていることを前提にする（`edge_shift` の
+/// 長さが辺の数と違えば、すべて 0 にする）。長さ 0 の辺の法線は NaN になる
 /// （[`build`] はそのような格子を拒否する）。
 pub fn compute_geometry(mesh: &mut Mesh) {
     let area_cell = (0..mesh.n_cells())
@@ -138,6 +268,9 @@ pub fn compute_geometry(mesh: &mut Mesh) {
         .collect();
 
     let n_edges = mesh.n_edges();
+    if mesh.edge_shift.len() != n_edges {
+        mesh.edge_shift = vec![[0.0; 2]; n_edges];
+    }
     let mut dv_edge = Vec::with_capacity(n_edges);
     let mut dc_edge = Vec::with_capacity(n_edges);
     let mut x_edge = Vec::with_capacity(n_edges);
@@ -155,7 +288,8 @@ pub fn compute_geometry(mesh: &mut Mesh) {
             // 母点から辺の直線までの距離（外向きの法線の向きに測る）の2倍 = 鏡映点までの距離
             2.0 * ((xa - x0) * normal[0] + (ya - y0) * normal[1])
         } else {
-            (mesh.x_cell[c1] - x0).hypot(mesh.y_cell[c1] - y0)
+            let [sx, sy] = mesh.edge_shift[e];
+            (mesh.x_cell[c1] + sx - x0).hypot(mesh.y_cell[c1] + sy - y0)
         };
         dv_edge.push(length);
         dc_edge.push(dc);
@@ -474,6 +608,40 @@ mod tests {
         assert!(close(report.total_area, 2.0));
         assert_eq!(report.max_orthogonality_error, 0.0);
         assert!(report.max_closure_error < 1e-15);
+    }
+
+    /// 2つの正方形の上流端と下流端を継ぐ。継ぎ目の辺はセル 0 の左の辺の記録を残し、
+    /// セル 1 の母点を (−2, 0) 移した位置との距離が `dc_edge` になる。
+    #[test]
+    fn upstream_and_downstream_edges_are_connected() {
+        let mesh = build(&two_squares()).expect("valid mesh");
+        let mesh = connect_periodic(mesh, [2.0, 0.0], 1e-12).expect("matching ends");
+        assert_eq!(mesh.n_edges(), 6);
+        assert!(!mesh.edge_kind.contains(&EdgeKind::Upstream));
+        assert!(!mesh.edge_kind.contains(&EdgeKind::Downstream));
+        // 元の辺 3（上流端）が継ぎ目の辺になり、元の辺 5（下流端）は除かれて番号が詰まる
+        assert_eq!(mesh.cells_on_edge[3], [0, 1]);
+        assert_eq!(mesh.vertices_on_edge[3], [3, 0]);
+        assert_eq!(mesh.edge_shift[3], [-2.0, 0.0]);
+        assert_eq!(mesh.edge_kind[3], EdgeKind::Interior);
+        assert_eq!(&mesh.edges_on_cell[1], &[4, 3, 5, 1]);
+        assert_eq!(&mesh.edge_sign_on_cell[1], &[1.0, -1.0, 1.0, -1.0]);
+        assert!((mesh.dc_edge[3] - 0.9).abs() < 1e-14);
+        assert_eq!(mesh.normal_edge[3], [-1.0, 0.0]);
+        let report = mesh.check_geometry();
+        assert_eq!(report.max_orthogonality_error, 0.0);
+        assert!(report.max_closure_error < 1e-15);
+    }
+
+    #[test]
+    fn unmatched_periodic_edges_are_reported() {
+        let mesh = build(&two_squares()).expect("valid mesh");
+        let problems = match connect_periodic(mesh, [3.0, 0.0], 1e-12) {
+            Ok(_) => panic!("the ends do not match"),
+            Err(err) => err.problems().to_vec(),
+        };
+        assert_reported(&problems, "upstream edge (3, 0) has no downstream edge");
+        assert_reported(&problems, "downstream edge (4, 5) has no upstream edge");
     }
 
     #[test]

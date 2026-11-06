@@ -10,9 +10,12 @@
 //!
 //! ```text
 //! u_j^{n+1} = G_j − θ g Δt / (δ_j (1 + Δt γ_j)) · (η_{2(j)}^{n+1} − η_{1(j)}^{n+1})
-//! G_j = [F u_j^n − (1 − θ) g Δt / δ_j · (η_{2(j)}^n − η_{1(j)}^n)] / (1 + Δt γ_j)
+//! G_j = [F u_j^n − (1 − θ) g Δt / δ_j · (η_{2(j)}^n − η_{1(j)}^n) + Δt g I n_{x,j}] / (1 + Δt γ_j)
 //! γ_j = g n² |u|_j / H_j^{4/3}
 //! ```
+//!
+//! g I n_{x,j} は周期境界の体積力で、I は河床高と水位から除いた縦断勾配
+//! （[`HydroParams::background_slope`]。周期境界でなければ 0。ADR-0014）。
 //!
 //! |u|_j は、法線成分 u_j^n と、両側のセルの Perot 流速の平均の接線成分から求める
 //! （一様流なら厳密に元の速さになる）。これを連続式に代入すると、水位について次の
@@ -47,6 +50,10 @@
 //!   配分し、既知の流入 Q_j として右辺 b_i に入れる（w_j = 0）。η_s は上流端の湿ったセルの
 //!   水位の平均（断面で共通の水位。ADR-0007）、z_{b,i} は内側のセルの河床高。境界辺の u_j は、
 //!   単位幅流量 Q_j / L_j を新しい水深で割った値にする（Perot 再構成と出力に使う）。
+//! - 周期境界：上流端と下流端を継いだ格子（[`crate::mesh::channel::build_periodic`]）では、
+//!   継ぎ目の辺は内部の辺として扱い、開境界の辺はない。河床高と水位は縦断勾配 I を除いた値で
+//!   持ち、勾配は体積力 g I n_x として運動量式に入れる。Perot 法では、継ぎ目の辺の中点を
+//!   セルの側の座標（[`Mesh::edge_midpoint_from`]）で使う。
 //! - 下流端（水位・水深）：境界辺の上の水位 η_b を既知とし、母点から辺までの距離
 //!   δ_j = `dc_edge` / 2 で水位勾配を評価する（ADR-0007）。w_j η_b を右辺へ移す。水深一定の
 //!   境界では η_b = z_{b,i} + 水深（z_{b,i} は内側のセルの河床高）。辺の水深の風上は、流出なら
@@ -126,6 +133,9 @@ pub struct HydroParams {
     pub advection: AdvectionScheme,
     /// 反復解法の設定。
     pub solver: SolverConfig,
+    /// 周期境界で河床高と水位から除いた縦断勾配 I \[-\]（x の正の向きに下がる向きを正）。
+    /// 運動量式に体積力 g I n_x として入れる。周期境界でなければ 0（ADR-0014）。
+    pub background_slope: f64,
 }
 
 impl HydroParams {
@@ -138,7 +148,16 @@ impl HydroParams {
             dry_depth: config.hydro.dry_depth,
             advection: config.hydro.advection,
             solver: config.hydro.solver.clone(),
+            background_slope: background_slope(config),
         }
+    }
+}
+
+/// 周期境界で河床高と水位から除いた縦断勾配（`[bed] slope`）。周期境界でなければ 0。
+pub fn background_slope(config: &Config) -> f64 {
+    match (&config.bed, config.boundary.is_periodic()) {
+        (Some(bed), true) => bed.slope,
+        _ => 0.0,
     }
 }
 
@@ -224,12 +243,13 @@ fn edge_role(mesh: &Mesh, state: &State, boundary: &BoundaryConfig, e: usize) ->
     match mesh.edge_kind[e] {
         EdgeKind::Interior => EdgeRole::Interior,
         EdgeKind::Wall => EdgeRole::Wall,
+        // 周期境界の格子には開境界の辺がない（継ぎ目の辺は内部の辺）
         EdgeKind::Upstream => match boundary.upstream {
-            UpstreamBoundary::Wall => EdgeRole::Wall,
+            UpstreamBoundary::Wall | UpstreamBoundary::Periodic { .. } => EdgeRole::Wall,
             UpstreamBoundary::Discharge { .. } => EdgeRole::Discharge,
         },
         EdgeKind::Downstream => match boundary.downstream {
-            DownstreamBoundary::Wall => EdgeRole::Wall,
+            DownstreamBoundary::Wall | DownstreamBoundary::Periodic => EdgeRole::Wall,
             DownstreamBoundary::WaterLevel { level } => EdgeRole::Level(level),
             DownstreamBoundary::Depth { depth } => {
                 EdgeRole::Level(state.zb[mesh.cells_on_edge[e][0]] + depth)
@@ -405,7 +425,7 @@ impl HydroSolver {
         edge_depths(mesh, state, outside_level, params.dry_depth, edge_depth);
         let discharge = match boundary.upstream {
             UpstreamBoundary::Discharge { discharge, .. } => discharge,
-            UpstreamBoundary::Wall => 0.0,
+            UpstreamBoundary::Wall | UpstreamBoundary::Periodic { .. } => 0.0,
         };
         let section_level = inflow_section_level(mesh, state, role, params.dry_depth);
         let total_conveyance: f64 = (0..mesh.n_edges())
@@ -468,6 +488,8 @@ impl HydroSolver {
         } = self;
         let (g, theta) = (params.gravity, params.theta);
         let n2 = params.manning_n * params.manning_n;
+        // 周期境界の体積力 g I（x 方向）
+        let body_force = g * params.background_slope;
         let mut report = StepReport {
             dt,
             outflow_courant: dt * outflow_rate(mesh, state, edge_flux),
@@ -502,7 +524,9 @@ impl HydroSolver {
                 if let Some((eta1, eta2, delta)) = gradient_points(mesh, role[e], &state.eta, e) {
                     gamma = g * n2 * edge_speed(mesh, state, e) / h.powf(4.0 / 3.0);
                     let denom = 1.0 + dt * gamma;
-                    big_g = (advected[e] - (1.0 - theta) * g * dt * (eta2 - eta1) / delta) / denom;
+                    big_g = (advected[e] - (1.0 - theta) * g * dt * (eta2 - eta1) / delta
+                        + dt * body_force * mesh.normal_edge[e][0])
+                        / denom;
                     w = g * theta * theta * dt * dt * mesh.dv_edge[e] * h / (delta * denom);
                     flux = mesh.dv_edge[e] * h * (theta * big_g + (1.0 - theta) * state.u_n[e]);
                 }
@@ -728,6 +752,7 @@ pub fn edge_depths(
 /// x_j は辺の中点、x_i は母点。発散定理から、一様流なら丸め誤差の範囲で厳密に元の
 /// 流速に一致する（検証ケース V02）。境界辺も含めてセルを囲むすべての辺を使うので、
 /// 境界辺の u_j（壁なら 0、流入・流出端なら境界条件で決まる値）を入れてから呼ぶ。
+/// 周期境界の継ぎ目の辺では、中点をセルの側の座標（[`Mesh::edge_midpoint_from`]）で使う。
 ///
 /// `u_n` の長さは辺の数、`out` の長さはセル数でなければならない。
 pub fn reconstruct_cell_velocity(mesh: &Mesh, u_n: &[f64], out: &mut [[f64; 2]]) {
@@ -746,8 +771,9 @@ pub fn reconstruct_cell_velocity(mesh: &Mesh, u_n: &[f64], out: &mut [[f64; 2]])
         let (mut sx, mut sy) = (0.0, 0.0);
         for (&e, &s) in mesh.edges_on_cell[c].iter().zip(&mesh.edge_sign_on_cell[c]) {
             let flux = s * mesh.dv_edge[e] * u_n[e];
-            sx += flux * (mesh.x_edge[e] - xc);
-            sy += flux * (mesh.y_edge[e] - yc);
+            let [xe, ye] = mesh.edge_midpoint_from(e, c);
+            sx += flux * (xe - xc);
+            sy += flux * (ye - yc);
         }
         *u = [sx / mesh.area_cell[c], sy / mesh.area_cell[c]];
     }
@@ -969,6 +995,7 @@ mod tests {
 
     fn params(manning_n: f64) -> HydroParams {
         HydroParams {
+            background_slope: 0.0,
             gravity: 9.81,
             theta: 0.55,
             manning_n,
