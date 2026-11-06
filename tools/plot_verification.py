@@ -13,6 +13,7 @@
     `<dir>/<ケース名>/<ケース名>.pvd` と、そこから参照する `.vtu`（src/io.rs の出力の規約）。
     V04 は、検証テストが書く `<dir>/<ケース名>/centroid.csv`（水塊の重心の時系列）も読む。
     V05 は、`<dir>/v05_convergence.csv`（格子幅ごとの L1 誤差）も読む。
+    V11 は、`<dir>/v11_<格子幅>m_<こぶの高さ>m/` の4ケース（tests/verification.rs の v11_bump_migration）。
     ケースの条件（寸法・流量など）は tests/verification.rs の定数と一致させる。
 """
 
@@ -102,6 +103,73 @@ V05_PROFILES = (
     ("hexagonal", 0.0125, "hexagonal, 0.0125 m", (0, (4, 2))),
 )
 """水深の分布を描く計算（配置, 格子幅 [m], 凡例, 線種）。"""
+
+
+# V11 河床のこぶの移動（tests/verification.rs の v11_bump_migration と同じ条件）
+V11_LENGTH = 300.0
+"""水路延長 [m]。"""
+V11_SLOPE = 0.002
+"""河床勾配 [-]。"""
+V11_MANNING_N = 0.025
+"""マニングの粗度係数 [s/m^(1/3)]。"""
+V11_UNIT_DISCHARGE = 2.0
+"""単位幅流量 [m²/s]。"""
+V11_CENTER = 200.0
+"""こぶの中心の初期位置 [m]。"""
+V11_SIGMA = 4.0
+"""こぶの幅（ガウス分布の σ）[m]。"""
+V11_MORPHOLOGY_START = 300.0
+"""河床変動を始める時刻 [s]。"""
+V11_MORFAC = 10.0
+"""MORFAC [-]。"""
+V11_GRAIN_SIZE = 0.002
+"""粒径 [m]。"""
+V11_RELATIVE_DENSITY = 1.65
+"""水中比重 [-]。"""
+V11_POROSITY = 0.4
+"""空隙率 [-]。"""
+V11_CRITICAL_SHIELDS = 0.047
+"""無次元限界掃流力 [-]。"""
+V11_G = 9.81
+"""重力加速度 [m/s²]。"""
+V11_CASES = (
+    ("v11_1m_0.1m", "1 m"),
+    ("v11_0.5m_0.1m", "0.5 m"),
+    ("v11_0.25m_0.1m", "0.25 m"),
+)
+"""高さ 0.1 m のこぶの（ケース名、格子幅の表示）。"""
+V11_SMALL = "v11_0.25m_0.02m"
+"""高さ 0.02 m の小さなこぶ（格子幅 0.25 m）のケース名。"""
+
+
+def bump_linear_celerity() -> float:
+    """線形理論のこぶの移動速度（流れの時間あたり）[m/s]。
+
+    流量一定の準定常な流れで δh = −δz/(1 − Fr²)、MPM 式の ∂q_b/∂h から
+    c = M/(1 − λ) · ∂q_b/∂z_b（tests/verification.rs の bump_linear_celerity と同じ）。
+    """
+    h = normal_depth(V11_UNIT_DISCHARGE, 1.0, V11_SLOPE, V11_MANNING_N)
+    u = V11_UNIT_DISCHARGE / h
+    s, d = V11_RELATIVE_DENSITY, V11_GRAIN_SIZE
+    tau = V11_MANNING_N**2 * u**2 / (np.cbrt(h) * s * d)
+    dqb_dh = np.sqrt(s * V11_G * d**3) * 12.0 * np.sqrt(tau - V11_CRITICAL_SHIELDS) * (-7.0 / 3.0) * tau / h
+    froude2 = u**2 / (V11_G * h)
+    return V11_MORFAC / (1.0 - V11_POROSITY) * (-dqb_dh / (1.0 - froude2))
+
+
+def bump_profile(mesh: meshio.Mesh) -> tuple[np.ndarray, np.ndarray]:
+    """こぶ（河床高 − 基準の河床高）の縦断形（x の小さい順。幅1セルの水路）。"""
+    x = cell_field(mesh, "x_cell")
+    b = cell_field(mesh, "zb") - V11_SLOPE * (V11_LENGTH - x)
+    order = np.argsort(x)
+    return x[order], b[order]
+
+
+def crest_position(x: np.ndarray, b: np.ndarray) -> float:
+    """山の位置（最大の点と両隣の3点の放物線で補間）[m]。"""
+    k = int(np.clip(np.argmax(b), 1, len(b) - 2))
+    b0, b1, b2 = b[k - 1], b[k], b[k + 1]
+    return float(x[k] + 0.5 * (x[k + 1] - x[k - 1]) / 2.0 * (b0 - b2) / (b0 - 2.0 * b1 + b2))
 
 
 def stoker_cm(hr: float) -> float:
@@ -493,13 +561,64 @@ def plot_v07(root: Path, output: Path) -> None:
     fig.savefig(output, dpi=150)
 
 
+def plot_v11(root: Path, output: Path) -> None:
+    """V11 の図：終了時のこぶの縦断形（3つの格子幅）と、小さなこぶの山の位置の時系列。"""
+    celerity = bump_linear_celerity()
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7.5), constrained_layout=True)
+    line = np.linspace(170.0, 280.0, 2201)
+    initial = 0.1 * np.exp(-(((line - V11_CENTER) / V11_SIGMA) ** 2))
+    top.plot(line, initial, color=REFERENCE, lw=2.0, label="initial bump")
+    duration = 0.0
+    for (case, label), color in zip(V11_CASES, SERIES, strict=True):
+        time, mesh = last_step(root / case)
+        duration = time - V11_MORPHOLOGY_START
+        x, b = bump_profile(mesh)
+        top.plot(x, b, color=color, lw=1.2, label=f"Δx = {label}")
+    shifted = V11_CENTER + celerity * duration
+    top.axvline(shifted, color=BED, lw=0.8, ls=":")
+    top.annotate(
+        f"initial position + linear celerity × {duration:g} s",
+        (shifted, 0.09),
+        xytext=(6, 0),
+        textcoords="offset points",
+        fontsize="small",
+        va="center",
+    )
+    top.set_xlim(185.0, 265.0)
+    top.set_xlabel("x [m]")
+    top.set_ylabel("bump height above the base slope [m]")
+    top.set_title(
+        f"(a) bump of 0.1 m after {duration:g} s of morphology (MORFAC {V11_MORFAC:g})",
+        loc="left",
+        fontsize="medium",
+    )
+    top.legend(loc="upper left", fontsize="small")
+    top.grid(alpha=0.3)
+
+    times, crests = [], []
+    for time, path in read_collection(root / V11_SMALL / f"{V11_SMALL}.pvd"):
+        if time < V11_MORPHOLOGY_START:
+            continue
+        times.append(time - V11_MORPHOLOGY_START)
+        crests.append(crest_position(*bump_profile(meshio.read(path))))
+    span = np.array([0.0, max(times)])
+    bottom.plot(span, V11_CENTER + celerity * span, color=REFERENCE, lw=2.0, label=f"linear theory ({celerity:.4f} m/s)")
+    bottom.plot(times, crests, color=SERIES[2], lw=1.2, marker="o", ms=4, label="Δx = 0.25 m")
+    bottom.set_xlabel("time since the start of morphology [s]")
+    bottom.set_ylabel("crest position [m]")
+    bottom.set_title("(b) crest of a small bump (0.02 m)", loc="left", fontsize="medium")
+    bottom.legend(loc="upper left", fontsize="small")
+    bottom.grid(alpha=0.3)
+    fig.savefig(output, dpi=150)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("case", choices=["v04", "v05", "v06", "v07"], help="verification case")
+    parser.add_argument("case", choices=["v04", "v05", "v06", "v07", "v11"], help="verification case")
     parser.add_argument("root", type=Path, help="VORMORPH_VERIFICATION_OUTPUT of the test run")
     parser.add_argument("-o", "--output", type=Path, required=True, help="output image")
     args = parser.parse_args(argv)
-    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06, "v07": plot_v07}
+    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06, "v07": plot_v07, "v11": plot_v11}
     plots[args.case](args.root, args.output)
     print(f"wrote {args.output}")
     return 0
