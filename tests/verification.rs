@@ -1209,13 +1209,341 @@ fn v08_trench_migration() {
     todo!("トレンチの移動速度と形状")
 }
 
-/// V09 交互砂州：波長と波高。
+/// V09 交互砂州：線形安定解析の成長率と移動速度。
 ///
-/// 直線水路で交互砂州を発達させ、波長・波高を既往の実験や線形安定解析と比較する。
+/// 周期的な直線水路（ADR-0014、ADR-0015）の等流（勾配 1/500、単位幅流量 2 m²/s、n = 0.025、
+/// `examples/sill.toml` の流砂の条件で MORFAC 100）に、交互砂州の単一モード
+/// ε cos(πy/B) cos(2πx/L)（ε = 1 mm、L は水路の周期）を与え、振幅の成長率と移動速度を、
+/// 同じ式の線形安定解析（`tools/bar_theory.py`。流れの非定常項と MORFAC を含む）と比べる。
+///
+/// 移流と辺の水深の1次の風上差分の数値拡散で、成長率は理論より小さく出る（短い波ほど大きい）。
+/// 誤差は格子幅に比例して減る（1次の収束）ので、横断方向の行数 N と 2N の2段の計算から、
+/// 1次精度を仮定した Richardson 外挿 2σ_{2N} − σ_N で理論と比べる。
+///
+/// - 誤差の比 e_{2N} / e_N が 0.4〜0.6（1次の収束）
+/// - 外挿した成長率の誤差が、正方形配置で 5%、六角形配置で 10% 以下
+/// - 細かい方の格子の移動速度の誤差が、正方形配置で 2%、六角形配置で 5% 以下
+///
+/// ケースは次のとおり（β = B/2H。この流れの発生の境は β_c ≈ 8.0）。
+///
+/// - 幅 40 m（β = 18.7）、L = 211.4 m：正方形配置・六角形配置の 10・20 行
+/// - 幅 40 m、L = 400 m と L = 100 m：正方形配置の 10・20 行
+/// - 幅 10 m（β = 4.7。どの波長でも減衰する）、L = 142.5 m：正方形配置の 5・10 行。
+///   六角形配置の 10 行でも減衰すること
+///
+/// 理論の値は `tools/bar_theory.py` で計算した（`tools/tests/test_bar_theory.py` で同じ値を確かめる）。
+/// `VORMORPH_VERIFICATION_OUTPUT` を指定すると、ケースごとに振幅の時系列 `amplitude.csv` と最後の
+/// 状態の VTK を、全ケースの結果を `v09_summary.csv` に書く。
 #[test]
-#[ignore = "未実装: sediment（掃流砂・勾配補正）"]
 fn v09_alternate_bars() {
-    todo!("交互砂州の波長と波高")
+    struct Case {
+        layout: ChannelLayout,
+        rows: usize,
+        width: f64,
+        wavelength: f64,
+        /// 線形理論の成長率 \[1/s\]と移動速度 \[m/s\]（流れの時間あたり、MORFAC 100）。
+        theory: (f64, f64),
+    }
+    let case = |layout, rows, width, wavelength, theory| Case {
+        layout,
+        rows,
+        width,
+        wavelength,
+        theory,
+    };
+    use ChannelLayout::{Hexagonal, Rectangular};
+    let main = (2.5895e-3, 0.33858);
+    let long = (1.6758e-3, 0.22031);
+    let short = (2.1121e-3, 0.53126);
+    let stable = (-5.0585e-3, 0.31199);
+    let cases = [
+        case(Rectangular, 10, 40.0, 211.4, main),
+        case(Rectangular, 20, 40.0, 211.4, main),
+        case(Hexagonal, 10, 40.0, 211.4, main),
+        case(Hexagonal, 20, 40.0, 211.4, main),
+        case(Rectangular, 10, 40.0, 400.0, long),
+        case(Rectangular, 20, 40.0, 400.0, long),
+        case(Rectangular, 10, 40.0, 100.0, short),
+        case(Rectangular, 20, 40.0, 100.0, short),
+        case(Rectangular, 5, 10.0, 142.5, stable),
+        case(Rectangular, 10, 10.0, 142.5, stable),
+        case(Hexagonal, 10, 10.0, 142.5, stable),
+    ];
+    let name = |c: &Case| {
+        format!(
+            "v09_{}_{}rows_b{}_l{}",
+            format!("{:?}", c.layout).to_lowercase(),
+            c.rows,
+            c.width,
+            c.wavelength
+        )
+    };
+    let runs: Vec<BarModeRun> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|c| {
+                let case = name(c);
+                scope.spawn(move || {
+                    bar_mode_run(c.layout, c.rows, c.width, c.wavelength, c.theory.0, &case)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("the run must not panic"))
+            .collect()
+    });
+
+    let errors: Vec<(f64, f64)> = cases
+        .iter()
+        .zip(&runs)
+        .map(|(c, run)| {
+            (
+                run.growth / c.theory.0 - 1.0,
+                run.celerity / c.theory.1 - 1.0,
+            )
+        })
+        .collect();
+    let mut summary = String::from(
+        "case,layout,rows,width,wavelength,cells,growth,celerity,theory_growth,theory_celerity\n",
+    );
+    for ((c, run), (growth_error, celerity_error)) in cases.iter().zip(&runs).zip(&errors) {
+        println!(
+            "V09 {:?}, {} rows, B = {} m, L = {} m: {} cells, {} steps, \
+             growth {:.4e} 1/s ({:+.1}%), celerity {:.4e} m/s ({:+.1}%), amplitude {:.2e} -> {:.2e} m",
+            c.layout,
+            c.rows,
+            c.width,
+            c.wavelength,
+            run.cells,
+            run.steps,
+            run.growth,
+            100.0 * growth_error,
+            run.celerity,
+            100.0 * celerity_error,
+            run.amplitude.0,
+            run.amplitude.1
+        );
+        summary.push_str(&format!(
+            "{},{:?},{},{},{},{},{:e},{:e},{:e},{:e}\n",
+            name(c),
+            c.layout,
+            c.rows,
+            c.width,
+            c.wavelength,
+            run.cells,
+            run.growth,
+            run.celerity,
+            c.theory.0,
+            c.theory.1
+        ));
+    }
+    if let Some(root) = output_root() {
+        std::fs::write(PathBuf::from(root).join("v09_summary.csv"), summary)
+            .expect("the summary must be written");
+    }
+
+    // 格子2段の組（粗い方, 細かい方）
+    for (coarse, fine) in [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)] {
+        let c = &cases[fine];
+        let label = format!("{:?}, B = {} m, L = {} m", c.layout, c.width, c.wavelength);
+        let (e_coarse, e_fine) = (errors[coarse].0, errors[fine].0);
+        let ratio = e_fine / e_coarse;
+        let extrapolated = 2.0 * e_fine - e_coarse;
+        let (growth_limit, celerity_limit) = match c.layout {
+            Rectangular => (0.05, 0.02),
+            Hexagonal => (0.10, 0.05),
+        };
+        println!(
+            "V09 {label}: error ratio {ratio:.3}, extrapolated growth error {:+.1}%",
+            100.0 * extrapolated
+        );
+        assert!(
+            (0.4..=0.6).contains(&ratio),
+            "{label}: the growth error must halve with the cell size ({e_coarse:+.3} -> {e_fine:+.3})"
+        );
+        assert!(
+            extrapolated.abs() <= growth_limit,
+            "{label}: extrapolated growth error {extrapolated:+.3}"
+        );
+        assert!(
+            errors[fine].1.abs() <= celerity_limit,
+            "{label}: celerity error {:+.3}",
+            errors[fine].1
+        );
+    }
+    // 幅 10 m は、どちらの配置でも減衰する
+    assert!(runs[8].growth < 0.0 && runs[9].growth < 0.0 && runs[10].growth < 0.0);
+}
+
+/// V09 の1ケースの結果。
+struct BarModeRun {
+    /// セル数。
+    cells: usize,
+    /// ステップ数。
+    steps: u64,
+    /// 振幅の成長率（流れの時間あたり）\[1/s\]。
+    growth: f64,
+    /// 移動速度（流れの時間あたり）\[m/s\]。
+    celerity: f64,
+    /// 河床変動を始めたときと終わりの振幅 \[m\]。
+    amplitude: (f64, f64),
+}
+
+/// 交互砂州の単一モード cos(πy/B) cos(kx) の、河床の複素振幅
+/// a = 2 Σ A z cos(πy/B) e^{−ikx} / Σ A cos²(πy/B) \[m\]（実部・虚部）。
+fn bar_mode_amplitude(mesh: &Mesh, zb: &[f64], width: f64, wavelength: f64) -> (f64, f64) {
+    let k = 2.0 * PI / wavelength;
+    let (mut re, mut im, mut norm) = (0.0, 0.0, 0.0);
+    for (c, &z) in zb.iter().enumerate() {
+        let (x, y, a) = (mesh.x_cell[c], mesh.y_cell[c], mesh.area_cell[c]);
+        let w = (PI * y / width).cos();
+        re += a * z * w * (k * x).cos();
+        im -= a * z * w * (k * x).sin();
+        norm += a * w * w;
+    }
+    (2.0 * re / norm, 2.0 * im / norm)
+}
+
+/// V09 の流れと流砂の条件：勾配 1/500、単位幅流量 2 m²/s、n = 0.025（V06・V12 と同じ）、
+/// `examples/sill.toml` の流砂の条件（d = 2 mm、MPM 式）で MORFAC を 100 にしたもの。
+mod bar_case {
+    pub const SLOPE: f64 = 0.002;
+    pub const MANNING_N: f64 = 0.025;
+    pub const UNIT_DISCHARGE: f64 = 2.0;
+    pub const MORFAC: f64 = 100.0;
+    /// 固定床で流れを起伏に合わせる助走の時間 \[s\]。
+    pub const SPIN_UP: f64 = 300.0;
+    /// 初期の起伏の振幅 \[m\]（水深の約 1/1000）。
+    pub const EPSILON: f64 = 1.0e-3;
+    /// 河床変動を解く時間：線形理論で振幅が e^3 倍（減衰なら e^{-3} 倍）になる時間。
+    pub const EFOLDS: f64 = 3.0;
+}
+
+/// 周期的な水路（幅 `width`、周期 `wavelength`、横断方向に `rows` 行）の等流に、
+/// 振幅 [`bar_case::EPSILON`] の単一モードの河床の起伏を与え、固定床で助走したあと、
+/// 線形理論の成長率 `expected_growth` で振幅が e^3 倍（減衰なら e^{-3} 倍）になる時間だけ
+/// 河床変動を解く。振幅の対数と位相を時刻に対して最小二乗で直線に当てはめて、成長率と
+/// 移動速度を求める（河床変動の最初の 1/4 は、流れの調整の過渡として除く）。
+fn bar_mode_run(
+    layout: ChannelLayout,
+    rows: usize,
+    width: f64,
+    wavelength: f64,
+    expected_growth: f64,
+    case: &str,
+) -> BarModeRun {
+    use bar_case::*;
+    let duration = EFOLDS / expected_growth.abs();
+    let end = SPIN_UP + duration;
+    let h_n = (MANNING_N * UNIT_DISCHARGE / SLOPE.sqrt()).powf(0.6);
+    let cell_size = match layout {
+        ChannelLayout::Rectangular => width / rows as f64,
+        ChannelLayout::Hexagonal => width / (rows as f64 * 0.5 * 3f64.sqrt()),
+    };
+    let mesh = channel::build_periodic(&ChannelSpec {
+        length: wavelength,
+        width,
+        cell_size,
+        layout,
+    })
+    .expect("valid periodic channel");
+    let boundary = format!(
+        r#"
+[bed]
+slope = {SLOPE:?}
+
+[boundary.upstream]
+kind = "periodic"
+discharge = {:?}
+
+[boundary.downstream]
+kind = "periodic"
+"#,
+        UNIT_DISCHARGE * width
+    );
+    let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, end);
+    config.time.dt = None;
+    config.time.courant = Some(0.5);
+    config.time.dt_max = Some(1.0);
+    config.time.morphology_start = SPIN_UP;
+    let mut sediment = sill_sediment();
+    sediment.morfac = MORFAC;
+    config.sediment = Some(sediment);
+
+    let k = 2.0 * PI / wavelength;
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
+        state.zb[c] = EPSILON * (PI * y / width).cos() * (k * x).cos();
+        state.eta[c] = h_n;
+    }
+    for (u, n) in state.u_n.iter_mut().zip(&mesh.normal_edge) {
+        *u = UNIT_DISCHARGE / h_n * n[0];
+    }
+    let cells = mesh.n_cells();
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    let record = duration / 200.0;
+    let mut next = SPIN_UP;
+    let mut samples: Vec<(f64, f64, f64)> = Vec::new();
+    let mut phase_offset = 0.0;
+    let mut last_phase = f64::NAN;
+    while !model.finished() {
+        model.step().expect("the step must succeed");
+        let time = model.state().time;
+        if time >= next - 1e-9 {
+            let (re, im) = bar_mode_amplitude(model.mesh(), &model.state().zb, width, wavelength);
+            // 位相を連続につなぐ（1回の記録の間に進む位相は π よりずっと小さい）
+            let mut phase = im.atan2(re) + phase_offset;
+            if last_phase.is_finite() {
+                while phase - last_phase > PI {
+                    phase -= 2.0 * PI;
+                    phase_offset -= 2.0 * PI;
+                }
+                while phase - last_phase < -PI {
+                    phase += 2.0 * PI;
+                    phase_offset += 2.0 * PI;
+                }
+            }
+            last_phase = phase;
+            samples.push((time, re.hypot(im).ln(), phase));
+            next += record;
+        }
+    }
+    if output_root().is_some() {
+        let csv: String = std::iter::once("time,amplitude,phase\n".to_owned())
+            .chain(
+                samples
+                    .iter()
+                    .map(|(t, l, p)| format!("{t:?},{:e},{p:?}\n", l.exp())),
+            )
+            .collect();
+        let path = model.config().output.dir.join("amplitude.csv");
+        std::fs::create_dir_all(&model.config().output.dir).expect("the output directory");
+        std::fs::write(path, csv).expect("the amplitude history must be written");
+    }
+    let fit = &samples[samples.len() / 4..];
+    let slope_of = |value: fn(&(f64, f64, f64)) -> f64| {
+        let n = fit.len() as f64;
+        let mt = fit.iter().map(|s| s.0).sum::<f64>() / n;
+        let my = fit.iter().map(value).sum::<f64>() / n;
+        let (num, den) = fit.iter().fold((0.0, 0.0), |(a, b), s| {
+            (
+                a + (s.0 - mt) * (value(s) - my),
+                b + (s.0 - mt) * (s.0 - mt),
+            )
+        });
+        num / den
+    };
+    let growth = slope_of(|s| s.1);
+    let phase_rate = slope_of(|s| s.2);
+    BarModeRun {
+        cells,
+        steps: model.steps(),
+        growth,
+        celerity: -phase_rate / k,
+        amplitude: (samples[0].1.exp(), samples[samples.len() - 1].1.exp()),
+    }
 }
 
 /// V10 湾曲水路の河床変動：外岸側の洗掘。

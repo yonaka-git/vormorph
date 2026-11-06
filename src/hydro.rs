@@ -52,8 +52,9 @@
 //!   単位幅流量 Q_j / L_j を新しい水深で割った値にする（Perot 再構成と出力に使う）。
 //! - 周期境界：上流端と下流端を継いだ格子（[`crate::mesh::channel::build_periodic`]）では、
 //!   継ぎ目の辺は内部の辺として扱い、開境界の辺はない。河床高と水位は縦断勾配 I を除いた値で
-//!   持ち、勾配は体積力 g I n_x として運動量式に入れる。Perot 法では、継ぎ目の辺の中点を
-//!   セルの側の座標（[`Mesh::edge_midpoint_from`]）で使う。
+//!   持ち、勾配は体積力 g I n_x として運動量式に入れる。辺の水深の風上と高い方の河床は、
+//!   除いた勾配を戻した実際の高さで選ぶ（[`edge_depths`]、ADR-0015）。Perot 法では、継ぎ目の
+//!   辺の中点をセルの側の座標（[`Mesh::edge_midpoint_from`]）で使う。
 //! - 下流端（水位・水深）：境界辺の上の水位 η_b を既知とし、母点から辺までの距離
 //!   δ_j = `dc_edge` / 2 で水位勾配を評価する（ADR-0007）。w_j η_b を右辺へ移す。水深一定の
 //!   境界では η_b = z_{b,i} + 水深（z_{b,i} は内側のセルの河床高）。辺の水深の風上は、流出なら
@@ -422,7 +423,14 @@ impl HydroSolver {
                 _ => f64::NEG_INFINITY,
             };
         }
-        edge_depths(mesh, state, outside_level, params.dry_depth, edge_depth);
+        edge_depths(
+            mesh,
+            state,
+            outside_level,
+            params.dry_depth,
+            params.background_slope,
+            edge_depth,
+        );
         let discharge = match boundary.upstream {
             UpstreamBoundary::Discharge { discharge, .. } => discharge,
             UpstreamBoundary::Wall | UpstreamBoundary::Periodic { .. } => 0.0,
@@ -699,6 +707,11 @@ fn water_level_residual(
 /// H_j = max(η_up − max(z_{b,1}, z_{b,2}), 0)。η_up は u_j の向きで決まる風上側のセルの水位
 /// （u_j = 0 のときは高い方）。`dry_depth` 未満の辺は乾いているとみなして 0 にする。
 ///
+/// `background_slope` は、周期境界で河床高と水位から除いた縦断勾配 I（周期境界でなければ 0）。
+/// 隣のセルの水位と河床高に、除いた勾配の分 −I (x_2 − x_1)（x_2 はセル 1 の側から見た母点の位置）
+/// を戻してから、風上と高い方の河床を選ぶ。勾配を除いたまま max をとると、河床が下流へ上がる
+/// 所で下流側のセルが選ばれ（風下）、河床に 2Δx の振動が育つ（ADR-0015）。
+///
 /// 境界辺では、外側の水位 `outside_level[e]`（水位境界の水位。外に水がなければ −∞）を
 /// 隣のセルの水位とし、辺の河床高には内側のセルの値を使う。`outside_level` と `out` の長さは
 /// 辺の数でなければならない。
@@ -710,6 +723,7 @@ pub fn edge_depths(
     state: &State,
     outside_level: &[f64],
     dry_depth: f64,
+    background_slope: f64,
     out: &mut [f64],
 ) {
     debug_assert_eq!(
@@ -728,7 +742,13 @@ pub fn edge_depths(
         let (eta2, zb_edge) = if c2 == NONE {
             (outside_level[e], zb1)
         } else {
-            (state.eta[c2], zb1.max(state.zb[c2]))
+            // セル 2 の実際の高さを、セル 1 の基準に直す（周期境界でなければ 0）
+            let trend = if background_slope == 0.0 {
+                0.0
+            } else {
+                background_slope * (mesh.neighbor_position_from(e, c1)[0] - mesh.x_cell[c1])
+            };
+            (state.eta[c2] - trend, zb1.max(state.zb[c2] - trend))
         };
         let u = state.u_n[e];
         let eta_up = if u > 0.0 {
@@ -982,6 +1002,7 @@ mod tests {
     use super::*;
     use crate::config::ChannelLayout;
     use crate::mesh::channel::{self, ChannelSpec};
+    use std::f64::consts::PI;
 
     fn mesh(length: f64, width: f64, cell_size: f64, layout: ChannelLayout) -> Mesh {
         channel::build(&ChannelSpec {
@@ -1097,13 +1118,78 @@ mod tests {
 
         let mut depth_for = |u: f64| {
             state.u_n[e] = u;
-            edge_depths(&mesh, &state, &outside, 1e-3, &mut h);
+            edge_depths(&mesh, &state, &outside, 1e-3, 0.0, &mut h);
             h[e]
         };
         // 河床高は高い方（0.5）、水位は風上側
         assert!((depth_for(0.3) - 0.5).abs() < 1e-15);
         assert!((depth_for(-0.3) - 0.3).abs() < 1e-15);
         assert!((depth_for(0.0) - 0.5).abs() < 1e-15);
+    }
+
+    /// 周期境界の辺の水深は、勾配を除いた河床高と水位から、勾配のある水路の実際の値で求めた
+    /// ものと一致する（ADR-0015）。勾配を戻さずに max をとると、勾配を除いた河床が下流へ上がる
+    /// 辺で下流側のセルが選ばれ、一致しない。
+    #[test]
+    fn periodic_edge_depths_match_the_sloped_channel() {
+        let (slope, length) = (0.01, 20.0);
+        let spec = ChannelSpec {
+            length,
+            width: 4.0,
+            cell_size: 1.0,
+            layout: ChannelLayout::Rectangular,
+        };
+        let periodic = channel::build_periodic(&spec).expect("valid periodic channel");
+        let open = channel::build(&spec).expect("valid channel");
+        let detrended = |m: &Mesh| {
+            let mut state = State::new(m.n_cells(), m.n_edges());
+            for c in 0..m.n_cells() {
+                let (x, y) = (m.x_cell[c], m.y_cell[c]);
+                // 勾配を除いた河床は下流へ上がる所と下がる所がある（勾配 I より緩い）
+                state.zb[c] = 0.02 * (2.0 * PI * x / length).sin() * (PI * y / 4.0).cos();
+                state.eta[c] = 0.8 + 0.01 * (2.0 * PI * x / length).cos();
+            }
+            for e in 0..m.n_edges() {
+                state.u_n[e] = 0.5 * m.normal_edge[e][0] + 0.05 * m.normal_edge[e][1];
+            }
+            state
+        };
+        let mut actual = detrended(&open);
+        for c in 0..open.n_cells() {
+            let trend = slope * (length - open.x_cell[c]);
+            actual.zb[c] += trend;
+            actual.eta[c] += trend;
+        }
+        let depths = |m: &Mesh, state: &State, background: f64| {
+            let mut h = vec![0.0; m.n_edges()];
+            let outside = vec![f64::NEG_INFINITY; m.n_edges()];
+            edge_depths(m, state, &outside, 1e-3, background, &mut h);
+            h
+        };
+        let h_open = depths(&open, &actual, 0.0);
+        let state = detrended(&periodic);
+        let h_periodic = depths(&periodic, &state, slope);
+        let h_unadjusted = depths(&periodic, &state, 0.0);
+        let mut compared = 0;
+        let mut differs = 0;
+        for e in (0..open.n_edges()).filter(|&e| !open.is_boundary_edge(e)) {
+            let cells = open.cells_on_edge[e];
+            let p = (0..periodic.n_edges())
+                .find(|&p| periodic.cells_on_edge[p] == cells)
+                .expect("the interior edges are the same");
+            assert!(
+                (h_periodic[p] - h_open[e]).abs() < 1e-12,
+                "edge {cells:?}: {} vs {}",
+                h_periodic[p],
+                h_open[e]
+            );
+            compared += 1;
+            if (h_unadjusted[p] - h_open[e]).abs() > 1e-6 {
+                differs += 1;
+            }
+        }
+        assert!(compared > 50);
+        assert!(differs > 0, "the unadjusted maximum must differ somewhere");
     }
 
     #[test]
@@ -1117,7 +1203,7 @@ mod tests {
         // 湛水セル（η = 1）と、水面より高い乾いたセル（η = z_b = 1.2）
         state.eta = vec![1.0, 1.2];
         state.zb = vec![0.0, 1.2];
-        edge_depths(&mesh, &state, &outside, 1e-3, &mut h);
+        edge_depths(&mesh, &state, &outside, 1e-3, 0.0, &mut h);
         assert_eq!(h[e], 0.0);
 
         // 閾値より浅い
@@ -1125,9 +1211,9 @@ mod tests {
         state.eta[c2] = 0.5;
         state.zb[c1] = 0.0;
         state.zb[c2] = 0.5;
-        edge_depths(&mesh, &state, &outside, 1e-3, &mut h);
+        edge_depths(&mesh, &state, &outside, 1e-3, 0.0, &mut h);
         assert_eq!(h[e], 0.0);
-        edge_depths(&mesh, &state, &outside, 1e-4, &mut h);
+        edge_depths(&mesh, &state, &outside, 1e-4, 0.0, &mut h);
         assert!((h[e] - 5e-4).abs() < 1e-12);
     }
 
@@ -1282,7 +1368,7 @@ mod tests {
         reconstruct_cell_velocity(mesh, &state.u_n, &mut state.u_cell);
         let outside = vec![f64::NEG_INFINITY; mesh.n_edges()];
         let mut h = vec![0.0; mesh.n_edges()];
-        edge_depths(mesh, state, &outside, 1e-3, &mut h);
+        edge_depths(mesh, state, &outside, 1e-3, 0.0, &mut h);
         for (e, depth) in h.iter_mut().enumerate() {
             if mesh.is_boundary_edge(e) {
                 *depth = state.depth(mesh.cells_on_edge[e][0]);

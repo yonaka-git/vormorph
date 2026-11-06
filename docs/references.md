@@ -73,6 +73,7 @@
 
 | 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
 |---|---|---|---|---|---|
+| Colombini, M., Seminara, G., Tubino, M. | 1987 | Finite-amplitude alternate bars | J. Fluid Mech., 181, 213–232 | [10.1017/S0022112087002064](https://doi.org/10.1017/S0022112087002064) | 要手動入手（有料。交互砂州の線形・弱非線形の安定解析。`tools/bar_theory.py` の線形安定解析は、同じ考え方を vormorph の式に当てはめたもの） |
 | Federici, B., Seminara, G. | 2003 | On the convective nature of bar instability | J. Fluid Mech., 487, 125–145 | [10.1017/S0022112003004737](https://doi.org/10.1017/S0022112003004737) | 要手動入手（有料。交互砂州の不安定が移流型であることを示した論文。周期境界を加えた理由として ADR-0014 で引用） |
 
 ## 実装・マニュアル（公式配布）

@@ -247,7 +247,14 @@ impl SedimentSolver {
             held_supply,
             ..
         } = self;
-        hydro::edge_depths(mesh, state, outside_level, params.dry_depth, edge_depth);
+        hydro::edge_depths(
+            mesh,
+            state,
+            outside_level,
+            params.dry_depth,
+            params.background_slope,
+            edge_depth,
+        );
         let scale = params.bedload_scale();
         for (e, q) in bedload_flux.iter_mut().enumerate() {
             *q = edge_capacity(params, mesh, state, edge_depth, scale, e);
