@@ -52,13 +52,35 @@
 //!   境界では η_b = z_{b,i} + 水深（z_{b,i} は内側のセルの河床高）。辺の水深の風上は、流出なら
 //!   内側のセル、流入なら η_b、u_j = 0 なら高い方の水位で決め、河床高は内側のセルの値を使う。
 //!
+//! ## 移流
+//!
+//! セル i の運動量収支を流入側の辺だけから求め（流出側の辺では風上の流速が u_i になり、
+//! 寄与が消える）、辺 j の両側のセルの値を水深の和で割って法線成分をとる（ADR-0008）。
+//!
+//! ```text
+//! M_i   = Σ_{l ∈ ∂i, s_il q_l < 0} s_il L_l q_l (u_{k(i,l)} − u_i)
+//! h*_i  = h_i − (Δt / A_i) Σ_l s_il L_l q_l
+//! F u_j = u_j − Δt (M_1 / A_1 + M_2 / A_2)·n_j / (h*_1 + h*_2)
+//! ```
+//!
+//! q_l = H_l^n u_l^n、u_i は Perot 法で再構成したセル中心の流速、h*_i は時刻 n の流量で連続式を
+//! 陽的に進めたセルの水深。辺は母点を結ぶ線分の垂直二等分線なので、両側のセルの重みは
+//! 1/2 ずつになる。定常流では h* = h で、水位勾配の項と合わせて 1次元の流れで
+//! q u + g h²/2 が離散的に保存され、跳水の共役水深が Bélanger の式を満たす
+//! （Stelling & Duinmeijer, 2003）。h* で割ると、増分は流れ込む流速との差の σ_j 倍
+//! （σ_j ≤ 1 の局所クーラン数）になり、汀線の浅いセルや段波の先端でも発散しない。
+//!
+//! - 境界辺から流れ込む水の流速は、その辺の法線流速 u_j n_j とする（流量境界の流入）。
+//!   水位境界の辺はセル 1(j) の値だけで評価する（h*_2 = 0、M_2 = 0）。
+//!
 //! ## 1ステップの手順
 //!
 //! 1. 辺の役割（内部・壁・流量境界・水位境界）と辺の水深 H_j^n を決める（[`edge_depths`]）。
 //!    H_j は風上側の水位から辺の河床高 max(z_{b,1}, z_{b,2}) を引いた値（Stelling & Duinmeijer,
-//!    2003）。上流端の流量 Q を、通水能に比例して境界辺に配分する（下の「境界条件」）。
-//! 2. 移流を評価して F u_j^n を求める。**移流は次の段階で実装する**（[`advection`]）。
-//!    それまでは F u_j^n = u_j^n とする。
+//!    2003）。上流端の流量 Q を、通水能に比例して境界辺に配分する（上の「境界条件」）。
+//!    辺の単位幅流量 q_j^n = H_j^n u_j^n（流量境界では配分した流入量）を求める。
+//! 2. 移流を保存型の風上差分で陽的に評価し、F u_j^n を求める（[`advection`]、上の「移流」）。
+//!    `hydro.advection = "none"` のときは F u_j^n = u_j^n とする。
 //! 3. 摩擦係数 γ_j、G_j、重み w_j、右辺 b_i を組み立てる。
 //! 4. Newton 法＋行列フリー PCG で η^{n+1} を求める（[`WaterLevelOperator`]）。
 //! 5. u_j^{n+1} を更新し、θ 平均の単位幅流量 q_j^θ = H_j^n (θ u_j^{n+1} + (1 − θ) u_j^n) を
@@ -72,9 +94,12 @@
 //! - Casulli (2009), Casulli & Zanolli (2012): wet/dry と Newton 法
 //! - Stelling & Duinmeijer (2003), Kramer & Stelling (2008): 保存型風上差分
 //! - Kernkamp et al. (2011): 非構造格子への適用（D-Flow FM）
+//! - Deltares (2026) D-Flow FM Technical Reference Manual §6.2: Perot 型の移流の離散化
 //! - Perot (2000): セル中心流速の再構成
 
-use crate::config::{BoundaryConfig, Config, DownstreamBoundary, SolverConfig, UpstreamBoundary};
+use crate::config::{
+    AdvectionScheme, BoundaryConfig, Config, DownstreamBoundary, SolverConfig, UpstreamBoundary,
+};
 use crate::linsolve::{self, LinearOperator, PcgError, PcgSettings, PcgWorkspace};
 use crate::mesh::{EdgeKind, Mesh, NONE};
 use crate::state::State;
@@ -92,6 +117,8 @@ pub struct HydroParams {
     pub manning_n: f64,
     /// wet/dry を判定する水深の閾値 \[m\]。
     pub dry_depth: f64,
+    /// 運動量の移流の扱い。
+    pub advection: AdvectionScheme,
     /// 反復解法の設定。
     pub solver: SolverConfig,
 }
@@ -104,6 +131,7 @@ impl HydroParams {
             theta: config.hydro.theta,
             manning_n: config.hydro.manning_n,
             dry_depth: config.hydro.dry_depth,
+            advection: config.hydro.advection,
             solver: config.hydro.solver.clone(),
         }
     }
@@ -118,6 +146,10 @@ pub struct StepReport {
     pub pcg_iterations: usize,
     /// 最終的な残差（体積残差をセル面積で割った値の最大値）\[m\]。乾いたセルを含む。
     pub residual: f64,
+    /// 移流の局所クーラン数 σ_j の最大値（増分を縮める前）\[-\]。移流を省くときは 0。
+    pub max_courant: f64,
+    /// 移流の増分を σ_j > 1 のために縮めた辺の数（時間刻みが大きすぎる兆候）。
+    pub limited_edges: usize,
 }
 
 /// 流れの計算の失敗。
@@ -255,6 +287,12 @@ pub struct HydroSolver {
     outside_level: Vec<f64>,
     /// 辺の水深 H_j^n \[m\]
     edge_depth: Vec<f64>,
+    /// 辺の単位幅流量 q_j^n（流量境界では配分した流入量）\[m²/s\]
+    edge_flux: Vec<f64>,
+    /// 運動量式を解く辺（内部の辺と水位境界の辺のうち、乾いていない辺）
+    momentum_edge: Vec<bool>,
+    /// 移流の作業配列
+    advection: AdvectionWorkspace,
     /// 移流を評価した F u_j^n \[m/s\]
     advected: Vec<f64>,
     /// 摩擦係数 γ_j \[1/s\]
@@ -288,6 +326,9 @@ impl HydroSolver {
             role: vec![EdgeRole::Wall; n_edges],
             outside_level: vec![f64::NEG_INFINITY; n_edges],
             edge_depth: vec![0.0; n_edges],
+            edge_flux: vec![0.0; n_edges],
+            momentum_edge: vec![false; n_edges],
+            advection: AdvectionWorkspace::new(n_cells),
             advected: vec![0.0; n_edges],
             friction: vec![0.0; n_edges],
             explicit_part: vec![0.0; n_edges],
@@ -332,6 +373,9 @@ impl HydroSolver {
             role,
             outside_level,
             edge_depth,
+            edge_flux,
+            momentum_edge,
+            advection: advection_workspace,
             advected,
             friction,
             explicit_part,
@@ -366,17 +410,49 @@ impl HydroSolver {
             .map(|e| conveyance(mesh, state, section_level, params.dry_depth, e))
             .sum();
 
-        // 2. 移流（次の段階で実装する）
-        advected.copy_from_slice(&state.u_n);
+        for (e, (q, active)) in edge_flux
+            .iter_mut()
+            .zip(momentum_edge.iter_mut())
+            .enumerate()
+        {
+            let h = edge_depth[e];
+            (*q, *active) = match role[e] {
+                // 法線は領域の外を向くので、流入は負の流量
+                EdgeRole::Discharge => (
+                    -discharge * conveyance(mesh, state, section_level, params.dry_depth, e)
+                        / (total_conveyance * mesh.dv_edge[e]),
+                    false,
+                ),
+                EdgeRole::Wall => (0.0, false),
+                EdgeRole::Interior | EdgeRole::Level(_) => (h * state.u_n[e], h > 0.0),
+            };
+        }
+
+        // 2. 移流
+        let mut report = StepReport::default();
+        match params.advection {
+            AdvectionScheme::Upwind => {
+                let stats = advection(
+                    mesh,
+                    state,
+                    edge_flux,
+                    momentum_edge,
+                    dt,
+                    advection_workspace,
+                    advected,
+                );
+                report.max_courant = stats.max_courant;
+                report.limited_edges = stats.limited_edges;
+            }
+            AdvectionScheme::Disabled => advected.copy_from_slice(&state.u_n),
+        }
 
         // 3. 摩擦係数、G_j、重み w_j、右辺に入る流量（流量境界では配分した流入量）
         for e in 0..mesh.n_edges() {
             let h = edge_depth[e];
             let (mut gamma, mut big_g, mut w, mut flux) = (0.0, 0.0, 0.0, 0.0);
             if role[e] == EdgeRole::Discharge {
-                // 法線は領域の外を向くので、流入は負の流量
-                flux = -discharge * conveyance(mesh, state, section_level, params.dry_depth, e)
-                    / total_conveyance;
+                flux = mesh.dv_edge[e] * edge_flux[e];
             } else if h > 0.0 {
                 if let Some((eta1, eta2, delta)) = gradient_points(mesh, role[e], &state.eta, e) {
                     gamma = g * n2 * edge_speed(mesh, state, e) / h.powf(4.0 / 3.0);
@@ -403,7 +479,6 @@ impl HydroSolver {
         // 4. Newton 法
         let solver = &params.solver;
         let settings = PcgSettings::from_config(solver);
-        let mut report = StepReport::default();
         loop {
             report.residual = water_level_residual(
                 mesh,
@@ -612,18 +687,149 @@ pub fn reconstruct_cell_velocity(mesh: &Mesh, u_n: &[f64], out: &mut [[f64; 2]])
     }
 }
 
-/// 移流項を保存型風上差分で陽的に評価し、F u_j = u_j − Δt (移流加速度)_j を `out` に書く。
+/// 移流の作業配列（セルごと）。
+#[derive(Debug, Clone)]
+pub struct AdvectionWorkspace {
+    /// 運動量収支 M_i / A_i \[m²/s²\]
+    momentum: Vec<[f64; 2]>,
+    /// 流入量 S_i / A_i \[m/s\]
+    inflow: Vec<f64>,
+    /// 時刻 n の流量で連続式を陽的に進めた水深 h*_i \[m\]
+    depth: Vec<f64>,
+}
+
+impl AdvectionWorkspace {
+    /// セル数 `n_cells` の格子用に確保する。
+    pub fn new(n_cells: usize) -> Self {
+        Self {
+            momentum: vec![[0.0; 2]; n_cells],
+            inflow: vec![0.0; n_cells],
+            depth: vec![0.0; n_cells],
+        }
+    }
+}
+
+/// [`advection`] の記録。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AdvectionStats {
+    /// 局所クーラン数 σ_j の最大値（増分を縮める前）\[-\]。
+    pub max_courant: f64,
+    /// σ_j > 1 のために増分を縮めた辺の数（時間刻みが大きすぎる兆候）。
+    pub limited_edges: usize,
+}
+
+/// 移流項を保存型の1次風上差分で陽的に評価し、F u_j を `out` に書く（ADR-0008）。
 ///
-/// セル i の移流加速度を、流入側の辺だけの寄与
-/// a_i = (1 / V_i) Σ_{j: s_ij q_j < 0} s_ij L_j q_j (u_{k(i,j)} − u_i) で求め、
-/// 辺の両側のセルの値を重み付き平均して法線成分をとる（Kramer & Stelling, 2008）。
-/// 減速流では運動量保存形、加速流ではエネルギー水頭保存形に切り替える拡張を予定している。
+/// ```text
+/// M_i   = Σ_{l ∈ ∂i, s_il q_l < 0} s_il L_l q_l (u_{k(i,l)} − u_i)   （流入側の辺だけ）
+/// h*_i  = h_i − (Δt / A_i) Σ_{l ∈ ∂i} s_il L_l q_l
+/// F u_j = u_j − Δt (M_1 / A_1 + M_2 / A_2)·n_j / (h*_1 + h*_2)
+/// ```
 ///
-/// 次の段階（検証ケース V05, V07）で実装する。それまで [`HydroSolver::step`] はこの関数を
-/// 呼ばず、F u_j = u_j とする。
-pub fn advection(mesh: &Mesh, state: &State, edge_depth: &[f64], dt: f64, out: &mut [f64]) {
-    let _ = (mesh, state, edge_depth, dt, out);
-    todo!("保存型風上差分による移流")
+/// セルの運動量 V_i u_i を時刻 n の流量で陽的に進めると (V u)* = V^n u^n − Δt Σ s L q u_up、
+/// 同じ流量で体積を進めると V* = V^n − Δt Σ s L q になり、u* − u^n = −Δt M_i / V* が得られる。
+/// これを辺へ配るときに、両側のセルの h* = V* / A の和で割る。h* は定常流では h に一致する。
+///
+/// - `flux` は辺の単位幅流量 q_j^n \[m²/s\]（向きは u_n と同じ）。壁と乾いた辺では 0。
+/// - u_i は `state.u_cell`（Perot 法で再構成したセル中心の流速）。
+/// - 境界辺（隣のセルが [`NONE`]）から流れ込む水の流速は、その辺の法線流速 u_j n_j とする。
+/// - `active` が真の辺だけを計算し、それ以外の辺は F u_j = u_j とする。境界辺は
+///   セル 1(j) の値だけで評価する（h*_2 = 0、M_2 = 0）。h*_1 + h*_2 = 0 の辺も F u_j = u_j。
+/// - 局所クーラン数 σ_j = Δt (S_1 / A_1 + S_2 / A_2) / (h*_1 + h*_2)（S_i はセル i への流入量の和）
+///   は、セルからの流出が体積を超えない（時間刻みの条件。`docs/design/overview.md` の第7章）
+///   限り 1 以下になる。このとき F u_j は u_j に、流れ込む流速との差の σ_j 倍を足した値になる。
+///   条件を破って σ_j > 1 になった辺では、増分を 1/σ_j 倍にする（安全策）。
+///
+/// 計算は2つのループに分け、セルのループでは各セルが自分の値だけを、辺のループでは
+/// 各辺が自分の F u_j だけを書く。`flux`, `active`, `out` の長さは辺の数、`workspace` は
+/// セル数に合わせて確保したものでなければならない。
+pub fn advection(
+    mesh: &Mesh,
+    state: &State,
+    flux: &[f64],
+    active: &[bool],
+    dt: f64,
+    workspace: &mut AdvectionWorkspace,
+    out: &mut [f64],
+) -> AdvectionStats {
+    let n_edges = mesh.n_edges();
+    debug_assert_eq!(flux.len(), n_edges, "flux must have one value per edge");
+    debug_assert_eq!(active.len(), n_edges, "active must have one value per edge");
+    debug_assert_eq!(out.len(), n_edges, "out must have one value per edge");
+    debug_assert_eq!(
+        workspace.inflow.len(),
+        mesh.n_cells(),
+        "the workspace must have one value per cell"
+    );
+
+    // セルの運動量収支 M_i / A_i、流入量 S_i / A_i、陽的に進めた水深 h*_i
+    for (c, ((m, s), hs)) in workspace
+        .momentum
+        .iter_mut()
+        .zip(workspace.inflow.iter_mut())
+        .zip(workspace.depth.iter_mut())
+        .enumerate()
+    {
+        let [ux, uy] = state.u_cell[c];
+        let (mut mx, mut my, mut inflow, mut net) = (0.0, 0.0, 0.0, 0.0);
+        let neighbors = mesh.edges_on_cell[c]
+            .iter()
+            .zip(&mesh.edge_sign_on_cell[c])
+            .zip(&mesh.cells_on_cell[c]);
+        for ((&e, &sign), &k) in neighbors {
+            // セル c から流れ出る向きを正とする流量 [m³/s]
+            let q = sign * mesh.dv_edge[e] * flux[e];
+            net += q;
+            if q < 0.0 {
+                let [vx, vy] = if k == NONE {
+                    let [nx, ny] = mesh.normal_edge[e];
+                    [state.u_n[e] * nx, state.u_n[e] * ny]
+                } else {
+                    state.u_cell[k]
+                };
+                mx += q * (vx - ux);
+                my += q * (vy - uy);
+                inflow -= q;
+            }
+        }
+        let area = mesh.area_cell[c];
+        *m = [mx / area, my / area];
+        *s = inflow / area;
+        *hs = (state.depth(c) - dt * net / area).max(0.0);
+    }
+
+    // 辺の F u_j
+    let mut stats = AdvectionStats::default();
+    for (e, f) in out.iter_mut().enumerate() {
+        let u = state.u_n[e];
+        *f = u;
+        if !active[e] {
+            continue;
+        }
+        let (mut mx, mut my, mut inflow, mut depth) = (0.0, 0.0, 0.0, 0.0);
+        for c in mesh.cells_on_edge[e] {
+            if c != NONE {
+                let [px, py] = workspace.momentum[c];
+                mx += px;
+                my += py;
+                inflow += workspace.inflow[c];
+                depth += workspace.depth[c];
+            }
+        }
+        if depth <= 0.0 {
+            continue;
+        }
+        let [nx, ny] = mesh.normal_edge[e];
+        let courant = dt * inflow / depth;
+        let mut increment = dt * (mx * nx + my * ny) / depth;
+        stats.max_courant = stats.max_courant.max(courant);
+        if courant > 1.0 {
+            increment /= courant;
+            stats.limited_edges += 1;
+        }
+        *f = u - increment;
+    }
+    stats
 }
 
 /// Newton 法の各段の係数行列 P + T（行列フリー）。
@@ -693,6 +899,7 @@ mod tests {
             theta: 0.55,
             manning_n,
             dry_depth: 1e-3,
+            advection: AdvectionScheme::Upwind,
             solver: SolverConfig::default(),
         }
     }
@@ -877,6 +1084,195 @@ mod tests {
                 EdgeRole::Level(state.zb[c] + 0.5)
             );
         }
+    }
+
+    /// 状態の u_n から u_cell を再構成し、辺の単位幅流量 q_j = H_j u_j と、水深のある辺を
+    /// 計算の対象とする `active` を返す。境界辺の H_j は内側のセルの水深とする（流入も表す）。
+    fn advection_inputs(mesh: &Mesh, state: &mut State) -> (Vec<f64>, Vec<bool>) {
+        reconstruct_cell_velocity(mesh, &state.u_n, &mut state.u_cell);
+        let outside = vec![f64::NEG_INFINITY; mesh.n_edges()];
+        let mut h = vec![0.0; mesh.n_edges()];
+        edge_depths(mesh, state, &outside, 1e-3, &mut h);
+        for (e, depth) in h.iter_mut().enumerate() {
+            if mesh.is_boundary_edge(e) {
+                *depth = state.depth(mesh.cells_on_edge[e][0]);
+            }
+        }
+        let flux = (0..mesh.n_edges()).map(|e| h[e] * state.u_n[e]).collect();
+        let active = h.iter().map(|&d| d > 0.0).collect();
+        (flux, active)
+    }
+
+    /// 一様流では、Perot 再構成が厳密なので移流の項が 0 になる（境界の流入を含む）。
+    #[test]
+    fn advection_vanishes_in_uniform_flow() {
+        for layout in [ChannelLayout::Rectangular, ChannelLayout::Hexagonal] {
+            let mesh = mesh(20.0, 6.0, 1.0, layout);
+            let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+            state.eta.fill(1.3);
+            // 側壁に平行な一様流（上流端から流入し、下流端から流出する）
+            state.u_n = mesh.normal_edge.iter().map(|n| 0.8 * n[0]).collect();
+            let (flux, active) = advection_inputs(&mesh, &mut state);
+            let mut out = vec![0.0; mesh.n_edges()];
+            let mut work = AdvectionWorkspace::new(mesh.n_cells());
+            let stats = advection(&mesh, &state, &flux, &active, 0.5, &mut work, &mut out);
+            assert_eq!(stats.limited_edges, 0);
+            for (e, (&f, &u)) in out.iter().zip(&state.u_n).enumerate() {
+                assert!((f - u).abs() <= 1e-13, "{layout:?}: edge {e}: {f} != {u}");
+            }
+
+            // 静水では流量が 0 なので、何も変わらない
+            state.u_n.fill(0.0);
+            let (flux, active) = advection_inputs(&mesh, &mut state);
+            let stats = advection(&mesh, &state, &flux, &active, 0.5, &mut work, &mut out);
+            assert!(out.iter().all(|&u| u == 0.0));
+            assert_eq!(stats.max_courant, 0.0);
+        }
+    }
+
+    /// セルの運動量収支 M_i を辺へ配ると、辺の運動量 L_j (δ_j / 2)(h*_1 + h*_2) u_j n_j の
+    /// 変化の総和が Σ_i M_i に一致する（正方形配置では Σ_j L_j (δ_j / 2) n_j n_jᵀ = A_i I）。
+    /// 1次元の定常流で q u + g h²/2 が保存される根拠になる性質。
+    #[test]
+    fn advection_projection_conserves_the_total_cell_momentum() {
+        let mesh = mesh(8.0, 5.0, 1.0, ChannelLayout::Rectangular);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
+            state.eta[c] = 1.0 + 0.2 * (0.7 * x).sin() * (0.9 * y).cos();
+        }
+        for e in 0..mesh.n_edges() {
+            let (x, y) = (mesh.x_edge[e], mesh.y_edge[e]);
+            let [nx, ny] = mesh.normal_edge[e];
+            state.u_n[e] = (0.5 + 0.3 * (0.4 * y).sin()) * nx + 0.2 * (0.6 * x).cos() * ny;
+        }
+        let (flux, _) = advection_inputs(&mesh, &mut state);
+        let active = vec![true; mesh.n_edges()];
+        let dt = 0.01;
+        let mut out = vec![0.0; mesh.n_edges()];
+        let mut work = AdvectionWorkspace::new(mesh.n_cells());
+        let stats = advection(&mesh, &state, &flux, &active, dt, &mut work, &mut out);
+        assert_eq!(stats.limited_edges, 0);
+
+        let (mut edges, mut cells) = ([0.0; 2], [0.0; 2]);
+        for (e, &f) in out.iter().enumerate() {
+            let depth: f64 = mesh.cells_on_edge[e]
+                .iter()
+                .filter(|&&c| c != NONE)
+                .map(|&c| work.depth[c])
+                .sum();
+            let weight = mesh.dv_edge[e] * 0.5 * mesh.dc_edge[e] * depth;
+            let rate = (state.u_n[e] - f) / dt;
+            edges[0] += weight * rate * mesh.normal_edge[e][0];
+            edges[1] += weight * rate * mesh.normal_edge[e][1];
+        }
+        for c in 0..mesh.n_cells() {
+            cells[0] += mesh.area_cell[c] * work.momentum[c][0];
+            cells[1] += mesh.area_cell[c] * work.momentum[c][1];
+        }
+        assert!(cells[0].abs() > 1e-3, "the test state must carry momentum");
+        for k in 0..2 {
+            assert!(
+                (edges[k] - cells[k]).abs() <= 1e-12 * cells[0].abs().max(cells[1].abs()),
+                "component {k}: {} != {}",
+                edges[k],
+                cells[k]
+            );
+        }
+    }
+
+    /// 汀線：深いセルから、濡れたばかりの浅いセルへ流れ込む。h* で割るので、増分は
+    /// 流れ込む流速との差の σ_j（≤ 1）倍に収まり、時間刻みが大きくても発散しない。
+    /// 流出が体積を超える時間刻みでは、安全策として増分を縮める。
+    #[test]
+    fn advection_stays_bounded_at_a_wetting_front() {
+        let mesh = mesh(8.0, 1.0, 1.0, ChannelLayout::Rectangular);
+        let cell_at = |x: f64| {
+            (0..mesh.n_cells())
+                .find(|&c| (mesh.x_cell[c] - x).abs() < 0.1)
+                .expect("a cell at x")
+        };
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            let x = mesh.x_cell[c];
+            // x < 3 は深く、x = 3.5 のセルは濡れたばかり、その先は乾いている
+            state.eta[c] = if x < 3.0 {
+                1.0
+            } else if x < 4.0 {
+                0.01
+            } else {
+                0.0
+            };
+        }
+        for e in 0..mesh.n_edges() {
+            let [c1, c2] = mesh.cells_on_edge[e];
+            if c2 != NONE && mesh.x_cell[c1].max(mesh.x_cell[c2]) < 4.0 {
+                state.u_n[e] = mesh.normal_edge[e][0];
+            }
+        }
+        let (flux, active) = advection_inputs(&mesh, &mut state);
+        let front = cell_at(3.5);
+        let ahead = (0..mesh.n_edges())
+            .find(|&e| {
+                let [c1, c2] = mesh.cells_on_edge[e];
+                c1 == front && c2 == cell_at(4.5) || c2 == front && c1 == cell_at(4.5)
+            })
+            .expect("the edge ahead of the front");
+        assert!(active[ahead] && state.u_n[ahead] == 0.0);
+
+        // 隣り合うセルの流速の差の最大値
+        let spread = (0..mesh.n_edges())
+            .filter(|&e| !mesh.is_boundary_edge(e))
+            .map(|e| {
+                let [c1, c2] = mesh.cells_on_edge[e];
+                let [a, b] = [state.u_cell[c1], state.u_cell[c2]];
+                (a[0] - b[0]).hypot(a[1] - b[1])
+            })
+            .fold(0.0, f64::max);
+        let mut out = vec![0.0; mesh.n_edges()];
+        let mut work = AdvectionWorkspace::new(mesh.n_cells());
+        for (dt, limited) in [(0.5, false), (5.0, true)] {
+            let stats = advection(&mesh, &state, &flux, &active, dt, &mut work, &mut out);
+            assert_eq!(stats.limited_edges > 0, limited, "dt = {dt}: {stats:?}");
+            assert!(out[ahead] > 0.0, "the front must receive momentum");
+            for (e, (&f, &u)) in out.iter().zip(&state.u_n).enumerate() {
+                assert!(
+                    (f - u).abs() <= spread + 1e-12,
+                    "dt = {dt}: edge {e}: increment {} > {spread}",
+                    f - u
+                );
+            }
+        }
+    }
+
+    /// `advection = "none"` では移流項を省く。
+    #[test]
+    fn advection_can_be_disabled() {
+        let mesh = mesh(20.0, 4.0, 1.0, ChannelLayout::Hexagonal);
+        let mut initial = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            initial.eta[c] = 1.0 + 0.1 * (0.3 * mesh.x_cell[c]).sin();
+        }
+        let run = |scheme: AdvectionScheme| {
+            let mut state = initial.clone();
+            let mut solver = HydroSolver::new(
+                &mesh,
+                HydroParams {
+                    advection: scheme,
+                    ..params(0.0)
+                },
+            );
+            let mut report = StepReport::default();
+            for _ in 0..5 {
+                report = solver.step(&mesh, &mut state, &closed(), 0.2).unwrap();
+            }
+            (state, report)
+        };
+        let (with, report_with) = run(AdvectionScheme::Upwind);
+        let (without, report_without) = run(AdvectionScheme::Disabled);
+        assert!(report_with.max_courant > 0.0);
+        assert_eq!(report_without.max_courant, 0.0);
+        assert_ne!(with.u_n, without.u_n);
     }
 
     /// 1ステップの計算を `steps` 回繰り返し、体積の保存、Newton 法の収束、η ≥ z_b を確かめる。

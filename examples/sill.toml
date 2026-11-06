@@ -43,6 +43,7 @@ morphology_start = 300.0  # 助走計算の後に河床変動を始める [s]
 theta = 0.55
 manning_n = 0.025
 dry_depth = 1.0e-3      # [m]
+advection = "upwind"    # 運動量の移流："upwind"（保存型風上差分）または "none"
 
 [hydro.solver]
 newton_tol = 1.0e-10

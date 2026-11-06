@@ -82,7 +82,7 @@
 | 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
 |---|---|---|---|---|---|
 | Thacker, W. C. | 1981 | Some exact solutions to the nonlinear shallow-water wave equations | J. Fluid Mech., 107, 499–508 | [10.1017/S0022112081001882](https://doi.org/10.1017/S0022112081001882) | 要手動入手（有料） |
-| Delestre, O., Lucas, C., Ksinant, P.-A., Darboux, F., Laguerre, C., Vo, T.-N.-T., James, F., Cordier, S. | 2013 | SWASHES: a compilation of shallow water analytic solutions for hydraulic and environmental studies | Int. J. Numer. Meth. Fluids, 72(3), 269–300 | [10.1002/fld.3741](https://doi.org/10.1002/fld.3741) | 取得済み（`delestre2013_swashes-arxiv.pdf`。arXiv:1110.0288v7 の著者版。V04 の条件（第4.2.2節の planar surface in a paraboloid）に使う。出版社版は有料） |
+| Delestre, O., Lucas, C., Ksinant, P.-A., Darboux, F., Laguerre, C., Vo, T.-N.-T., James, F., Cordier, S. | 2013 | SWASHES: a compilation of shallow water analytic solutions for hydraulic and environmental studies | Int. J. Numer. Meth. Fluids, 72(3), 269–300 | [10.1002/fld.3741](https://doi.org/10.1002/fld.3741) | 取得済み（`delestre2013_swashes-arxiv.pdf`。arXiv:1110.0288v7 の著者版。V04 の条件（第4.2.2節の planar surface in a paraboloid）、V05 の条件（第4.1.1節・第4.1.2節の dam break on a wet / dry domain）、V07 の条件（第3.1.5節の transcritical flow with shock）に使う。出版社版は有料） |
 | Ritter, A. | 1892 | Die Fortpflanzung der Wasserwellen | Zeitschrift des Vereines Deutscher Ingenieure, 36 | DOI なし | 書誌のみ（頁は文献により 947–954 または 934–954 と記載が分かれ、原本は未確認） |
 | Stoker, J. J. | 1957 | Water Waves: The Mathematical Theory with Applications | Interscience（Wiley Classics Library 版 1992） | [10.1002/9781118033159](https://doi.org/10.1002/9781118033159) | 要手動入手（書籍） |
 
