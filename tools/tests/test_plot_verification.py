@@ -18,12 +18,16 @@ from plot_verification import (
     V05_X0,
     V07_G,
     V07_Q,
+    bar_beta,
+    bar_growth_curve,
+    bar_refinement_pairs,
     bump_depth,
     bump_jump_solution,
     bump_linear_celerity,
     crest_position,
     dam_break_depth,
     normal_depth,
+    read_bar_summary,
     read_collection,
     read_history,
     stoker_cm,
@@ -137,3 +141,31 @@ def test_crest_position_is_exact_for_a_parabola(peak: float) -> None:
     x = np.arange(0.0, 20.0, 0.5)
     b = 1.0 - (x - peak) ** 2
     assert crest_position(x, b) == pytest.approx(peak, abs=1e-12)
+
+
+def test_read_bar_summary_and_refinement_pairs(tmp_path: Path) -> None:
+    summary = tmp_path / "v09_summary.csv"
+    summary.write_text(
+        "case,layout,rows,width,wavelength,cells,growth,celerity,theory_growth,theory_celerity\n"
+        "a,Rectangular,10,40,211.4,530,1.0e-3,0.3,2.0e-3,0.34\n"
+        "b,Rectangular,20,40,211.4,2120,1.5e-3,0.33,2.0e-3,0.34\n"
+        "c,Hexagonal,10,10,142.5,1230,-1.0e-2,0.28,-5.0e-3,0.31\n"
+        "d,Rectangular,5,10,142.5,355,-6.0e-3,0.31,-5.0e-3,0.31\n"
+        "e,Rectangular,10,10,142.5,1430,-5.5e-3,0.31,-5.0e-3,0.31\n",
+        encoding="utf-8",
+    )
+    rows = read_bar_summary(summary)
+    assert rows[0]["case"] == "a" and rows[0]["layout"] == "Rectangular"
+    assert rows[1]["growth"] == pytest.approx(1.5e-3)
+    pairs = bar_refinement_pairs(rows)
+    # 六角形の幅 10 m は1つしかないので組にならない
+    assert [(layout, coarse["case"], fine["case"]) for layout, coarse, fine in pairs] == [
+        ("Rectangular", "a", "b"),
+        ("Rectangular", "d", "e"),
+    ]
+
+
+def test_bar_growth_curve_matches_the_v09_reference_value() -> None:
+    # tests/verification.rs の v09_alternate_bars（MORFAC 100）の理論値
+    assert bar_growth_curve(40.0, np.array([211.4]))[0] == pytest.approx(2.5895e-3, rel=2e-4)
+    assert bar_beta(40.0) == pytest.approx(18.705, abs=1e-3)

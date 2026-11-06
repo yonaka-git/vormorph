@@ -14,12 +14,15 @@
     V04 は、検証テストが書く `<dir>/<ケース名>/centroid.csv`（水塊の重心の時系列）も読む。
     V05 は、`<dir>/v05_convergence.csv`（格子幅ごとの L1 誤差）も読む。
     V11 は、`<dir>/v11_<格子幅>m_<こぶの高さ>m/` の4ケース（tests/verification.rs の v11_bump_migration）。
+    V09 は、`<dir>/v09_summary.csv`（全ケースの成長率と移動速度）、各ケースの `amplitude.csv`
+    （振幅の時系列）と最後の状態の VTK を読み、理論の曲線は tools/bar_theory.py で計算する。
     ケースの条件（寸法・流量など）は tests/verification.rs の定数と一致させる。
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from pathlib import Path
@@ -612,13 +615,215 @@ def plot_v11(root: Path, output: Path) -> None:
     fig.savefig(output, dpi=150)
 
 
+# V09 交互砂州（tests/verification.rs の v09_alternate_bars と同じ条件）
+V09_MORFAC = 100.0
+"""MORFAC [-]。"""
+V09_SPIN_UP = 300.0
+"""固定床の助走の時間 [s]。"""
+V09_EPSILON = 1.0e-3
+"""初期の起伏の振幅 [m]。"""
+V09_PLAN = "v09_rectangular_20rows_b40_l211.4"
+"""平面図に描くケース。"""
+V09_MAIN = (
+    ("v09_rectangular_10rows_b40_l211.4", "square, 10 rows", 0, "--"),
+    ("v09_rectangular_20rows_b40_l211.4", "square, 20 rows", 0, "-"),
+    ("v09_hexagonal_10rows_b40_l211.4", "hexagonal, 10 rows", 1, "--"),
+    ("v09_hexagonal_20rows_b40_l211.4", "hexagonal, 20 rows", 1, "-"),
+)
+"""振幅の時系列を描くケース（ケース名、凡例、系列の色の番号、線の種類）。"""
+
+
+def read_bar_summary(path: Path) -> list[dict[str, str | float]]:
+    """`v09_summary.csv` を読み、行ごとの辞書にする（数値の列は float）。"""
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    header = lines[0].split(",")
+    rows = []
+    for line in lines[1:]:
+        values = line.split(",")
+        row: dict[str, str | float] = {}
+        for key, value in zip(header, values, strict=True):
+            row[key] = value if key in ("case", "layout") else float(value)
+        rows.append(row)
+    return rows
+
+
+def bar_refinement_pairs(rows: list[dict[str, str | float]]) -> list[tuple[str, dict, dict]]:
+    """V09 の結果を、配置・幅・波長が同じ組に分け、行数の少ない方と多い方の組（配置, 粗, 細）を返す。
+
+    行数がちょうど2倍の組だけを返す（1つしかない組は除く）。
+    """
+    groups: dict[tuple, list[dict[str, str | float]]] = {}
+    for row in rows:
+        key = (row["layout"], row["width"], row["wavelength"])
+        groups.setdefault(key, []).append(row)
+    pairs = []
+    for (layout, _, _), members in groups.items():
+        members = sorted(members, key=lambda r: float(r["rows"]))
+        for coarse, fine in itertools.pairwise(members):
+            if float(fine["rows"]) == 2.0 * float(coarse["rows"]):
+                pairs.append((str(layout), coarse, fine))
+    return pairs
+
+
+def bar_beta(width: float) -> float:
+    """水路幅と水深の比 β = B / (2H)（examples/sill.toml の等流）。"""
+    import bar_theory
+
+    return width / (2.0 * bar_theory.base_state(bar_theory.Closure()).depth)
+
+
+def bar_growth_curve(width: float, wavelengths: np.ndarray, morfac: float = V09_MORFAC) -> np.ndarray:
+    """線形理論の成長率 [1/s]（流れの時間あたり。examples/sill.toml の条件、MORFAC `morfac`）。"""
+    from dataclasses import replace
+
+    import bar_theory
+
+    closure = replace(bar_theory.Closure(), morfac=morfac)
+    return np.array([bar_theory.growth_and_celerity(closure, wl, width)[0] for wl in wavelengths])
+
+
+def plot_v09(root: Path, output: Path) -> None:
+    """V09 の図：交互砂州の河床の平面図、振幅の時系列、成長率と波長の関係（線形理論との比較）。"""
+    from matplotlib.collections import PolyCollection
+
+    from plot_sill import bed_change_colormap, cell_polygons, symmetric_limit
+
+    summary = {str(row["case"]): row for row in read_bar_summary(root / "v09_summary.csv")}
+    fig = plt.figure(figsize=(11, 9.4), constrained_layout=True)
+    grid = fig.add_gridspec(2, 2, height_ratios=(0.8, 1.0))
+    plan = fig.add_subplot(grid[0, :])
+    history = fig.add_subplot(grid[1, 0])
+    dispersion = fig.add_subplot(grid[1, 1])
+
+    # (a) 平面図：勾配を除いた河床高（交互砂州の起伏）
+    time, mesh = last_step(root / V09_PLAN)
+    zb = cell_field(mesh, "zb")
+    zb = zb - float(np.mean(zb))
+    width = float(summary[V09_PLAN]["width"])
+    length = float(summary[V09_PLAN]["wavelength"])
+    limit = symmetric_limit(zb)
+    cells = PolyCollection(
+        cell_polygons(mesh), array=zb, cmap=bed_change_colormap(), edgecolors="face", linewidths=0.2
+    )
+    cells.set_clim(-limit, limit)
+    plan.add_collection(cells)
+    plan.set_xlim(0.0, length)
+    plan.set_ylim(0.0, width)
+    plan.set_aspect("equal")
+    plan.set_xlabel("x [m]  (periodic: x = 0 and x = L are connected)")
+    plan.set_ylabel("y [m]")
+    colorbar = fig.colorbar(cells, ax=plan, shrink=0.9, pad=0.01)
+    colorbar.set_label("bed level above the mean slope [m]")
+    plan.set_title(
+        f"(a) alternate bar mode after {time - V09_SPIN_UP:.0f} s of morphology "
+        f"(square layout, 20 rows, B = {width:g} m, L = {length:g} m, MORFAC {V09_MORFAC:g}; flow →)",
+        loc="left",
+        fontsize="medium",
+    )
+
+    # (b) 振幅の時系列
+    theory = float(summary[V09_PLAN]["theory_growth"])
+    span = 0.0
+    for case, label, color, style in V09_MAIN:
+        data = read_history(root / case / "amplitude.csv")
+        t = data["time"] - V09_SPIN_UP
+        span = max(span, float(t.max()))
+        growth = float(summary[case]["growth"])
+        history.plot(
+            t,
+            data["amplitude"] / V09_EPSILON,
+            color=SERIES[color],
+            ls=style,
+            lw=1.4,
+            label=f"{label} ({100 * (growth / theory - 1):+.0f}%)",
+        )
+    line = np.array([0.0, span])
+    history.plot(line, np.exp(theory * line), color=REFERENCE, lw=2.5, zorder=0, label="linear theory")
+    history.set_yscale("log")
+    history.set_xlabel("time since the start of morphology [s]")
+    history.set_ylabel("amplitude / initial amplitude")
+    history.set_title(
+        f"(b) growth of the mode (B = {width:g} m, L = {length:g} m)", loc="left", fontsize="medium"
+    )
+    history.legend(loc="upper left", fontsize="small", title="growth rate error", title_fontsize="small")
+    history.grid(alpha=0.3, which="both")
+
+    # (c) 成長率と波長の関係：格子2段の組（粗い方は白抜き、細かい方は塗りつぶし）と、
+    # 1次精度を仮定した Richardson 外挿 2σ_fine − σ_coarse
+    wavelengths = np.geomspace(40.0, 800.0, 120)
+    for width_case, style in ((40.0, "-"), (10.0, "--")):
+        b = bar_beta(width_case)
+        dispersion.plot(
+            wavelengths,
+            bar_growth_curve(width_case, wavelengths) * 1e3,
+            color=REFERENCE,
+            lw=2.0,
+            ls=style,
+            zorder=0,
+            label=f"linear theory, B = {width_case:g} m (β = {b:.1f})",
+        )
+    markers = {"Rectangular": ("s", SERIES[0], "square"), "Hexagonal": ("o", SERIES[1], "hexagonal")}
+    shown = set()
+    for layout, coarse, fine in bar_refinement_pairs(list(summary.values())):
+        marker, color, name = markers[layout]
+        wavelength = float(fine["wavelength"])
+        for row, filled in ((coarse, False), (fine, True)):
+            key = (name, filled)
+            grid_label = "finer (2N rows)" if filled else "coarser (N rows)"
+            dispersion.plot(
+                wavelength,
+                float(row["growth"]) * 1e3,
+                marker=marker,
+                ms=8,
+                mfc=color if filled else "white",
+                mec=color,
+                mew=1.5,
+                ls="none",
+                label=None if key in shown else f"{name}, {grid_label}",
+            )
+            shown.add(key)
+        extrapolated = 2.0 * float(fine["growth"]) - float(coarse["growth"])
+        dispersion.plot(
+            wavelength,
+            extrapolated * 1e3,
+            marker="*",
+            ms=12,
+            color="0.1",
+            ls="none",
+            label=None if "extrapolated" in shown else "extrapolated, 2σ(2N) − σ(N)",
+        )
+        shown.add("extrapolated")
+    dispersion.axhline(0.0, color=BED, lw=0.8)
+    dispersion.set_xscale("log")
+    ticks = [50, 100, 200, 400, 800]
+    dispersion.set_xticks(ticks, [str(t) for t in ticks])
+    dispersion.set_xticks([], minor=True)
+    dispersion.set_xlabel("wavelength L [m]")
+    dispersion.set_ylabel("growth rate [10⁻³ 1/s]")
+    dispersion.set_title(
+        f"(c) growth rate vs wavelength (MORFAC {V09_MORFAC:g})",
+        loc="left",
+        fontsize="medium",
+    )
+    dispersion.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2, fontsize="small")
+    dispersion.grid(alpha=0.3, which="both")
+    fig.savefig(output, dpi=150)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("case", choices=["v04", "v05", "v06", "v07", "v11"], help="verification case")
+    parser.add_argument("case", choices=["v04", "v05", "v06", "v07", "v09", "v11"], help="verification case")
     parser.add_argument("root", type=Path, help="VORMORPH_VERIFICATION_OUTPUT of the test run")
     parser.add_argument("-o", "--output", type=Path, required=True, help="output image")
     args = parser.parse_args(argv)
-    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06, "v07": plot_v07, "v11": plot_v11}
+    plots = {
+        "v04": plot_v04,
+        "v05": plot_v05,
+        "v06": plot_v06,
+        "v07": plot_v07,
+        "v09": plot_v09,
+        "v11": plot_v11,
+    }
     plots[args.case](args.root, args.output)
     print(f"wrote {args.output}")
     return 0
