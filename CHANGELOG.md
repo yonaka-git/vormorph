@@ -78,4 +78,5 @@
 - 設定 `[boundary.upstream] kind = "periodic"`（`discharge` は初期の等流の流量）と `[boundary.downstream] kind = "periodic"`。河床高と水位は `[bed] slope` の勾配を除いた値で持ち、勾配は運動量式の体積力 g I n_x にする（`HydroParams::background_slope`）。掃流砂の勾配の項と安息角補正の高低差にも、除いた勾配を戻す（`SedimentParams::background_slope`）。`Model::new` は周期的な格子と等流の初期状態を作り、`Model::with_state` は周期境界と周期的な格子の対応を確かめる。`vormorph run` は、給砂も流出もないとき、土砂の収支の誤差を体積 [m³] で表示する
 - 周期的な水路を検証ケースに追加：V01・V02（幾何と Perot 法の厳密さ）、V06（静止状態から体積力で加速した流れが等流の流速に $2\times10^{-11}$ で収束）、V12（六角形配置でも平衡河床の変化が $10^{-14}$ m 以下）。周期 L と 2L の水路の解が丸め誤差の範囲で一致することを確かめるテスト `tests/periodic_channel.rs`。`docs/design/overview.md` の第3章・第4.1節・第4.5節・第4.6節・第4.8節・第6章を更新
 - 周期境界の辺の水深を、除いた勾配を戻した実際の高さで選ぶように修正（ADR-0015。ADR-0014 を一部置き換え）。勾配を除いたまま `max(z_{b,1}, z_{b,2})` をとると、河床が下流へ上がる所で下流側のセルが選ばれ（風下）、交互砂州の河床に 2Δx の振動が育っていた。`hydro::edge_depths` に勾配の引数を追加し、流れと掃流砂の両方に効く。勾配のある開境界の水路と辺の水深が一致することを確かめる単体テスト
+- 交互砂州の線形安定解析 `tools/bar_theory.py`（vormorph と同じ式。流れの非定常項と MORFAC を含む 4×4 の系の河床のモード、最も速く育つ波長、発生の境の幅）。係数行列を非線形の式の数値的な線形化と照合する pytest（`tools/tests/test_bar_theory.py`）
 - ライセンス：MIT OR Apache-2.0
