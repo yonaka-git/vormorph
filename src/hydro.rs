@@ -54,24 +54,27 @@
 //!
 //! ## 移流
 //!
-//! セル i の運動量収支を流入側の辺だけから求め（流出側の辺では風上の流速が u_i になり、
-//! 寄与が消える）、辺 j の両側のセルの値を水深の和で割って法線成分をとる（ADR-0008）。
+//! 各辺の流速を、両側のセルに流れ込む水の流速（法線成分）へ、局所クーラン数 σ_j の割合で
+//! 近づける（ADR-0008, ADR-0009）。
 //!
 //! ```text
-//! M_i   = Σ_{l ∈ ∂i, s_il q_l < 0} s_il L_l q_l (u_{k(i,l)} − u_i)
+//! S_i   = Σ_{l ∈ ∂i, s_il q_l < 0} |L_l q_l|,  P_i = (1 / A_i) Σ_{同じ辺} |L_l q_l| u_{k(i,l)}
 //! h*_i  = h_i − (Δt / A_i) Σ_l s_il L_l q_l
-//! F u_j = u_j − Δt (M_1 / A_1 + M_2 / A_2)·n_j / (h*_1 + h*_2)
+//! σ_j   = Δt (S_1 / A_1 + S_2 / A_2) / (h*_1 + h*_2),  ū_j = (P_1 + P_2)·n_j / (S_1 / A_1 + S_2 / A_2)
+//! F u_j = u_j + min(σ_j, 1) (ū_j − u_j)
 //! ```
 //!
-//! q_l = H_l^n u_l^n、u_i は Perot 法で再構成したセル中心の流速、h*_i は時刻 n の流量で連続式を
-//! 陽的に進めたセルの水深。辺は母点を結ぶ線分の垂直二等分線なので、両側のセルの重みは
-//! 1/2 ずつになる。定常流では h* = h で、水位勾配の項と合わせて 1次元の流れで
-//! q u + g h²/2 が離散的に保存され、跳水の共役水深が Bélanger の式を満たす
-//! （Stelling & Duinmeijer, 2003）。h* で割ると、増分は流れ込む流速との差の σ_j 倍
-//! （σ_j ≤ 1 の局所クーラン数）になり、汀線の浅いセルや段波の先端でも発散しない。
+//! q_l = H_l^n u_l^n、u_k は Perot 法で再構成したセル中心の流速、h*_i は時刻 n の流量で連続式を
+//! 陽的に進めたセルの水深。保存形の移流 Σ s L q u_up − u_j Σ s L q を流入側の辺で評価したもので、
+//! 辺は母点を結ぶ線分の垂直二等分線なので、両側のセルの重みは 1/2 ずつになる。
 //!
+//! - 1次元の定常流では、水位勾配の項と合わせて q u + g h²/2 が離散的に保存され、跳水の
+//!   共役水深が Bélanger の式を満たす（Stelling & Duinmeijer, 2003）。
+//! - 辺の流速そのものを上流の流速へ近づけるので、六角形配置で生じる、セル中心の流速に
+//!   現れない格子規模の辺の流速の成分も下流へ運び去られる。
+//! - σ_j ≤ 1 なら F u_j は u_j と ū_j の凸結合で、汀線の浅いセルや段波の先端でも発散しない。
 //! - 境界辺から流れ込む水の流速は、その辺の法線流速 u_j n_j とする（流量境界の流入）。
-//!   水位境界の辺はセル 1(j) の値だけで評価する（h*_2 = 0、M_2 = 0）。
+//!   水位境界の辺はセル 1(j) の値だけで評価する。
 //!
 //! ## 1ステップの手順
 //!
@@ -146,9 +149,9 @@ pub struct StepReport {
     pub pcg_iterations: usize,
     /// 最終的な残差（体積残差をセル面積で割った値の最大値）\[m\]。乾いたセルを含む。
     pub residual: f64,
-    /// 移流の局所クーラン数 σ_j の最大値（増分を縮める前）\[-\]。移流を省くときは 0。
+    /// 移流の局所クーラン数 σ_j の最大値（重みを 1 で頭打ちにする前）\[-\]。移流を省くときは 0。
     pub max_courant: f64,
-    /// 移流の増分を σ_j > 1 のために縮めた辺の数（時間刻みが大きすぎる兆候）。
+    /// 移流の重みを σ_j > 1 のために 1 で頭打ちにした辺の数（時間刻みが大きすぎる兆候）。
     pub limited_edges: usize,
 }
 
@@ -690,8 +693,8 @@ pub fn reconstruct_cell_velocity(mesh: &Mesh, u_n: &[f64], out: &mut [[f64; 2]])
 /// 移流の作業配列（セルごと）。
 #[derive(Debug, Clone)]
 pub struct AdvectionWorkspace {
-    /// 運動量収支 M_i / A_i \[m²/s²\]
-    momentum: Vec<[f64; 2]>,
+    /// 流れ込む運動量 P_i = (1 / A_i) Σ_{流入側の辺} |L_l q_l| u_{k(i,l)} \[m²/s²\]
+    upwind: Vec<[f64; 2]>,
     /// 流入量 S_i / A_i \[m/s\]
     inflow: Vec<f64>,
     /// 時刻 n の流量で連続式を陽的に進めた水深 h*_i \[m\]
@@ -702,7 +705,7 @@ impl AdvectionWorkspace {
     /// セル数 `n_cells` の格子用に確保する。
     pub fn new(n_cells: usize) -> Self {
         Self {
-            momentum: vec![[0.0; 2]; n_cells],
+            upwind: vec![[0.0; 2]; n_cells],
             inflow: vec![0.0; n_cells],
             depth: vec![0.0; n_cells],
         }
@@ -712,33 +715,43 @@ impl AdvectionWorkspace {
 /// [`advection`] の記録。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AdvectionStats {
-    /// 局所クーラン数 σ_j の最大値（増分を縮める前）\[-\]。
+    /// 局所クーラン数 σ_j の最大値（重みを 1 で頭打ちにする前）\[-\]。
     pub max_courant: f64,
-    /// σ_j > 1 のために増分を縮めた辺の数（時間刻みが大きすぎる兆候）。
+    /// σ_j > 1 のために重みを 1 で頭打ちにした辺の数（時間刻みが大きすぎる兆候）。
     pub limited_edges: usize,
 }
 
-/// 移流項を保存型の1次風上差分で陽的に評価し、F u_j を `out` に書く（ADR-0008）。
+/// 移流項を保存型の1次風上差分で陽的に評価し、F u_j を `out` に書く（ADR-0008, ADR-0009）。
+///
+/// 各辺の流速を、両側のセルに流れ込む水の流速（法線成分）へ、局所クーラン数 σ_j の割合で
+/// 近づける。
 ///
 /// ```text
-/// M_i   = Σ_{l ∈ ∂i, s_il q_l < 0} s_il L_l q_l (u_{k(i,l)} − u_i)   （流入側の辺だけ）
+/// S_i   = Σ_{l ∈ ∂i, s_il q_l < 0} |L_l q_l|                     （セル i への流入量）
+/// P_i   = (1 / A_i) Σ_{l ∈ ∂i, s_il q_l < 0} |L_l q_l| u_{k(i,l)}
 /// h*_i  = h_i − (Δt / A_i) Σ_{l ∈ ∂i} s_il L_l q_l
-/// F u_j = u_j − Δt (M_1 / A_1 + M_2 / A_2)·n_j / (h*_1 + h*_2)
+/// σ_j   = Δt (S_1 / A_1 + S_2 / A_2) / (h*_1 + h*_2)
+/// ū_j   = (P_1 + P_2)·n_j / (S_1 / A_1 + S_2 / A_2)
+/// F u_j = u_j + min(σ_j, 1) (ū_j − u_j)
 /// ```
 ///
-/// セルの運動量 V_i u_i を時刻 n の流量で陽的に進めると (V u)* = V^n u^n − Δt Σ s L q u_up、
-/// 同じ流量で体積を進めると V* = V^n − Δt Σ s L q になり、u* − u^n = −Δt M_i / V* が得られる。
-/// これを辺へ配るときに、両側のセルの h* = V* / A の和で割る。h* は定常流では h に一致する。
+/// σ_j ≤ 1 のとき、これは u_j − Δt [Σ_i (S_i / A_i) u_j − (P_1 + P_2)·n_j] / (h*_1 + h*_2) と同じで、
+/// 運動量の流束 Σ s L q u_up から連続式の項 u_j Σ s L q を引いた保存形の移流を、流入側の辺で
+/// 評価したものにあたる。h* は、セルの運動量と体積を時刻 n の同じ流量で陽的に進めたときの
+/// 体積から求めた水深で、定常流では h に一致する。
 ///
+/// - 辺の流速そのものを上流の流速へ近づけるので、セル中心の流速に現れない格子規模の辺の
+///   流速の成分（六角形配置で生じる）も下流へ運び去られる。
+/// - 一様流では ū_j = u_j なので、F u_j = u_j（Perot 再構成が一様流で厳密なため）。
+/// - 1次元の定常流では、水位勾配の項と合わせて q u + g h²/2 が離散的に保存され、跳水の
+///   共役水深が Bélanger の式を満たす（`docs/design/adr/0009-advection-face-velocity.md`）。
+/// - セルからの流出が体積を超えない（時間刻みの条件。`docs/design/overview.md` の第7章）限り
+///   σ_j ≤ 1 で、F u_j は u_j と ū_j の凸結合になる。σ_j > 1 の辺では重みを 1 にする（安全策）。
 /// - `flux` は辺の単位幅流量 q_j^n \[m²/s\]（向きは u_n と同じ）。壁と乾いた辺では 0。
-/// - u_i は `state.u_cell`（Perot 法で再構成したセル中心の流速）。
-/// - 境界辺（隣のセルが [`NONE`]）から流れ込む水の流速は、その辺の法線流速 u_j n_j とする。
-/// - `active` が真の辺だけを計算し、それ以外の辺は F u_j = u_j とする。境界辺は
-///   セル 1(j) の値だけで評価する（h*_2 = 0、M_2 = 0）。h*_1 + h*_2 = 0 の辺も F u_j = u_j。
-/// - 局所クーラン数 σ_j = Δt (S_1 / A_1 + S_2 / A_2) / (h*_1 + h*_2)（S_i はセル i への流入量の和）
-///   は、セルからの流出が体積を超えない（時間刻みの条件。`docs/design/overview.md` の第7章）
-///   限り 1 以下になる。このとき F u_j は u_j に、流れ込む流速との差の σ_j 倍を足した値になる。
-///   条件を破って σ_j > 1 になった辺では、増分を 1/σ_j 倍にする（安全策）。
+/// - u_k は `state.u_cell`（Perot 法で再構成したセル中心の流速）。境界辺（隣のセルが [`NONE`]）
+///   から流れ込む水の流速は、その辺の法線流速 u_l n_l とする。
+/// - `active` が真の辺だけを計算し、それ以外の辺は F u_j = u_j とする。境界辺はセル 1(j) の
+///   値だけで評価する。h*_1 + h*_2 = 0 の辺と、どちらのセルにも流入がない辺も F u_j = u_j。
 ///
 /// 計算は2つのループに分け、セルのループでは各セルが自分の値だけを、辺のループでは
 /// 各辺が自分の F u_j だけを書く。`flux`, `active`, `out` の長さは辺の数、`workspace` は
@@ -762,16 +775,15 @@ pub fn advection(
         "the workspace must have one value per cell"
     );
 
-    // セルの運動量収支 M_i / A_i、流入量 S_i / A_i、陽的に進めた水深 h*_i
-    for (c, ((m, s), hs)) in workspace
-        .momentum
+    // セルに流れ込む運動量 P_i、流入量 S_i / A_i、陽的に進めた水深 h*_i
+    for (c, ((p, s), hs)) in workspace
+        .upwind
         .iter_mut()
         .zip(workspace.inflow.iter_mut())
         .zip(workspace.depth.iter_mut())
         .enumerate()
     {
-        let [ux, uy] = state.u_cell[c];
-        let (mut mx, mut my, mut inflow, mut net) = (0.0, 0.0, 0.0, 0.0);
+        let (mut px, mut py, mut inflow, mut net) = (0.0, 0.0, 0.0, 0.0);
         let neighbors = mesh.edges_on_cell[c]
             .iter()
             .zip(&mesh.edge_sign_on_cell[c])
@@ -787,13 +799,13 @@ pub fn advection(
                 } else {
                     state.u_cell[k]
                 };
-                mx += q * (vx - ux);
-                my += q * (vy - uy);
+                px -= q * vx;
+                py -= q * vy;
                 inflow -= q;
             }
         }
         let area = mesh.area_cell[c];
-        *m = [mx / area, my / area];
+        *p = [px / area, py / area];
         *s = inflow / area;
         *hs = (state.depth(c) - dt * net / area).max(0.0);
     }
@@ -806,28 +818,27 @@ pub fn advection(
         if !active[e] {
             continue;
         }
-        let (mut mx, mut my, mut inflow, mut depth) = (0.0, 0.0, 0.0, 0.0);
+        let (mut px, mut py, mut inflow, mut depth) = (0.0, 0.0, 0.0, 0.0);
         for c in mesh.cells_on_edge[e] {
             if c != NONE {
-                let [px, py] = workspace.momentum[c];
-                mx += px;
-                my += py;
+                let [x, y] = workspace.upwind[c];
+                px += x;
+                py += y;
                 inflow += workspace.inflow[c];
                 depth += workspace.depth[c];
             }
         }
-        if depth <= 0.0 {
+        if depth <= 0.0 || inflow <= 0.0 {
             continue;
         }
         let [nx, ny] = mesh.normal_edge[e];
         let courant = dt * inflow / depth;
-        let mut increment = dt * (mx * nx + my * ny) / depth;
+        let target = (px * nx + py * ny) / inflow;
         stats.max_courant = stats.max_courant.max(courant);
         if courant > 1.0 {
-            increment /= courant;
             stats.limited_edges += 1;
         }
-        *f = u - increment;
+        *f = u + courant.min(1.0) * (target - u);
     }
     stats
 }
@@ -1130,60 +1141,119 @@ mod tests {
         }
     }
 
-    /// セルの運動量収支 M_i を辺へ配ると、辺の運動量 L_j (δ_j / 2)(h*_1 + h*_2) u_j n_j の
-    /// 変化の総和が Σ_i M_i に一致する（正方形配置では Σ_j L_j (δ_j / 2) n_j n_jᵀ = A_i I）。
-    /// 1次元の定常流で q u + g h²/2 が保存される根拠になる性質。
+    /// 1次元の定常な跳水：両側の一様な区間の間に任意の遷移区間をはさんでも、移流と水位勾配の
+    /// 項を辺の運動量 (h_1 + h_2)/2 Δx で重み付けして足すと [q u + g h²/2] の差になる。両側の
+    /// 水深が Bélanger の式を満たせば和は 0 になり、離散式の上で跳水が釣り合う。
     #[test]
-    fn advection_projection_conserves_the_total_cell_momentum() {
-        let mesh = mesh(8.0, 5.0, 1.0, ChannelLayout::Rectangular);
-        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
-        for c in 0..mesh.n_cells() {
-            let (x, y) = (mesh.x_cell[c], mesh.y_cell[c]);
-            state.eta[c] = 1.0 + 0.2 * (0.7 * x).sin() * (0.9 * y).cos();
-        }
-        for e in 0..mesh.n_edges() {
-            let (x, y) = (mesh.x_edge[e], mesh.y_edge[e]);
-            let [nx, ny] = mesh.normal_edge[e];
-            state.u_n[e] = (0.5 + 0.3 * (0.4 * y).sin()) * nx + 0.2 * (0.6 * x).cos() * ny;
-        }
-        let (flux, _) = advection_inputs(&mesh, &mut state);
-        let active = vec![true; mesh.n_edges()];
-        let dt = 0.01;
-        let mut out = vec![0.0; mesh.n_edges()];
-        let mut work = AdvectionWorkspace::new(mesh.n_cells());
-        let stats = advection(&mesh, &state, &flux, &active, dt, &mut work, &mut out);
-        assert_eq!(stats.limited_edges, 0);
-
-        let (mut edges, mut cells) = ([0.0; 2], [0.0; 2]);
-        for (e, &f) in out.iter().enumerate() {
-            let depth: f64 = mesh.cells_on_edge[e]
-                .iter()
-                .filter(|&&c| c != NONE)
-                .map(|&c| work.depth[c])
-                .sum();
-            let weight = mesh.dv_edge[e] * 0.5 * mesh.dc_edge[e] * depth;
-            let rate = (state.u_n[e] - f) / dt;
-            edges[0] += weight * rate * mesh.normal_edge[e][0];
-            edges[1] += weight * rate * mesh.normal_edge[e][1];
-        }
-        for c in 0..mesh.n_cells() {
-            cells[0] += mesh.area_cell[c] * work.momentum[c][0];
-            cells[1] += mesh.area_cell[c] * work.momentum[c][1];
-        }
-        assert!(cells[0].abs() > 1e-3, "the test state must carry momentum");
-        for k in 0..2 {
-            assert!(
-                (edges[k] - cells[k]).abs() <= 1e-12 * cells[0].abs().max(cells[1].abs()),
-                "component {k}: {} != {}",
-                edges[k],
-                cells[k]
-            );
-        }
+    fn steady_jump_balances_momentum_for_conjugate_depths() {
+        const G: f64 = 9.81;
+        let (q, h1) = (1.0, 0.2);
+        let froude = q / (h1 * (G * h1).sqrt());
+        let h2 = h1 * ((1.0 + 8.0 * froude * froude).sqrt() - 1.0) / 2.0;
+        let mesh = mesh(20.0, 1.0, 1.0, ChannelLayout::Rectangular);
+        assert_eq!(mesh.n_cells(), 20);
+        // セル番号は x の順。遷移区間（x = 8〜12）の水深は単調でなくてよい
+        let transition = [0.45, 0.31, 0.9, 0.6];
+        let balance = |h2: f64| {
+            let depth: Vec<f64> = (0..20)
+                .map(|c| match c {
+                    0..=7 => h1,
+                    8..=11 => transition[c - 8],
+                    _ => h2,
+                })
+                .collect();
+            let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+            state.eta.clone_from(&depth);
+            // 単位幅流量 q が一様な定常流：辺の水深は風上（左）のセルの水深、u_j = q / H_j
+            let mut flux = vec![0.0; mesh.n_edges()];
+            for (e, f) in flux.iter_mut().enumerate() {
+                let [c1, c2] = mesh.cells_on_edge[e];
+                let [nx, _] = mesh.normal_edge[e];
+                if nx.abs() < 0.5 {
+                    continue; // 側壁
+                }
+                let upwind = if c2 != NONE && mesh.x_cell[c2] < mesh.x_cell[c1] {
+                    c2
+                } else {
+                    c1
+                };
+                *f = q * nx;
+                state.u_n[e] = *f / depth[upwind];
+            }
+            reconstruct_cell_velocity(&mesh, &state.u_n, &mut state.u_cell);
+            let active: Vec<bool> = (0..mesh.n_edges())
+                .map(|e| !mesh.is_boundary_edge(e))
+                .collect();
+            let dt = 0.01;
+            let mut out = vec![0.0; mesh.n_edges()];
+            let mut work = AdvectionWorkspace::new(mesh.n_cells());
+            let stats = advection(&mesh, &state, &flux, &active, dt, &mut work, &mut out);
+            assert_eq!(stats.limited_edges, 0);
+            // 両端から3セル以上内側の内部の辺について、(h_1 + h_2)/2 Δx の重みで足す
+            let mut sum = 0.0;
+            for e in (0..mesh.n_edges()).filter(|&e| active[e]) {
+                let [c1, c2] = mesh.cells_on_edge[e];
+                let x = mesh.x_edge[e];
+                if !(3.0..=17.0).contains(&x) {
+                    continue;
+                }
+                let h_bar = 0.5 * (depth[c1] + depth[c2]);
+                let advective = (state.u_n[e] - out[e]) / dt;
+                let gradient = G * (depth[c2] - depth[c1]) / mesh.dc_edge[e];
+                sum += h_bar * mesh.dc_edge[e] * (advective + gradient) * mesh.normal_edge[e][0];
+            }
+            sum
+        };
+        let momentum = |h: f64| q * q / h + 0.5 * G * h * h;
+        // Bélanger の式を満たす水深では釣り合い、満たさなければ運動量関数の差が残る
+        assert!(balance(h2).abs() <= 1e-12, "imbalance {}", balance(h2));
+        let other = 1.1 * h2;
+        let expected = momentum(other) - momentum(h1);
+        assert!(
+            (balance(other) - expected).abs() <= 1e-12 * expected.abs(),
+            "{} != {expected}",
+            balance(other)
+        );
     }
 
-    /// 汀線：深いセルから、濡れたばかりの浅いセルへ流れ込む。h* で割るので、増分は
-    /// 流れ込む流速との差の σ_j（≤ 1）倍に収まり、時間刻みが大きくても発散しない。
-    /// 流出が体積を超える時間刻みでは、安全策として増分を縮める。
+    /// 六角形配置で一様流に乗せた格子規模の辺の流速の乱れは、移流を繰り返すと減衰する（辺の
+    /// 流速そのものを上流の流速へ近づけるため。5回で約 0.23 倍）。セル中心の流速だけで増分を
+    /// 作る形（ADR-0008）では、乱れのうちセル中心の流速に現れない成分が減らずに残り、5回で
+    /// 約 0.59 倍にしかならない。
+    #[test]
+    fn advection_damps_grid_scale_noise_on_hexagons() {
+        let mesh = mesh(20.0, 6.0, 1.0, ChannelLayout::Hexagonal);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        state.eta.fill(1.0);
+        let exact: Vec<f64> = mesh.normal_edge.iter().map(|n| 0.8 * n[0]).collect();
+        state.u_n = exact.clone();
+        let (flux, active) = advection_inputs(&mesh, &mut state);
+        for e in (0..mesh.n_edges()).filter(|&e| !mesh.is_boundary_edge(e)) {
+            state.u_n[e] += 0.05 * (12.9898 * e as f64).sin();
+        }
+        let noise = |u: &[f64]| {
+            (0..mesh.n_edges())
+                .map(|e| (u[e] - exact[e]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let before = noise(&state.u_n);
+        let mut out = vec![0.0; mesh.n_edges()];
+        let mut work = AdvectionWorkspace::new(mesh.n_cells());
+        // 流量は一様流のまま固定し、辺の流速だけを5回進める
+        for _ in 0..5 {
+            reconstruct_cell_velocity(&mesh, &state.u_n, &mut state.u_cell);
+            let stats = advection(&mesh, &state, &flux, &active, 0.75, &mut work, &mut out);
+            assert_eq!(stats.limited_edges, 0, "{stats:?}");
+            state.u_n.copy_from_slice(&out);
+        }
+        let after = noise(&state.u_n);
+        assert!(after <= 0.35 * before, "noise {before} -> {after}");
+    }
+
+    /// 汀線：深いセルから、濡れたばかりの浅いセルへ流れ込む。h* で割るので σ_j ≤ 1 で、F u_j は
+    /// 辺の流速と上流の流速の凸結合に収まり、時間刻みが大きくても発散しない。流出が体積を
+    /// 超える時間刻み（σ_j > 1）では、安全策として重みを 1 にする。
     #[test]
     fn advection_stays_bounded_at_a_wetting_front() {
         let mesh = mesh(8.0, 1.0, 1.0, ChannelLayout::Rectangular);
@@ -1220,26 +1290,20 @@ mod tests {
             .expect("the edge ahead of the front");
         assert!(active[ahead] && state.u_n[ahead] == 0.0);
 
-        // 隣り合うセルの流速の差の最大値
-        let spread = (0..mesh.n_edges())
-            .filter(|&e| !mesh.is_boundary_edge(e))
-            .map(|e| {
-                let [c1, c2] = mesh.cells_on_edge[e];
-                let [a, b] = [state.u_cell[c1], state.u_cell[c2]];
-                (a[0] - b[0]).hypot(a[1] - b[1])
-            })
-            .fold(0.0, f64::max);
         let mut out = vec![0.0; mesh.n_edges()];
         let mut work = AdvectionWorkspace::new(mesh.n_cells());
         for (dt, limited) in [(0.5, false), (5.0, true)] {
             let stats = advection(&mesh, &state, &flux, &active, dt, &mut work, &mut out);
             assert_eq!(stats.limited_edges > 0, limited, "dt = {dt}: {stats:?}");
             assert!(out[ahead] > 0.0, "the front must receive momentum");
+            // F u_j は u_j と上流のセルの流速（法線成分）の凸結合
             for (e, (&f, &u)) in out.iter().zip(&state.u_n).enumerate() {
+                let [nx, ny] = mesh.normal_edge[e];
+                let projected = state.u_cell.iter().map(|v| v[0] * nx + v[1] * ny);
+                let (lo, hi) = projected.fold((u, u), |(lo, hi), p| (lo.min(p), hi.max(p)));
                 assert!(
-                    (f - u).abs() <= spread + 1e-12,
-                    "dt = {dt}: edge {e}: increment {} > {spread}",
-                    f - u
+                    lo - 1e-12 <= f && f <= hi + 1e-12,
+                    "dt = {dt}: edge {e}: {f} outside [{lo}, {hi}]"
                 );
             }
         }

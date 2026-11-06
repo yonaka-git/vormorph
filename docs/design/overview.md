@@ -235,27 +235,34 @@ $\boldsymbol{\eta}^{n+1}$ が求まったら、4.1節の式で $u_j^{n+1}$ を�
 
 ### 4.4 移流（保存型風上差分）
 
-移流は陽的な保存型風上差分で評価します（Stelling & Duinmeijer, 2003; Kramer & Stelling, 2008。決め方の理由は [ADR-0008](adr/0008-advection-discretization.md)）。
+移流は陽的な保存型風上差分で評価します（Stelling & Duinmeijer, 2003; Kramer & Stelling, 2008）。決め方の理由は [ADR-0008](adr/0008-advection-discretization.md) と [ADR-0009](adr/0009-advection-face-velocity.md) にあります。
 
-まず、セル $i$ の運動量収支を2.1節の保存形に基づいて求めます。流出側の辺では $\mathbf{u}_{\mathrm{up}} = \mathbf{u}_i$ となって寄与が消えるため、流入側の辺だけが残ります。
+2.1節の保存形 $h^{-1}\left[\nabla\cdot(\mathbf{q}\otimes\mathbf{u}) - \mathbf{u}\,\nabla\cdot\mathbf{q}\right]$ をセル $i$ で評価します。運動量の流束の風上の流速は、流出側の辺では $\mathbf{u}_i$ です。そこで、連続式の項に辺の流速 $u_j$ を使うと、流入側の辺だけが残ります。
 
-$$
-\mathbf{M}_i = \sum_{l\in\partial i,\ s_{i,l} q_l < 0} s_{i,l}\, L_l\, q_l\left(\mathbf{u}_{k(i,l)} - \mathbf{u}_i\right), \qquad q_l = H_l^n u_l^n
-$$
-
-$\mathbf{u}_i$ は4.5節の Perot 法で再構成したセル中心の流速です。境界辺から流れ込む水の流速は、その辺の法線流速 $u_l\mathbf{n}_l$ とします（流量境界の流入）。
-
-次に、時刻 $n$ の同じ流量で連続式を陽的に進めたセルの水深 $h^\ast_i$ を求めます。辺の移流は、両側のセルの運動量収支を $h^\ast$ の和で割り、法線成分をとって求めます。
+まず、セルごとに、流入量 $S_i$ と、流れ込む運動量 $\mathbf{P}_i$ を求めます。
 
 $$
-h^\ast_i = h_i^n - \frac{\Delta t}{A_i}\sum_{l\in\partial i} s_{i,l}\, L_l\, q_l, \qquad F u_j^n = u_j^n - \Delta t\,\frac{\left(\mathbf{M}_{1(j)}/A_{1(j)} + \mathbf{M}_{2(j)}/A_{2(j)}\right)\cdot\mathbf{n}_j}{h^\ast_{1(j)} + h^\ast_{2(j)}}
+S_i = \sum_{l\in\partial i,\ s_{i,l} q_l < 0} \lvert L_l q_l\rvert, \qquad \mathbf{P}_i = \frac{1}{A_i}\sum_{l\in\partial i,\ s_{i,l} q_l < 0} \lvert L_l q_l\rvert\,\mathbf{u}_{k(i,l)}, \qquad q_l = H_l^n u_l^n
+$$
+
+$\mathbf{u}_k$ は4.5節の Perot 法で再構成したセル中心の流速です。境界辺から流れ込む水の流速は、その辺の法線流速 $u_l\mathbf{n}_l$ とします（流量境界の流入）。
+
+次に、時刻 $n$ の同じ流量で連続式を陽的に進めたセルの水深 $h^\ast_i$ を求めます。辺の流速を、両側のセルに流れ込む水の流速（法線成分）$\bar u_j$ へ、局所クーラン数 $\sigma_j$ の割合で近づけます。
+
+$$
+h^\ast_i = h_i^n - \frac{\Delta t}{A_i}\sum_{l\in\partial i} s_{i,l}\, L_l\, q_l, \qquad \sigma_j = \Delta t\,\frac{S_{1(j)}/A_{1(j)} + S_{2(j)}/A_{2(j)}}{h^\ast_{1(j)} + h^\ast_{2(j)}}, \qquad \bar u_j = \frac{\left(\mathbf{P}_{1(j)} + \mathbf{P}_{2(j)}\right)\cdot\mathbf{n}_j}{S_{1(j)}/A_{1(j)} + S_{2(j)}/A_{2(j)}}
+$$
+
+$$
+F u_j^n = u_j^n + \min(\sigma_j, 1)\left(\bar u_j - u_j^n\right)
 $$
 
 - **重みは両側とも 1/2 です。** ボロノイ格子の辺は、母点を結ぶ線分の垂直二等分線だからです。
-- **跳水で Bélanger の式が成り立ちます。** 定常流では $h^\ast = h$ です。水位勾配の項 $g\,\bar h_j\,\partial\eta/\partial n$（$\bar h_j = (h_1 + h_2)/2$）と合わせると、1次元の流れでは各辺の式の和で $q u + g h^2/2$ が打ち消し合います。そのため、跳水の両側で Rankine–Hugoniot の関係（Bélanger の式）が離散式の上で成り立ちます。
-- **$h^\ast$ で割ると、陽的な有限体積法の更新と一致します。** セルの運動量 $V\mathbf{u}$ と体積 $V$ を同じ流量で陽的に進めた形 $\mathbf{u}^\ast - \mathbf{u}^n = -\Delta t\,\mathbf{M}_i/V^\ast$ と同じです。増分は、流れ込む流速との差の $\sigma_j$ 倍になります。$\sigma_j = \Delta t\left(S_{1}/A_{1} + S_{2}/A_{2}\right)/(h^\ast_1 + h^\ast_2)$ は局所クーラン数で、$S_i$ はセル $i$ への流入量の和です。7章の時間刻みの条件が成り立てば $\sigma_j \le 1$ なので、濡れたばかりの浅いセルや段波の先端でも増分は発散しません。
-- **安全策**：$\sigma_j > 1$ の辺（時間刻みの条件を破ったとき）では、増分を $1/\sigma_j$ 倍にします。
-- **水位境界の辺**は、内側のセルの値だけで評価します（$h^\ast_2 = 0$、$\mathbf{M}_2 = 0$）。壁と流量境界の辺には運動量式がないので、移流も評価しません。
+- **跳水で Bélanger の式が成り立ちます。** 定常流では $h^\ast = h$ です。水位勾配の項 $g\,\bar h_j\,\partial\eta/\partial n$（$\bar h_j = (h_1 + h_2)/2$）と合わせると、1次元の流れでは、各辺の式の和で $q u + g h^2/2$ が打ち消し合います（連続式の項に $u_j$ を使うことで加わる項は流速の2階差分で、和では両端の差だけが残ります）。そのため、跳水の両側で Rankine–Hugoniot の関係（Bélanger の式）が離散式の上で成り立ちます。
+- **$h^\ast$ で割ると、陽的な有限体積法の更新と一致します。** セルの運動量 $V\mathbf{u}$ と体積 $V$ を同じ流量で陽的に進めた形です。7章の時間刻みの条件が成り立てば $\sigma_j \le 1$ で、$F u_j^n$ は $u_j^n$ と $\bar u_j$ の凸結合になります。濡れたばかりの浅いセルや段波の先端でも発散しません。
+- **格子規模の辺の流速の成分も運び去られます。** 辺の流速そのものを上流の流速へ近づけるためです。六角形配置では、辺の数がセル数の約3倍あり、セル中心の流速に現れない格子規模の辺の流速の成分が生じます。セル中心の流速だけで増分を作ると、この成分が跳水などにたまります（ADR-0009）。
+- **安全策**：$\sigma_j > 1$ の辺（時間刻みの条件を破ったとき）では、重みを 1 にします（$F u_j^n = \bar u_j$）。
+- **水位境界の辺**は、内側のセルの値だけで評価します。壁と流量境界の辺には運動量式がないので、移流も評価しません。
 - 1次精度の風上差分です。2次精度化（制限関数付き）と、加速流（堰の天端へ向かう流れなど）でのエネルギー水頭保存形への切り替えは、未決事項（8章）です。
 - 設定 `[hydro] advection = "none"` で、移流項を省けます（$F u_j^n = u_j^n$。検証で移流の効果を比べるため）。
 
@@ -378,8 +385,7 @@ $$
 
 実装の過程で決め、結果を ADR に記録します。
 
-- 移流の2次精度化と制限関数（重みは [ADR-0008](adr/0008-advection-discretization.md) で決定）
-- 六角形配置で、止まっている跳水の位置に側壁沿いの横断方向の流れが生じ、定常にならない問題（検証ケース V07 の結果）。側壁沿いのセルでの Perot 法の再構成が原因と推定しており、床止めの例題（V11）の前に対策する
+- 移流の2次精度化と制限関数（重みは [ADR-0008](adr/0008-advection-discretization.md)、形は [ADR-0009](adr/0009-advection-face-velocity.md) で決定）
 - 運動量保存形とエネルギー水頭保存形を切り替える判定方法
 - セル内の河床の起伏（サブグリッド地形、Casulli, 2009）を体積関数に入れるかどうか
 - 二次流による掃流砂の向きの補正（湾曲水路の検証ケース V10 で必要になる）
