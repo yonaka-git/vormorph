@@ -505,13 +505,235 @@ fn v04_closed_basin_oscillation() {
     }
 }
 
-/// V05 ダム破壊：Ritter（下流が乾燥）／ Stoker（下流が湛水）の解析解との比較。
+/// V05 のダム破壊（SWASHES の "dam break on a wet / dry domain without friction"）の諸元と解析解。
+mod dam_break {
+    /// 水路の延長 \[m\]。
+    pub const L: f64 = 10.0;
+    /// 水路の幅 \[m\]（1次元の流れを、側壁が滑り条件の細い水路で解く）。
+    pub const WIDTH: f64 = 0.2;
+    /// ダムの位置 \[m\]。
+    pub const X0: f64 = 5.0;
+    /// 上流側の水深 \[m\]。
+    pub const HL: f64 = 0.005;
+    /// 比べる時刻 \[s\]。
+    pub const T: f64 = 6.0;
+    /// 重力加速度 \[m/s²\]（設定の既定値）。
+    pub const G: f64 = 9.81;
+
+    /// Stoker の解の中間の状態の波速 c_m = √(g h_m)。下流側の水深 `hr` > 0 で、
+    /// −8 g h_r c_m² (√(g h_l) − c_m)² + (c_m² − g h_r)² (c_m² + g h_r) = 0 を二分法で解く。
+    pub fn stoker_cm(hr: f64) -> f64 {
+        let c0 = (G * HL).sqrt();
+        let f = |c: f64| {
+            -8.0 * G * hr * c * c * (c0 - c).powi(2) + (c * c - G * hr).powi(2) * (c * c + G * hr)
+        };
+        let (mut lo, mut hi) = ((G * hr).sqrt(), c0);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if f(mid) < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// 衝撃波の速さ 2 c_m² (√(g h_l) − c_m) / (c_m² − g h_r) \[m/s\]（Stoker）。
+    pub fn shock_speed(hr: f64) -> f64 {
+        let (c0, cm) = ((G * HL).sqrt(), stoker_cm(hr));
+        2.0 * cm * cm * (c0 - cm) / (cm * cm - G * hr)
+    }
+
+    /// 時刻 `t` > 0 の水深 \[m\]。`hr` = 0 なら Ritter、`hr` > 0 なら Stoker の解。
+    pub fn depth(x: f64, t: f64, hr: f64) -> f64 {
+        let c0 = (G * HL).sqrt();
+        let xi = (x - X0) / t;
+        let rarefaction = 4.0 / (9.0 * G) * (c0 - 0.5 * xi).powi(2);
+        if xi <= -c0 {
+            HL
+        } else if hr == 0.0 {
+            if xi <= 2.0 * c0 { rarefaction } else { 0.0 }
+        } else {
+            let cm = stoker_cm(hr);
+            if xi <= 2.0 * c0 - 3.0 * cm {
+                rarefaction
+            } else if xi <= shock_speed(hr) {
+                cm * cm / G
+            } else {
+                hr
+            }
+        }
+    }
+}
+
+/// V05 の1回の計算の結果。
+struct DamBreakRun {
+    /// 水深の L1 誤差の、解析解の体積に対する比。
+    l1_error: f64,
+    /// Stoker：質量から求めた衝撃波の位置 \[m\]。Ritter：水深が 1e-4 m 以上の最も下流のセルの位置 \[m\]。
+    front: f64,
+    /// 横断方向の流速の最大値 \[m/s\]。
+    max_v: f64,
+    /// 局所クーラン数の最大値。
+    max_courant: f64,
+}
+
+/// V05 の条件で、下流側の水深 `hr` のダム破壊を時刻 T まで解く。
+fn dam_break_run(layout: ChannelLayout, cell_size: f64, hr: f64, case: &str) -> DamBreakRun {
+    use dam_break::{G, HL, L, T, WIDTH, X0};
+    // 時間刻みは、最大の流速 2√(g h_l)（Ritter の先端）に対するクーラン数が 0.5 以下で、
+    // T をちょうど割り切る値
+    let steps = (T * 2.0 * (G * HL).sqrt() / (0.5 * cell_size)).ceil();
+    let dt = T / steps;
+    let mesh = basin_mesh(layout, L, WIDTH, cell_size);
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for c in 0..mesh.n_cells() {
+        state.eta[c] = if mesh.x_cell[c] < X0 { HL } else { hr };
+    }
+    let mut config = flow_config(case, dt, T, 0.0, CLOSED, T);
+    // 水深は mm の単位なので、wet/dry の閾値を水深より十分小さくする
+    config.hydro.dry_depth = 1.0e-6;
+    let mut model = Model::with_state(config, mesh, state).expect("valid setup");
+    if output_root().is_some() {
+        model
+            .write_output()
+            .expect("the initial state must be written");
+    }
+    let mut max_courant = 0.0_f64;
+    for _ in 0..steps as u64 {
+        let report = model.step().expect("the step must succeed");
+        max_courant = max_courant.max(report.max_courant);
+    }
+    let (mesh, state) = (model.mesh(), model.state());
+    assert!((state.time - T).abs() <= 1e-9 * T, "time {}", state.time);
+
+    let (mut l1, mut total) = (0.0, 0.0);
+    for c in 0..mesh.n_cells() {
+        let exact = dam_break::depth(mesh.x_cell[c], T, hr);
+        l1 += mesh.area_cell[c] * (state.depth(c) - exact).abs();
+        total += mesh.area_cell[c] * exact;
+    }
+    let front = if hr > 0.0 {
+        // 中間の一様な区間の中ほどの x_m より下流の水の量 ∫ (h − h_r) dx は、解析解では
+        // (h_m − h_r)(x_C − x_m)。これから衝撃波の位置 x_C を求める
+        let (c0, cm) = ((G * HL).sqrt(), dam_break::stoker_cm(hr));
+        let x_b = X0 + T * (2.0 * c0 - 3.0 * cm);
+        let x_c = X0 + T * dam_break::shock_speed(hr);
+        let x_m = 0.5 * (x_b + x_c);
+        let excess: f64 = (0..mesh.n_cells())
+            .filter(|&c| mesh.x_cell[c] > x_m)
+            .map(|c| mesh.area_cell[c] * (state.depth(c) - hr))
+            .sum();
+        x_m + excess / (WIDTH * (cm * cm / G - hr))
+    } else {
+        (0..mesh.n_cells())
+            .filter(|&c| state.depth(c) >= 1.0e-4)
+            .map(|c| mesh.x_cell[c])
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    let max_v = state.u_cell.iter().fold(0.0_f64, |m, u| m.max(u[1].abs()));
+    DamBreakRun {
+        l1_error: l1 / total,
+        front,
+        max_v,
+        max_courant,
+    }
+}
+
+/// V05 ダム破壊：Stoker（下流が湛水）／ Ritter（下流が乾燥）の解析解との比較。
 ///
-/// 水位・流速分布の L1 誤差と、格子を細かくしたときの収束次数を確かめる。
+/// SWASHES（Delestre et al., 2013）の §4.1.1, §4.1.2 と同じ条件（延長 10 m、x₀ = 5 m、
+/// h_l = 5 mm、h_r = 1 mm／0、摩擦なし、t = 6 s）を、幅 0.2 m の水路で解く。格子幅を
+/// 0.1, 0.05, 0.025, 0.0125 m と変え、両方の配置で次を確かめる。
+///
+/// - 水深の L1 誤差（解析解の体積に対する比）が、格子を細かくするたびに減り、0.1 m から
+///   0.0125 m までの平均の収束次数が 0.5 以上（不連続を含む解での1次精度のスキームの下限）
+/// - 0.0125 m での L1 誤差が、Stoker で 0.5% 以下、Ritter で 0.7% 以下
+/// - Stoker：質量から求めた衝撃波の位置の誤差が、どの格子でも格子幅の 2 倍以下
+/// - Ritter：先端（水深 1e-4 m の位置）の遅れが、格子を細かくするたびに減る
 #[test]
-#[ignore = "未実装: model::Model（保存型移流）"]
 fn v05_dam_break() {
-    todo!("Ritter / Stoker の解析解との比較")
+    use dam_break::{G, HL, T, X0};
+    const CELL_SIZES: [f64; 4] = [0.1, 0.05, 0.025, 0.0125];
+    let mut csv = String::from("case,layout,cell_size,l1_error,front\n");
+    for (name, hr, max_l1) in [("stoker", 0.001, 0.005), ("ritter", 0.0, 0.007)] {
+        let exact_front = if hr > 0.0 {
+            X0 + T * dam_break::shock_speed(hr)
+        } else {
+            // 解析解の水深が 1e-4 m になる位置
+            let c0 = (G * HL).sqrt();
+            X0 + T * 2.0 * (c0 - (1.0e-4 * 9.0 * G / 4.0).sqrt())
+        };
+        for layout in LAYOUTS {
+            let layout_name = format!("{layout:?}").to_lowercase();
+            println!("V05 {name}, {layout:?}: front (exact) {exact_front:.3} m");
+            let mut runs = Vec::new();
+            for cell_size in CELL_SIZES {
+                let case = format!("v05_{name}_{layout_name}_{cell_size}m");
+                let run = dam_break_run(layout, cell_size, hr, &case);
+                let order = runs
+                    .last()
+                    .map(|p: &DamBreakRun| (p.l1_error / run.l1_error).log2());
+                println!(
+                    "  dx {cell_size} m: L1 error {:.2}%, order {}, front {:.3} m \
+                     (error {:+.3} m = {:+.1} dx), max |v| {:.1e} m/s, max Courant {:.2}",
+                    100.0 * run.l1_error,
+                    order.map_or("-".to_owned(), |p| format!("{p:.2}")),
+                    run.front,
+                    run.front - exact_front,
+                    (run.front - exact_front) / cell_size,
+                    run.max_v,
+                    run.max_courant
+                );
+                csv.push_str(&format!(
+                    "{name},{layout_name},{cell_size:?},{:?},{:?}\n",
+                    run.l1_error, run.front
+                ));
+                if hr > 0.0 {
+                    assert!(
+                        (run.front - exact_front).abs() <= 2.0 * cell_size,
+                        "{name}, {layout:?}, dx {cell_size}: shock at {} m, exact {exact_front} m",
+                        run.front
+                    );
+                }
+                runs.push(run);
+            }
+            for (pair, sizes) in runs.windows(2).zip(CELL_SIZES.windows(2)) {
+                assert!(
+                    pair[1].l1_error < pair[0].l1_error,
+                    "{name}, {layout:?}: L1 error grows from dx {} to {}",
+                    sizes[0],
+                    sizes[1]
+                );
+                if hr == 0.0 {
+                    assert!(
+                        pair[1].front > pair[0].front,
+                        "{name}, {layout:?}: the front lag grows from dx {} to {}",
+                        sizes[0],
+                        sizes[1]
+                    );
+                }
+            }
+            let (first, last) = (&runs[0], &runs[runs.len() - 1]);
+            let mean_order =
+                (first.l1_error / last.l1_error).log2() / (CELL_SIZES.len() - 1) as f64;
+            println!("  mean order {mean_order:.2}");
+            assert!(
+                mean_order >= 0.5,
+                "{name}, {layout:?}: mean order {mean_order}"
+            );
+            assert!(
+                last.l1_error <= max_l1,
+                "{name}, {layout:?}: L1 error {} on the finest grid",
+                last.l1_error
+            );
+        }
+    }
+    if let Some(root) = output_root() {
+        let path = PathBuf::from(root).join("v05_convergence.csv");
+        std::fs::write(path, csv).expect("the convergence table must be written");
+    }
 }
 
 /// V06 等流：マニング式の等流水深に一致すること。

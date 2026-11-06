@@ -11,9 +11,16 @@ from plot_verification import (
     V04_A,
     V04_H0,
     V04_L,
+    V05_G,
+    V05_HL,
+    V05_L,
+    V05_T,
+    V05_X0,
+    dam_break_depth,
     normal_depth,
     read_collection,
     read_history,
+    stoker_cm,
     thacker_centroid,
     thacker_depth,
     thacker_omega,
@@ -77,3 +84,26 @@ def test_read_history_reads_named_columns(tmp_path: Path) -> None:
     one_row = tmp_path / "one.csv"
     one_row.write_text("time,centroid_x\n0.5,2.25\n", encoding="utf-8")
     assert read_history(one_row)["time"].tolist() == [0.5]
+
+
+@pytest.mark.parametrize("hr", [0.0, 0.001])
+def test_dam_break_solutions_conserve_the_water_volume(hr: float) -> None:
+    # 壁に届く前なので、水の体積は初期の h_l x₀ + h_r (L − x₀) のまま
+    x = np.linspace(0.0, V05_L, 200_001)
+    h = dam_break_depth(x, V05_T, hr)
+    volume = np.trapezoid(h, x)
+    assert volume == pytest.approx(V05_HL * V05_X0 + hr * (V05_L - V05_X0), rel=1e-4)
+    assert h[0] == V05_HL and h[-1] == hr
+
+
+def test_stoker_state_satisfies_the_shock_relations() -> None:
+    # 中間の状態と下流の状態は、衝撃波の速さ s で質量と運動量の Rankine–Hugoniot の関係を満たす
+    hr = 0.001
+    cm = stoker_cm(hr)
+    hm, um = cm * cm / V05_G, 2.0 * (np.sqrt(V05_G * V05_HL) - cm)
+    s = hm * um / (hm - hr)
+    momentum = (hm * um * um + V05_G * hm * hm / 2.0) - V05_G * hr * hr / 2.0
+    assert momentum == pytest.approx(s * hm * um, rel=1e-9)
+    # SWASHES の値（h_m ≈ 2.54 mm、x_C(6 s) ≈ 6.26 m）
+    assert hm == pytest.approx(2.539e-3, abs=1e-6)
+    assert V05_X0 + V05_T * s == pytest.approx(6.2598, abs=1e-3)

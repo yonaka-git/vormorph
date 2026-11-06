@@ -12,6 +12,7 @@
 前提:
     `<dir>/<ケース名>/<ケース名>.pvd` と、そこから参照する `.vtu`（src/io.rs の出力の規約）。
     V04 は、検証テストが書く `<dir>/<ケース名>/centroid.csv`（水塊の重心の時系列）も読む。
+    V05 は、`<dir>/v05_convergence.csv`（格子幅ごとの L1 誤差）も読む。
     ケースの条件（寸法・流量など）は tests/verification.rs の定数と一致させる。
 """
 
@@ -80,6 +81,68 @@ V04_CASES = (
     ("v04_rectangular_none", "no advection, rectangular", "-"),
 )
 """（ケース名, 凡例, 線種）。正方形配置と六角形配置の線は重なるので、六角形配置を破線にする。"""
+
+
+# V05 ダム破壊（tests/verification.rs の dam_break モジュールと同じ条件）
+V05_L = 10.0
+"""水路の延長 [m]。"""
+V05_X0 = 5.0
+"""ダムの位置 [m]。"""
+V05_HL = 0.005
+"""上流側の水深 [m]。"""
+V05_T = 6.0
+"""比べる時刻 [s]。"""
+V05_G = 9.81
+"""重力加速度 [m/s²]。"""
+V05_CASES = (("stoker", 0.001, "Stoker (h_r = 1 mm)"), ("ritter", 0.0, "Ritter (dry bed)"))
+"""（ケース名, 下流側の水深 [m], 題名）。"""
+V05_PROFILES = (
+    ("rectangular", 0.1, "rectangular, 0.1 m", "-"),
+    ("rectangular", 0.0125, "rectangular, 0.0125 m", "-"),
+    ("hexagonal", 0.0125, "hexagonal, 0.0125 m", (0, (4, 2))),
+)
+"""水深の分布を描く計算（配置, 格子幅 [m], 凡例, 線種）。"""
+
+
+def stoker_cm(hr: float) -> float:
+    """Stoker の解の中間の状態の波速 c_m = √(g h_m) [m/s]（二分法）。"""
+    c0 = np.sqrt(V05_G * V05_HL)
+
+    def f(c: float) -> float:
+        return -8.0 * V05_G * hr * c * c * (c0 - c) ** 2 + (c * c - V05_G * hr) ** 2 * (c * c + V05_G * hr)
+
+    lo, hi = np.sqrt(V05_G * hr), c0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if f(mid) < 0.0 else (lo, mid)
+    return float(0.5 * (lo + hi))
+
+
+def dam_break_depth(x: np.ndarray, t: float, hr: float) -> np.ndarray:
+    """ダム破壊の解析解の水深 [m]。`hr` = 0 なら Ritter、`hr` > 0 なら Stoker の解。"""
+    c0 = np.sqrt(V05_G * V05_HL)
+    xi = (np.asarray(x, dtype=float) - V05_X0) / t
+    rarefaction = 4.0 / (9.0 * V05_G) * (c0 - 0.5 * xi) ** 2
+    if hr == 0.0:
+        return np.where(xi <= -c0, V05_HL, np.where(xi <= 2.0 * c0, rarefaction, 0.0))
+    cm = stoker_cm(hr)
+    shock = 2.0 * cm * cm * (c0 - cm) / (cm * cm - V05_G * hr)
+    return np.select(
+        [xi <= -c0, xi <= 2.0 * c0 - 3.0 * cm, xi <= shock],
+        [V05_HL, rarefaction, cm * cm / V05_G],
+        default=hr,
+    )
+
+
+def binned_depth(mesh: meshio.Mesh, bin_width: float) -> tuple[np.ndarray, np.ndarray]:
+    """セルの水深を x 方向のビンごとに平均し、(x, h) を返す（乾いたセルも 0 として含める）。"""
+    x, h = cell_field(mesh, "x_cell"), cell_field(mesh, "h")
+    index = np.floor(x / bin_width).astype(int)
+    bins = np.unique(index)
+    return (
+        np.array([x[index == k].mean() for k in bins]),
+        np.array([h[index == k].mean() for k in bins]),
+    )
 
 
 def thacker_omega() -> float:
@@ -224,13 +287,66 @@ def plot_v04(root: Path, output: Path) -> None:
     fig.savefig(output, dpi=150)
 
 
+def plot_v05(root: Path, output: Path) -> None:
+    """V05 の図：Stoker と Ritter の水深の分布（t = 6 s）と、L1 誤差の収束。"""
+    fig = plt.figure(figsize=(10, 8), constrained_layout=True)
+    grid = fig.add_gridspec(2, 2)
+    profiles = [fig.add_subplot(grid[0, 0]), fig.add_subplot(grid[0, 1])]
+    convergence = fig.add_subplot(grid[1, :])
+
+    line = np.linspace(0.0, V05_L, 2001)
+    for ax, (case, hr, title), letter in zip(profiles, V05_CASES, "ab", strict=True):
+        ax.plot(line, 1e3 * dam_break_depth(line, V05_T, hr), color=REFERENCE, lw=3.0, label="analytic")
+        for (layout, dx, label, style), color in zip(V05_PROFILES, SERIES, strict=True):
+            time, mesh = last_step(root / f"v05_{case}_{layout}_{dx}m")
+            x, h = binned_depth(mesh, dx)
+            ax.plot(x, 1e3 * h, color=color, ls=style, lw=1.2, label=label)
+        ax.set_xlim(2.5, 8.5)
+        ax.set_ylim(-0.1, 5.4)
+        ax.set_xlabel("x [m]")
+        ax.set_ylabel("depth [mm]")
+        ax.set_title(f"({letter}) {title}, t = {time:g} s", loc="left", fontsize="medium")
+        ax.grid(alpha=0.3)
+    profiles[0].legend(loc="lower left", fontsize="small")
+
+    table = np.genfromtxt(
+        root / "v05_convergence.csv", delimiter=",", names=True, dtype=None, encoding="utf-8"
+    )
+    for (case, _, title), color in zip(V05_CASES, SERIES[:2], strict=True):
+        for layout, style, marker in (("rectangular", "-", "s"), ("hexagonal", (0, (4, 2)), "o")):
+            rows = table[(table["case"] == case) & (table["layout"] == layout)]
+            convergence.loglog(
+                rows["cell_size"],
+                100.0 * rows["l1_error"],
+                color=color,
+                ls=style,
+                marker=marker,
+                ms=6,
+                lw=1.2,
+                label=f"{title}, {layout}",
+            )
+    sizes = np.array([0.1, 0.0125])
+    for order, style in ((1.0, ":"), (0.5, "--")):
+        convergence.loglog(
+            sizes, 0.25 * (sizes / sizes[-1]) ** order, color=BED, ls=style, lw=0.8, label=f"order {order:g}"
+        )
+    convergence.set_xlabel("cell size [m]")
+    convergence.set_ylabel("L1 error of depth [%]")
+    convergence.set_title(
+        "(c) convergence (L1 error relative to the water volume)", loc="left", fontsize="medium"
+    )
+    convergence.legend(loc="upper left", fontsize="small", ncol=2)
+    convergence.grid(alpha=0.3, which="both")
+    fig.savefig(output, dpi=150)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("case", choices=["v04", "v06"], help="verification case")
+    parser.add_argument("case", choices=["v04", "v05", "v06"], help="verification case")
     parser.add_argument("root", type=Path, help="VORMORPH_VERIFICATION_OUTPUT of the test run")
     parser.add_argument("-o", "--output", type=Path, required=True, help="output image")
     args = parser.parse_args(argv)
-    plots = {"v04": plot_v04, "v06": plot_v06}
+    plots = {"v04": plot_v04, "v05": plot_v05, "v06": plot_v06}
     plots[args.case](args.root, args.output)
     print(f"wrote {args.output}")
     return 0
