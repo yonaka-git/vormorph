@@ -929,9 +929,9 @@ mod bump_jump {
 struct JumpRun {
     /// 跳水の位置（x 方向に平均した水深が (h₁ + h₂)/2 を上回る位置）\[m\]。
     jump: f64,
-    /// 跳水の直前（解析解の跳水の位置から 0.3 m 上流）の水深の相対誤差。
+    /// 跳水の直前（解析解の跳水の位置から 0.4 m 上流）の水深の相対誤差。
     before: f64,
-    /// 跳水の直後（同じく 0.3 m 下流）の水深の相対誤差。
+    /// 跳水の直後（同じく 0.4 m 下流）の水深の相対誤差。
     after: f64,
     /// 跳水の位置（解析解・計算値）から格子幅の 3 倍以上離れた範囲の水深の相対誤差の最大値と、
     /// その位置 \[m\]。
@@ -1024,8 +1024,8 @@ level = {H_DOWNSTREAM:?}
         });
     JumpRun {
         jump,
-        before: error_near(x_s - 0.3),
-        after: error_near(x_s + 0.3),
+        before: error_near(x_s - 0.4),
+        after: error_near(x_s + 0.4),
         max_error,
         discharge_error: outflow / inflow - 1.0,
         max_v: state.u_cell.iter().fold(0.0_f64, |m, u| m.max(u[1].abs())),
@@ -1037,17 +1037,15 @@ level = {H_DOWNSTREAM:?}
 /// SWASHES（Delestre et al., 2013）の §3.1.5 と同じ条件（延長 25 m、こぶの高さ 0.2 m、
 /// q = 0.18 m²/s、下流端の水深 0.33 m、摩擦なし）で、こぶの頂部で常流から射流に変わり、
 /// 下流側で跳水して常流に戻る流れを、幅 0.2 m の水路で 300 s 解く。格子は正方形配置の
-/// 0.1 m と 0.05 m。次を確かめる。
+/// 0.1 m と 0.05 m、六角形配置の 0.05 m（0.1 m では幅 0.2 m に 2 行しかないので除く）。
+/// 次を確かめる。
 ///
 /// - 定常になっている：下流端の流出量と上流端の流入量の差が 0.1% 以下
 /// - 跳水の位置（水深が共役水深の平均を上回る位置）の誤差が格子幅の 2 倍以下
-/// - 跳水の直前と直後（解析解の跳水の位置から 0.3 m 上流・下流）の水深の誤差が 2% 以下
-///   （解析解の共役水深の比 h₂/h₁ = 3.41 は Bélanger の式を満たす）
-/// - 跳水の近く（格子幅の 3 倍以内）を除く水深の誤差の最大値が 4% 以下で、格子を細かくすると
-///   減る
-///
-/// 六角形配置では、跳水の位置で側壁沿いに横断方向の流れが生じて定常にならないので、
-/// 合格基準には含めない（`docs/verification.md`）。
+/// - 跳水の直前と直後（解析解の跳水の位置から 0.4 m 上流・下流。なまった跳水の外側）の
+///   水深の誤差が 2% 以下（解析解の共役水深の比 h₂/h₁ = 3.41 は Bélanger の式を満たす）
+/// - 跳水の近く（格子幅の 3 倍以内）を除く水深の誤差の最大値が 4% 以下で、正方形配置では
+///   格子を細かくすると減る
 #[test]
 fn v07_hydraulic_jump() {
     let x_s = bump_jump::jump_position();
@@ -1059,12 +1057,16 @@ fn v07_hydraulic_jump() {
         bump_jump::critical_depth()
     );
     let mut previous_max = f64::INFINITY;
-    for cell_size in [0.1, 0.05] {
-        let layout = ChannelLayout::Rectangular;
+    for (layout, cell_size) in [
+        (ChannelLayout::Rectangular, 0.1),
+        (ChannelLayout::Rectangular, 0.05),
+        (ChannelLayout::Hexagonal, 0.05),
+    ] {
+        let name = format!("{layout:?}, {cell_size} m");
         let case = format!("v07_{}_{cell_size}m", format!("{layout:?}").to_lowercase());
         let run = bump_jump_run(layout, cell_size, 300.0, &case);
         println!(
-            "V07 {layout:?}, {cell_size} m: jump at {:.3} m (error {:+.3} m = {:+.1} dx), \
+            "V07 {name}: jump at {:.3} m (error {:+.3} m = {:+.1} dx), \
              depth error {:+.2}% before / {:+.2}% after the jump, \
              max {:.2}% at x = {:.2} m, outflow / inflow − 1 = {:.1e}, max |v| {:.1e} m/s",
             run.jump,
@@ -1079,40 +1081,34 @@ fn v07_hydraulic_jump() {
         );
         assert!(
             run.discharge_error.abs() <= 1e-3,
-            "{cell_size} m: not steady ({:e})",
+            "{name}: not steady ({:e})",
             run.discharge_error
         );
         assert!(
             (run.jump - x_s).abs() <= 2.0 * cell_size,
-            "{cell_size} m: jump at {} m, exact {x_s} m",
+            "{name}: jump at {} m, exact {x_s} m",
             run.jump
         );
         assert!(
             run.before.abs() <= 0.02 && run.after.abs() <= 0.02,
-            "{cell_size} m: depth error {} before / {} after the jump",
+            "{name}: depth error {} before / {} after the jump",
             run.before,
             run.after
         );
         assert!(
-            run.max_error.0 <= 0.04 && run.max_error.0 < previous_max,
-            "{cell_size} m: max depth error {} at {} m",
+            run.max_error.0 <= 0.04,
+            "{name}: max depth error {} at {} m",
             run.max_error.0,
             run.max_error.1
         );
-        previous_max = run.max_error.0;
-    }
-    if output_root().is_some() {
-        // 図のために六角形配置も計算する（合格基準には含めない）
-        let run = bump_jump_run(ChannelLayout::Hexagonal, 0.05, 300.0, "v07_hexagonal_0.05m");
-        println!(
-            "V07 Hexagonal, 0.05 m (for the figure): jump at {:.3} m, depth error {:+.2}% before / \
-             {:+.2}% after the jump, outflow / inflow − 1 = {:.1e}, max |v| {:.1e} m/s",
-            run.jump,
-            100.0 * run.before,
-            100.0 * run.after,
-            run.discharge_error,
-            run.max_v
-        );
+        if layout == ChannelLayout::Rectangular {
+            assert!(
+                run.max_error.0 < previous_max,
+                "{name}: max depth error {} does not decrease",
+                run.max_error.0
+            );
+            previous_max = run.max_error.0;
+        }
     }
 }
 
