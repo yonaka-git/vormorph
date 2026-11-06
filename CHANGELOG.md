@@ -56,4 +56,8 @@
 - 移流を ADR-0009 の形にした後の V03〜V06 の結果を `docs/verification.md` に記録（どれも同じ合格基準で通る）
 - 格子生成ツールを、平面直角座標のような原点から遠い座標でも使えるように修正：重心をセルの頂点の平均を原点にして計算し、境界の母点・Lloyd 法・組み立て・検査を、領域の近くに原点を移した局所座標で行う。$(10^5, 10^5)$ m 平行移動した領域で、以前は重心が桁落ちし、格子幅 1.5 m で Lloyd 法が収束せず、0.5 m で生成が失敗していた。平行移動のテストを追加（`tools/tests/test_voronoi.py`, `test_gmsh.py`）。`docs/design/mesh-generation.md` に「座標の扱い」を追加
 - 格子の幾何量が座標の原点によらないこと（$(10^5, 10^5)$ m 平行移動して組み立てても、座標の丸めの範囲で一致する）と、一次の流速場の Perot 法の再構成の誤差が壁ぎわのセルでも小さいことを確かめるテストを追加（`tests/mesh_file.rs`、`hydro` の単体テスト）。`docs/design/mesh-generation.md` に、壁ぎわのセルの母点と重心のずれ、中心を母点のままにする理由、外周の凸な角に接するセルの制限を記録
+- 設定からモデルを組み立てる `model::Model::new`（`mesh.kind = "channel"`）：直線水路の格子を作り、`[bed]` の河床高と床止め（かさ上げ・非侵食層）を母点で評価する（端にちょうど乗る母点を丸め誤差で取りこぼさないよう、格子幅の $10^{-9}$ 倍の許容差）。初期状態は乾いた河床（η = z_b、u = 0）。`mesh.kind = "file"`（格子ファイルに河床高がない）と、未実装の流砂（`[sediment]`）は `ModelError::Setup` で拒否する。格子の誤り `ModelError::Mesh` を追加
+- 可変の時間刻み（ADR-0010）：`[time]` に `dt`（固定）か `courant` と `dt_max`（可変）のどちらか一方を書く。可変のときは、時刻 n の流量でセルの流出量の比 max_i Σ_流出 L q / V（`hydro::HydroSolver::max_outflow_rate`）を求め、Δt = min(C / 比, `dt_max`) とし、出力時刻・`morphology_start`・終了時刻にちょうど止める。`config::TimeStep`、`ModelError::TimeStep`。`StepReport` に時間刻み `dt` と実際のクーラン数 `outflow_courant` を追加。`docs/design/overview.md` の第5章と第7章を更新
+- `model::Model::run_with`（出力のたびに直前の出力からの記録 `model::Progress` を渡す）、`Model::finished`、`Model::time_step`
+- 例題 `examples/sill.toml` を可変の時間刻み（`courant = 0.5`、`dt_max = 0.2`）に変更。固定の 0.2 s では、床止めの直下の射流で移流の局所クーラン数が 1.75 になり、安全策が毎ステップ約 860 辺で働いていた。乾いた状態から定常になるまで約 500 s かかるので、`morphology_start` を 300 s から 600 s に延ばした
 - ライセンス：MIT OR Apache-2.0

@@ -1,16 +1,33 @@
 //! 時間ループと質量収支。
 //!
+//! ## モデルの組み立て
+//!
+//! - [`Model::new`]：設定から直線水路の格子（[`crate::mesh::channel`]）、初期河床、床止めを作る。
+//!   河床高は母点 x_i で評価し（z_b = `z_downstream` + `slope` × (L − x_i)）、床止めごとに
+//!   x_i ≤ `x_end` のセルを `height` だけかさ上げし、`x_start` ≤ x_i ≤ `x_end` のセルを
+//!   非侵食層（z_ne = 初期の z_b）とする。母点が `x_start`・`x_end` にちょうど乗る場合に
+//!   丸め誤差で分かれないよう、比較には格子幅の 10⁻⁹ 倍の許容差をつける。初期状態は
+//!   乾いた河床（η = z_b、u = 0）で、水は境界から入る。
+//! - [`Model::with_state`]：格子と初期状態を外から与える（検証ケースで任意の地形を使うため）。
+//!
 //! ## 1ステップの流れ
 //!
-//! 1. [`HydroSolver::step`] で η と u_n を時刻 n+1 へ進める。時刻は開始時刻 + ステップ数 × Δt
-//!    で計算し、Δt の足し算による誤差の累積を避ける。
-//! 2. t > `time.morphology_start` かつ移動床なら、
+//! 1. 時間刻み Δt を決める（[`TimeStep`]）。
+//!    - 固定：`time.dt`。時刻は開始時刻 + ステップ数 × Δt で計算し、足し算による誤差の累積を
+//!      避ける。
+//!    - 可変：時刻 n の状態でセルの流出量の比 r = max_i Σ_流出 L q / V
+//!      （[`HydroSolver::max_outflow_rate`]）を求め、Δt = min(C / r, `dt_max`) とする
+//!      （流出がなければ `dt_max`）。次の区切りの時刻（出力時刻、`morphology_start`、終了時刻）
+//!      までの残りが Δt 以下ならちょうどそこまで進め、時刻をその値にそろえる。残りが 2Δt 未満
+//!      なら、半分ずつ2ステップで進める（極端に短いステップを作らないため）。ADR-0010。
+//! 2. [`HydroSolver::step`] で η と u_n を時刻 n+1 へ進める。
+//! 3. t > `time.morphology_start` かつ移動床なら、
 //!    [`SedimentSolver::compute_bedload`]、[`SedimentSolver::step_suspended`]、
-//!    [`SedimentSolver::update_bed`] の順に流砂と河床を更新する（流砂は未実装で、
-//!    これらの関数は `todo!()` のまま）。
-//! 3. 水の収支（[`MassBalance`]）を更新する。上流端・下流端の流量は、連続式と同じ θ 平均流量
+//!    [`SedimentSolver::update_bed`] の順に流砂と河床を更新する（流砂は未実装なので、
+//!    `[sediment]` のある設定は組み立ての時点でエラーにする）。
+//! 4. 水の収支（[`MassBalance`]）を更新する。上流端・下流端の流量は、連続式と同じ θ 平均流量
 //!    （[`HydroSolver::theta_flux`]）から求める。
-//! 4. 出力時刻なら [`VtkWriter::write_step`] で書き出す。[`Model::run`] は最初に初期状態も書く。
+//! 5. 出力時刻なら [`VtkWriter::write_step`] で書き出す。[`Model::run`] は最初に初期状態も書く。
 //!
 //! ## 質量収支
 //!
@@ -24,10 +41,14 @@
 //! 半陰解法では、Newton 反復と PCG の収束判定値の範囲でこれが成り立つ。収支の誤差は
 //! 検証ケース（閉鎖水域の振動など）で確かめる。
 
-use crate::config::{Config, ConfigError, DownstreamBoundary, UpstreamBoundary};
+use crate::config::{
+    BedConfig, Config, ConfigError, DownstreamBoundary, MeshConfig, StructureConfig, TimeStep,
+    UpstreamBoundary,
+};
 use crate::hydro::{self, HydroError, HydroParams, HydroSolver, StepReport};
 use crate::io::VtkWriter;
-use crate::mesh::{EdgeKind, Mesh};
+use crate::mesh::channel::{self, ChannelSpec};
+use crate::mesh::{EdgeKind, Mesh, MeshError};
 use crate::sediment::{SedimentParams, SedimentSolver};
 use crate::state::State;
 use std::error::Error;
@@ -84,8 +105,17 @@ pub enum ModelError {
     Config(ConfigError),
     /// 格子・状態・設定の組み合わせが正しくない（配列の長さ、境界条件と境界辺の対応など）。
     Setup(String),
+    /// 格子を作れない。
+    Mesh(MeshError),
     /// 流れの計算が失敗した。
     Hydro(HydroError),
+    /// 可変の時間刻みが正の有限の値にならない（時刻と、求めた値 \[s\]）。
+    TimeStep {
+        /// 時刻 \[s\]。
+        time: f64,
+        /// 求めた時間刻み \[s\]。
+        dt: f64,
+    },
     /// 入出力の失敗。
     Io(std::io::Error),
 }
@@ -95,7 +125,12 @@ impl fmt::Display for ModelError {
         match self {
             Self::Config(e) => write!(f, "configuration error: {e}"),
             Self::Setup(message) => write!(f, "invalid model setup: {message}"),
+            Self::Mesh(e) => write!(f, "cannot build the mesh: {e}"),
             Self::Hydro(e) => write!(f, "hydrodynamic solver error: {e}"),
+            Self::TimeStep { time, dt } => write!(
+                f,
+                "the adaptive time step became {dt:e} s at t = {time} s (expected a positive finite value)"
+            ),
             Self::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
@@ -105,7 +140,8 @@ impl Error for ModelError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Config(e) => Some(e),
-            Self::Setup(_) => None,
+            Self::Setup(_) | Self::TimeStep { .. } => None,
+            Self::Mesh(e) => Some(e),
             Self::Hydro(e) => Some(e),
             Self::Io(e) => Some(e),
         }
@@ -115,6 +151,12 @@ impl Error for ModelError {
 impl From<ConfigError> for ModelError {
     fn from(e: ConfigError) -> Self {
         Self::Config(e)
+    }
+}
+
+impl From<MeshError> for ModelError {
+    fn from(e: MeshError) -> Self {
+        Self::Mesh(e)
     }
 }
 
@@ -143,6 +185,8 @@ pub struct Model {
     writer: VtkWriter,
     water: MassBalance,
     sediment_balance: SedimentBalance,
+    /// 時間刻みの決め方
+    time_step: TimeStep,
     /// 開始時刻 \[s\]
     start_time: f64,
     /// 進めたステップ数
@@ -151,11 +195,90 @@ pub struct Model {
     next_output: f64,
 }
 
+/// [`Model::run_with`] が出力のたびに渡す、直前の出力からの計算の記録。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress {
+    /// 直前の出力から進めたステップ数。
+    pub steps: u64,
+    /// 時間刻みの最小値 \[s\]。
+    pub dt_min: f64,
+    /// 時間刻みの最大値 \[s\]。
+    pub dt_max: f64,
+    /// セルの流出量の比（クーラン数）の最大値 \[-\]（[`StepReport::outflow_courant`]）。
+    pub max_outflow_courant: f64,
+    /// 1ステップの Newton 法の反復回数の最大値。
+    pub max_newton_iterations: usize,
+    /// PCG の反復回数の合計。
+    pub pcg_iterations: usize,
+    /// 移流の重みを頭打ちにした辺の数の合計（[`StepReport::limited_edges`]）。
+    pub limited_edges: usize,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            steps: 0,
+            dt_min: f64::INFINITY,
+            dt_max: 0.0,
+            max_outflow_courant: 0.0,
+            max_newton_iterations: 0,
+            pcg_iterations: 0,
+            limited_edges: 0,
+        }
+    }
+}
+
+impl Progress {
+    /// 1ステップの記録を加える。
+    pub fn add(&mut self, report: &StepReport) {
+        self.steps += 1;
+        self.dt_min = self.dt_min.min(report.dt);
+        self.dt_max = self.dt_max.max(report.dt);
+        self.max_outflow_courant = self.max_outflow_courant.max(report.outflow_courant);
+        self.max_newton_iterations = self.max_newton_iterations.max(report.newton_iterations);
+        self.pcg_iterations += report.pcg_iterations;
+        self.limited_edges += report.limited_edges;
+    }
+}
+
 impl Model {
     /// 設定から格子と初期条件を作り、モデルを組み立てる。
+    ///
+    /// `mesh.kind = "channel"` のとき、直線水路の格子を作り、`[bed]` と `[[structures]]` から
+    /// 初期河床と非侵食層を決める（モジュールの説明の「モデルの組み立て」）。初期状態は乾いた
+    /// 河床（η = z_b、u = 0）。
+    ///
+    /// `mesh.kind = "file"` は、格子ファイルにセルの河床高がないので、まだ使えない
+    /// （[`ModelError::Setup`]。[`Model::with_state`] で状態を与える）。
     pub fn new(config: Config) -> Result<Self, ModelError> {
-        let _ = config;
-        todo!("格子の生成・初期条件の設定")
+        config.validate()?;
+        let (mesh, state) = match &config.mesh {
+            MeshConfig::Channel {
+                length,
+                width,
+                cell_size,
+                layout,
+            } => {
+                let mesh = channel::build(&ChannelSpec {
+                    length: *length,
+                    width: *width,
+                    cell_size: *cell_size,
+                    layout: *layout,
+                })?;
+                let bed = config.bed.as_ref().ok_or_else(|| {
+                    ModelError::Setup("[bed] is required when mesh.kind = \"channel\"".to_owned())
+                })?;
+                let state = channel_state(&mesh, *length, *cell_size, bed, &config.structures);
+                (mesh, state)
+            }
+            MeshConfig::File { path } => {
+                return Err(ModelError::Setup(format!(
+                    "mesh.kind = \"file\" ({}) is not supported by Model::new yet: mesh files have no bed elevations (build the state yourself and use Model::with_state)",
+                    path.display()
+                )));
+            }
+        };
+        Self::with_state(config, mesh, state)
     }
 
     /// 格子と初期状態を外から与えて組み立てる（検証ケースで任意の地形を与えるため）。
@@ -167,10 +290,14 @@ impl Model {
     /// - `u_cell` を `u_n` から Perot 法で再構成する。
     ///
     /// 配列の長さが格子と合わないとき、流量境界なのに上流端の辺がないとき、水位・水深境界
-    /// なのに下流端の辺がないときは [`ModelError::Setup`] を返す。
+    /// なのに下流端の辺がないとき、まだ実装していない流砂（`[sediment]`）を含むときは
+    /// [`ModelError::Setup`] を返す。
     pub fn with_state(config: Config, mesh: Mesh, mut state: State) -> Result<Self, ModelError> {
         config.validate()?;
         check_setup(&config, &mesh, &state)?;
+        let time_step = config.time.step_control().ok_or_else(|| {
+            ModelError::Setup("time: give either dt or courant and dt_max".to_owned())
+        })?;
 
         for (eta, &zb) in state.eta.iter_mut().zip(&state.zb) {
             *eta = eta.max(zb);
@@ -213,6 +340,7 @@ impl Model {
                 initial_suspended: suspended,
                 ..SedimentBalance::default()
             },
+            time_step,
             steps: 0,
             config,
             mesh,
@@ -258,14 +386,47 @@ impl Model {
         &self.sediment_balance
     }
 
+    /// 時間刻みの決め方。
+    pub fn time_step(&self) -> TimeStep {
+        self.time_step
+    }
+
+    /// 計算が設定の終了時刻に達したか。
+    pub fn finished(&self) -> bool {
+        self.state.time >= self.config.time.end - 1.0e-9 * self.time_step.max_dt()
+    }
+
     /// 1ステップ進め、流れの計算の記録を返す。出力時刻を過ぎたら VTK を書く。
     pub fn step(&mut self) -> Result<StepReport, ModelError> {
-        let dt = self.config.time.dt;
+        let (dt, landing) = match self.time_step {
+            TimeStep::Fixed { dt } => (dt, None),
+            TimeStep::Adaptive { courant, dt_max } => {
+                let rate =
+                    self.hydro
+                        .max_outflow_rate(&self.mesh, &self.state, &self.config.boundary);
+                let dt = if rate > 0.0 {
+                    (courant / rate).min(dt_max)
+                } else {
+                    dt_max
+                };
+                if !(dt.is_finite() && dt > 0.0) {
+                    return Err(ModelError::TimeStep {
+                        time: self.state.time,
+                        dt,
+                    });
+                }
+                self.fit_to_next_event(dt)
+            }
+        };
         let report = self
             .hydro
             .step(&self.mesh, &mut self.state, &self.config.boundary, dt)?;
         self.steps += 1;
-        self.state.time = self.start_time + self.steps as f64 * dt;
+        self.state.time = match (self.time_step, landing) {
+            (TimeStep::Fixed { dt }, _) => self.start_time + self.steps as f64 * dt,
+            (TimeStep::Adaptive { .. }, Some(event)) => event,
+            (TimeStep::Adaptive { .. }, None) => self.state.time,
+        };
 
         let (inflow, outflow) = boundary_discharge(&self.mesh, self.hydro.theta_flux());
         self.water.inflow += dt * inflow;
@@ -292,14 +453,55 @@ impl Model {
         Ok(report)
     }
 
+    /// 可変の時間刻み `dt` を、次の区切りの時刻（出力時刻、河床変動の開始時刻、終了時刻）に
+    /// 合わせる。区切りまでの残りが `dt` 以下ならちょうどそこまで進め（その時刻を返す）、
+    /// 2`dt` 未満なら残りの半分にする。
+    fn fit_to_next_event(&self, dt: f64) -> (f64, Option<f64>) {
+        let time = self.state.time;
+        let time_config = &self.config.time;
+        let next_event = [
+            self.next_output,
+            time_config.morphology_start,
+            time_config.end,
+        ]
+        .into_iter()
+        .filter(|&t| t > time)
+        .fold(f64::INFINITY, f64::min);
+        let remaining = next_event - time;
+        if remaining <= dt {
+            (remaining, Some(next_event))
+        } else if remaining < 2.0 * dt {
+            (0.5 * remaining, None)
+        } else {
+            (dt, None)
+        }
+    }
+
     /// 初期状態を書き出し（まだ何も書いていなければ）、設定の終了時刻まで進める。
     pub fn run(&mut self) -> Result<(), ModelError> {
+        self.run_with(|_, _| {})
+    }
+
+    /// [`Model::run`] と同じく終了時刻まで進め、出力を書くたびに `on_output` を呼ぶ。
+    ///
+    /// `on_output` には、モデル（書き出した時刻の状態）と、直前の出力からの計算の記録
+    /// （[`Progress`]）を渡す。初期状態を書いたときは呼ばない。
+    pub fn run_with(
+        &mut self,
+        mut on_output: impl FnMut(&Self, &Progress),
+    ) -> Result<(), ModelError> {
         if self.writer.entries().is_empty() {
             self.write_output()?;
         }
-        let (dt, end) = (self.config.time.dt, self.config.time.end);
-        while self.state.time < end - 1.0e-9 * dt {
-            self.step()?;
+        let mut progress = Progress::default();
+        while !self.finished() {
+            let written = self.writer.entries().len();
+            let report = self.step()?;
+            progress.add(&report);
+            if self.writer.entries().len() > written {
+                on_output(self, &progress);
+                progress = Progress::default();
+            }
         }
         Ok(())
     }
@@ -342,11 +544,55 @@ fn check_setup(config: &Config, mesh: &Mesh, state: &State) -> Result<(), ModelE
         problems
             .push("a water level or depth boundary needs downstream edges in the mesh".to_owned());
     }
+    if config.sediment.is_some() {
+        problems.push(
+            "sediment transport is not implemented yet: remove [sediment] to run a fixed-bed simulation"
+                .to_owned(),
+        );
+    }
     if problems.is_empty() {
         Ok(())
     } else {
         Err(ModelError::Setup(problems.join("; ")))
     }
+}
+
+/// 直線水路の初期状態：河床高と非侵食層を母点で評価し、乾いた河床（η = z_b、u = 0）にする。
+///
+/// z_b = `z_downstream` + `slope` × (L − x_i)。床止めごとに、x_i ≤ `x_end` のセルを `height`
+/// だけかさ上げし、`x_start` ≤ x_i ≤ `x_end` のセルの非侵食層の高さを、すべての床止めを
+/// 加えた後の z_b にする（天端の上に土砂がない状態）。比較には `cell_size` の 10⁻⁹ 倍の
+/// 許容差をつける。
+fn channel_state(
+    mesh: &Mesh,
+    length: f64,
+    cell_size: f64,
+    bed: &BedConfig,
+    structures: &[StructureConfig],
+) -> State {
+    let tol = 1.0e-9 * cell_size;
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    for (c, &x) in mesh.x_cell.iter().enumerate() {
+        let mut zb = bed.z_downstream + bed.slope * (length - x);
+        for structure in structures {
+            match structure {
+                StructureConfig::Sill { x_end, height, .. } => {
+                    if x <= x_end + tol {
+                        zb += height;
+                    }
+                }
+            }
+        }
+        state.zb[c] = zb;
+        state.eta[c] = zb;
+        let fixed = structures.iter().any(|structure| match structure {
+            StructureConfig::Sill { x_start, x_end, .. } => x_start - tol <= x && x <= x_end + tol,
+        });
+        if fixed {
+            state.z_ne[c] = zb;
+        }
+    }
+    state
 }
 
 /// 水の体積 Σ A_i max(η_i − z_{b,i}, 0) \[m³\]。
@@ -487,5 +733,182 @@ interval = 100.0
             bed_exchange: -3.0,
         };
         assert_eq!(b.error(), 0.0);
+    }
+
+    /// 直線水路の設定（正方形配置、格子幅 0.5 m で母点は x = 0.25, 0.75, …, 9.75 m）。
+    fn channel_config(name: &str, structures: &str, time: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!("vormorph-{name}-{}", std::process::id()));
+        format!(
+            r#"
+title = "{name}"
+[mesh]
+kind = "channel"
+length = 10.0
+width = 2.0
+cell_size = 0.5
+layout = "rectangular"
+[bed]
+slope = 0.01
+z_downstream = 0.5
+{structures}
+[time]
+{time}
+end = 3.0
+morphology_start = 1.5
+[hydro]
+theta = 0.55
+manning_n = 0.03
+[boundary.upstream]
+kind = "discharge"
+discharge = 0.5
+[boundary.downstream]
+kind = "depth"
+depth = 0.2
+[output]
+dir = {dir:?}
+interval = 1.0
+"#
+        )
+        .parse()
+        .expect("valid channel config")
+    }
+
+    const SILL: &str = r#"
+[[structures]]
+kind = "sill"
+x_start = 4.0
+x_end = 5.0
+height = 1.0
+"#;
+
+    #[test]
+    fn new_evaluates_the_bed_and_the_sill_at_the_generators() {
+        let model =
+            Model::new(channel_config("bed", SILL, "dt = 0.1")).expect("the channel must build");
+        let (mesh, state) = (model.mesh(), model.state());
+        assert_eq!(mesh.n_cells(), 80);
+        let mut fixed = 0;
+        for c in 0..mesh.n_cells() {
+            let x = mesh.x_cell[c];
+            let raised = if x <= 5.0 { 1.0 } else { 0.0 };
+            let zb = 0.5 + 0.01 * (10.0 - x) + raised;
+            assert!((state.zb[c] - zb).abs() < 1e-14, "zb at x = {x}");
+            assert_eq!(state.eta[c], state.zb[c], "the initial bed must be dry");
+            if (4.0..=5.0).contains(&x) {
+                assert_eq!(state.z_ne[c], state.zb[c], "non-erodible at x = {x}");
+                fixed += 1;
+            } else {
+                assert_eq!(state.z_ne[c], f64::NEG_INFINITY, "erodible at x = {x}");
+            }
+        }
+        // x = 4.25, 4.75 m の2列（各 4 セル）
+        assert_eq!(fixed, 8);
+        assert!(state.u_n.iter().all(|&u| u == 0.0));
+        assert_eq!(model.water_balance().initial_volume, 0.0);
+    }
+
+    /// 母点が床止めの端にちょうど乗る場合を、丸め誤差で取りこぼさない。
+    #[test]
+    fn generators_on_the_sill_ends_are_included_despite_rounding() {
+        let mut config = channel_config("sill-ends", SILL, "dt = 0.1");
+        let StructureConfig::Sill { x_start, x_end, .. } = &mut config.structures[0];
+        *x_start = 4.25 + 1e-12;
+        *x_end = 5.25 - 1e-12;
+        let model = Model::new(config).expect("the channel must build");
+        let (mesh, state) = (model.mesh(), model.state());
+        for c in 0..mesh.n_cells() {
+            let x = mesh.x_cell[c];
+            let in_band = (4.2..5.3).contains(&x);
+            assert_eq!(state.z_ne[c].is_finite(), in_band, "x = {x}");
+            let raised = state.zb[c] - (0.5 + 0.01 * (10.0 - x));
+            assert!((raised - if x < 5.3 { 1.0 } else { 0.0 }).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn new_rejects_file_meshes_and_sediment_for_now() {
+        let mut config = channel_config("reject", "", "dt = 0.1");
+        config.mesh = MeshConfig::File {
+            path: "mesh.toml".into(),
+        };
+        let err = Model::new(config).unwrap_err();
+        assert!(
+            matches!(&err, ModelError::Setup(m) if m.contains("not supported")),
+            "{err}"
+        );
+
+        let mut config = channel_config("reject", "", "dt = 0.1");
+        config.sediment =
+            crate::config::Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sill.toml"))
+                .expect("examples/sill.toml must be valid")
+                .sediment;
+        let err = Model::new(config).unwrap_err();
+        assert!(
+            matches!(&err, ModelError::Setup(m) if m.contains("sediment transport is not implemented")),
+            "{err}"
+        );
+    }
+
+    /// 可変の時間刻みは上限とクーラン数を守り、出力時刻・河床変動の開始時刻・終了時刻に
+    /// ちょうど止まる。
+    #[test]
+    fn adaptive_steps_respect_the_limits_and_land_on_events() {
+        let (courant, dt_max) = (0.5, 0.2);
+        let config = channel_config(
+            "adaptive",
+            SILL,
+            &format!("courant = {courant:?}\ndt_max = {dt_max:?}"),
+        );
+        let mut model = Model::new(config).expect("the channel must build");
+        assert_eq!(model.time_step(), TimeStep::Adaptive { courant, dt_max });
+        let mut times = Vec::new();
+        let mut limited_by_courant = 0;
+        while !model.finished() {
+            let report = model.step().expect("the step must succeed");
+            assert!(report.dt > 0.0 && report.dt <= dt_max, "dt = {}", report.dt);
+            assert!(
+                report.outflow_courant <= courant * (1.0 + 1e-12),
+                "Courant {} at t = {}",
+                report.outflow_courant,
+                model.state().time
+            );
+            if report.outflow_courant > 0.99 * courant {
+                limited_by_courant += 1;
+            }
+            times.push(model.state().time);
+        }
+        assert!(
+            limited_by_courant > 0,
+            "the Courant condition must be active"
+        );
+        for event in [1.0, 1.5, 2.0, 3.0] {
+            assert!(times.contains(&event), "t = {event} must be hit exactly");
+        }
+        assert_eq!(model.state().time, 3.0);
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+        let water = model.water_balance();
+        assert!(water.inflow > 0.0);
+        assert!(water.error().abs() <= 1e-10 * water.inflow, "{water:?}");
+    }
+
+    /// `run_with` は出力のたびに呼ばれ、直前の出力からのステップ数を渡す。
+    #[test]
+    fn run_with_reports_progress_at_each_output() {
+        let mut model =
+            Model::new(channel_config("progress", "", "dt = 0.1")).expect("the channel must build");
+        let mut outputs = Vec::new();
+        model
+            .run_with(|model, progress| {
+                outputs.push((model.state().time, progress.steps, progress.dt_min));
+            })
+            .expect("the run must succeed");
+        assert_eq!(outputs.len(), 3);
+        for (k, &(time, steps, dt)) in outputs.iter().enumerate() {
+            assert!((time - (k + 1) as f64).abs() < 1e-12);
+            assert_eq!(steps, 10);
+            assert_eq!(dt, 0.1);
+        }
+        // 初期状態を含めて 4 回書く
+        assert_eq!(model.writer.entries().len(), 4);
     }
 }
