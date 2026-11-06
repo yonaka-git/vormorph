@@ -61,4 +61,13 @@
 - `model::Model::run_with`（出力のたびに直前の出力からの記録 `model::Progress` を渡す）、`Model::finished`、`Model::time_step`
 - コマンドライン `vormorph run <config.toml>`：計算を実行し、出力時刻ごとに時刻・ステップ数・時間刻み・クーラン数・反復回数・水の収支の誤差を表示する。バイナリを実行するテスト `tests/cli.rs`
 - 例題 `examples/sill.toml` を可変の時間刻み（`courant = 0.5`、`dt_max = 0.2`）に変更。固定の 0.2 s では、床止めの直下の射流で移流の局所クーラン数が 1.75 になり、安全策が毎ステップ約 860 辺で働いていた。乾いた状態から定常になるまで約 500 s かかるので、`morphology_start` を 300 s から 600 s に延ばした
+- 掃流砂量式 `sediment::formulas`：Meyer-Peter & Müller 式、芦田・道上式（有効掃流力 τ*e = τ*）、長谷川の式による勾配補正の係数 γ。係数は原著で確認。手計算の値と比べる単体テスト
+- 辺の掃流砂 `sediment::SedimentSolver::compute_bedload`（ADR-0011）：流れを進めた後の流速と、流れの計算と同じ辺の水深・流速の大きさ（`hydro::edge_speed` を公開）で掃流力を求め、勾配補正は全方向に2点差分でかける。上流端（平衡給砂）と下流端（自由流出）の辺は、内側のセルの河床勾配（最小二乗。`sediment::bed_gradient`）を外挿して同じ式で求める。非侵食層より上の土砂量で流出を頭打ちにする。`BedloadReport`
+- 河床の更新 `sediment::SedimentSolver::update_bed`（ADR-0012）：Exner 式と MORFAC、安息角補正（緩和係数 0.5 の Jacobi 型の反復。辺の配列に書いてセルで集め、体積を厳密に保存。非侵食層より上の量で頭打ち）、水位の調整（水深が `dry_depth` 以上なら水位、未満なら水深を保つ）。`BedUpdateReport`
+- `model::Model` に河床変動を組み込む：`morphology_start` の後に掃流砂と河床を更新し、土砂の収支（`SedimentBalance`）と、水位を保ったことによる水の体積の変化（`MassBalance::bed_exchange`）を記録する。`Model::sediment`、`Model::last_sediment_report`、`model::SedimentStepReport`。`Progress` に河床の変化の最大値と安息角補正の反復回数を追加。`[sediment]` を拒否していたのをやめ、未実装の浮遊砂（`[sediment.suspended]`）だけを拒否する
+- `vormorph run` の表示に、1ステップの河床の変化の最大値と土砂の収支の誤差を追加
+- 移動床（`[sediment]`）と下流端の水深一定の境界の組み合わせを、設定の誤りにする（水位が河床とともに上下し、下流端から河床低下が進むため。ADR-0011）。`examples/sill.toml` の下流端を水位固定（1.07 m）に変更
+- VTK 出力に、掃流砂量ベクトル `qb`（辺の q_b を Perot 法と同じ式でセル中心へ再構成）と非侵食層の印 `fixed_bed` を追加（移動床のとき）。`VtkWriter::write_step` に辺の掃流砂量の引数を追加
+- 検証ケース V12（平衡河床の保持）を追加・実装。等流に平衡給砂を与え、正方形配置と格子生成ツールの不規則な格子（凸な角を含む）で河床の変化が丸め誤差の水準（$10^{-14}$ m 以下）であることを確かめる。格子生成ツールの入力例 `examples/domains/straight.toml` と、テスト用の格子 `tests/data/straight_coarse.mesh.toml`
+- `docs/design/overview.md` の第4.6節・第4.8節・第6章・第7章を更新。ADR-0011、ADR-0012
 - ライセンス：MIT OR Apache-2.0

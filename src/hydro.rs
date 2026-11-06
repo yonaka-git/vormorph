@@ -622,8 +622,9 @@ fn outflow_rate(mesh: &Mesh, state: &State, edge_flux: &[f64]) -> f64 {
 /// 辺 `e` での流速の大きさ |u|_j \[m/s\]。
 ///
 /// 法線成分は u_j、接線成分は両側のセルの Perot 流速の平均（境界辺では内側のセルの値）の
-/// 接線方向の成分とする。
-fn edge_speed(mesh: &Mesh, state: &State, e: usize) -> f64 {
+/// 接線方向の成分とする。摩擦係数と、掃流砂の掃流力（[`crate::sediment`]）で同じ値を使う。
+/// 一様流では、Perot 法の再構成が厳密なので、元の速さに丸め誤差の範囲で一致する。
+pub fn edge_speed(mesh: &Mesh, state: &State, e: usize) -> f64 {
     let [c1, c2] = mesh.cells_on_edge[e];
     let [mut vx, mut vy] = state.u_cell[c1];
     if c2 != NONE {

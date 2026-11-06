@@ -95,7 +95,7 @@ fn cells_points_and_fields_are_written() {
     assert_eq!(n, 17);
     let mut writer = VtkWriter::new(output_dir("fields"), "case", DRY_DEPTH);
     let path = writer
-        .write_step(&mesh, &state, &zb_initial)
+        .write_step(&mesh, &state, &zb_initial, None)
         .expect("write .vtu");
     assert!(path.ends_with("case_000000.vtu"), "{}", path.display());
     let text = fs::read_to_string(&path).expect("read back");
@@ -158,7 +158,7 @@ fn collection_lists_every_step() {
     for time in [0.0, 30.0, 60.0] {
         state.time = time;
         writer
-            .write_step(&mesh, &state, &zb_initial)
+            .write_step(&mesh, &state, &zb_initial, None)
             .expect("write .vtu");
     }
     let path = writer.write_collection().expect("write .pvd");
@@ -183,18 +183,58 @@ fn invalid_states_are_rejected_without_writing() {
     let mut writer = VtkWriter::new(&dir, "case", DRY_DEPTH);
 
     let err = writer
-        .write_step(&mesh, &state, &zb_initial[1..])
+        .write_step(&mesh, &state, &zb_initial[1..], None)
         .expect_err("zb_initial is too short");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(err.to_string().contains("zb_initial"), "{err}");
 
     state.u_cell[3] = [f64::NAN, 0.0];
     let err = writer
-        .write_step(&mesh, &state, &zb_initial)
+        .write_step(&mesh, &state, &zb_initial, None)
         .expect_err("NaN velocity");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("velocity[6]"), "{err}");
 
     assert!(writer.entries().is_empty());
     assert!(!dir.exists(), "nothing must be written");
+}
+
+/// 移動床のときは、辺の掃流砂量をセル中心へ再構成した `qb` と、非侵食層の印 `fixed_bed` を書く。
+/// 一様な掃流砂量なら、`qb` は丸め誤差の範囲で元のベクトルに一致する。固定床では書かない。
+#[test]
+fn bedload_fields_are_written_for_a_movable_bed() {
+    let (mesh, mut state, zb_initial) = case();
+    let n = mesh.n_cells();
+    state.z_ne[0] = state.zb[0];
+    let (qx, qy) = (1.0e-3, -4.0e-4);
+    let bedload: Vec<f64> = mesh
+        .normal_edge
+        .iter()
+        .map(|n| qx * n[0] + qy * n[1])
+        .collect();
+    let mut writer = VtkWriter::new(output_dir("bedload"), "case", DRY_DEPTH);
+    let path = writer
+        .write_step(&mesh, &state, &zb_initial, Some(&bedload))
+        .expect("write .vtu");
+    let text = fs::read_to_string(&path).expect("read back");
+    let qb = array(&text, "qb");
+    assert_eq!(qb.len(), 3 * n);
+    for cell in qb.chunks(3) {
+        assert!((cell[0] - qx).abs() < 1e-17 && (cell[1] - qy).abs() < 1e-17 && cell[2] == 0.0);
+    }
+    let fixed = array(&text, "fixed_bed");
+    assert_eq!(fixed[0], 1.0);
+    assert!(fixed[1..].iter().all(|&f| f == 0.0));
+
+    let err = writer
+        .write_step(&mesh, &state, &zb_initial, Some(&bedload[1..]))
+        .expect_err("wrong length");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("bedload"), "{err}");
+
+    let path = writer
+        .write_step(&mesh, &state, &zb_initial, None)
+        .expect("write .vtu");
+    let text = fs::read_to_string(&path).expect("read back");
+    assert!(!text.contains("Name=\"qb\"") && !text.contains("Name=\"fixed_bed\""));
 }

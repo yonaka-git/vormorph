@@ -423,6 +423,10 @@ pub enum DownstreamBoundary {
         level: f64,
     },
     /// 水深を一定に保つ（境界セルの河床高に `depth` を加えた値を、境界辺の上の水位とする）。
+    ///
+    /// 移動床（`[sediment]`）とは組み合わせられない。水位が下流端の河床とともに上下するので、
+    /// 河床が下がると水面勾配が増えてさらに掘れ、上がると堰上げでさらに堆積する（正の
+    /// フィードバック）。等流の平衡河床でも、下流端から河床低下が進む（ADR-0011）。
     Depth {
         /// 水深 h \[m\]。
         depth: f64,
@@ -698,7 +702,11 @@ impl Config {
                 "boundary.downstream.level must be finite",
             ),
             DownstreamBoundary::Depth { depth } => {
-                require(positive(*depth), "boundary.downstream.depth must be > 0")
+                require(positive(*depth), "boundary.downstream.depth must be > 0");
+                require(
+                    self.sediment.is_none(),
+                    "boundary.downstream: kind = \"depth\" cannot be used with [sediment] (the water level follows the outlet bed, so the outlet erodes or aggrades without limit); use kind = \"water_level\"",
+                );
             }
             DownstreamBoundary::Wall => {}
         }
@@ -1008,6 +1016,34 @@ mod tests {
     }
 
     #[test]
+    fn depth_boundary_is_rejected_with_a_movable_bed() {
+        let text = SILL.replacen(
+            "kind = \"water_level\"\nlevel = 1.07",
+            "kind = \"depth\"\ndepth = 1.07",
+            1,
+        );
+        assert_ne!(text, SILL, "sill.toml has a water level boundary");
+        let messages = invalid_messages(text.parse());
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("cannot be used with [sediment]")),
+            "{messages:?}"
+        );
+        let start = text
+            .find("\n[sediment]\n")
+            .expect("sill.toml has [sediment]");
+        let end = text
+            .find("\n[boundary.upstream]\n")
+            .expect("sill.toml has [boundary.upstream]");
+        let fixed_bed = format!("{}{}", &text[..start], &text[end..]);
+        assert!(
+            fixed_bed.parse::<Config>().is_ok(),
+            "a fixed bed may use it"
+        );
+    }
+
+    #[test]
     fn physics_section_can_be_omitted() {
         let start = SILL.find("\n[physics]\n").expect("sill.toml has [physics]");
         let end = SILL.find("\n[time]\n").expect("sill.toml has [time]");
@@ -1027,7 +1063,10 @@ mod tests {
             summary.contains("upstream   : discharge 40 m^3/s"),
             "{summary}"
         );
-        assert!(summary.contains("downstream : depth 1.07 m"), "{summary}");
+        assert!(
+            summary.contains("downstream : water level 1.07 m"),
+            "{summary}"
+        );
         assert!(!summary.contains('{'), "Debug output leaked: {summary}");
     }
 }

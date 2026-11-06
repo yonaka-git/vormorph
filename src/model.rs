@@ -21,10 +21,11 @@
 //!      までの残りが Δt 以下ならちょうどそこまで進め、時刻をその値にそろえる。残りが 2Δt 未満
 //!      なら、半分ずつ2ステップで進める（極端に短いステップを作らないため）。ADR-0010。
 //! 2. [`HydroSolver::step`] で η と u_n を時刻 n+1 へ進める。
-//! 3. t > `time.morphology_start` かつ移動床なら、
-//!    [`SedimentSolver::compute_bedload`]、[`SedimentSolver::step_suspended`]、
-//!    [`SedimentSolver::update_bed`] の順に流砂と河床を更新する（流砂は未実装なので、
-//!    `[sediment]` のある設定は組み立ての時点でエラーにする）。
+//! 3. t > `time.morphology_start` かつ移動床なら、[`SedimentSolver::compute_bedload`] と
+//!    [`SedimentSolver::update_bed`] で掃流砂と河床を更新し、土砂の収支（[`SedimentBalance`]）と、
+//!    湛水セルの水位を保ったことによる水の体積の変化（[`MassBalance::bed_exchange`]）を加える。
+//!    浮遊砂（[`SedimentSolver::step_suspended`]）は未実装なので、`[sediment.suspended]` の
+//!    ある設定は組み立ての時点でエラーにする。
 //! 4. 水の収支（[`MassBalance`]）を更新する。上流端・下流端の流量は、連続式と同じ θ 平均流量
 //!    （[`HydroSolver::theta_flux`]）から求める。
 //! 5. 出力時刻なら [`VtkWriter::write_step`] で書き出す。[`Model::run`] は最初に初期状態も書く。
@@ -49,7 +50,7 @@ use crate::hydro::{self, HydroError, HydroParams, HydroSolver, StepReport};
 use crate::io::VtkWriter;
 use crate::mesh::channel::{self, ChannelSpec};
 use crate::mesh::{EdgeKind, Mesh, MeshError};
-use crate::sediment::{SedimentParams, SedimentSolver};
+use crate::sediment::{BedUpdateReport, BedloadReport, SedimentParams, SedimentSolver};
 use crate::state::State;
 use std::error::Error;
 use std::fmt;
@@ -193,6 +194,17 @@ pub struct Model {
     steps: u64,
     /// 次に出力する時刻 \[s\]
     next_output: f64,
+    /// 直前のステップの流砂の記録（河床変動を計算しなかったステップでは `None`）
+    last_sediment: Option<SedimentStepReport>,
+}
+
+/// 1ステップの流砂の記録。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SedimentStepReport {
+    /// 掃流砂量の計算。
+    pub bedload: BedloadReport,
+    /// 河床の更新。
+    pub bed: BedUpdateReport,
 }
 
 /// [`Model::run_with`] が出力のたびに渡す、直前の出力からの計算の記録。
@@ -212,6 +224,14 @@ pub struct Progress {
     pub pcg_iterations: usize,
     /// 移流の重みを頭打ちにした辺の数の合計（[`StepReport::limited_edges`]）。
     pub limited_edges: usize,
+    /// 河床変動を計算したステップの数。
+    pub morphology_steps: u64,
+    /// 1ステップの河床高の変化量の最大値 \[m\]（[`BedUpdateReport::max_change`]）。
+    pub max_bed_change: f64,
+    /// 1ステップの安息角補正の反復回数の最大値。
+    pub max_avalanche_iterations: usize,
+    /// 安息角補正が反復の上限までに収束しなかったステップの数。
+    pub unconverged_avalanches: u64,
 }
 
 impl Default for Progress {
@@ -224,13 +244,17 @@ impl Default for Progress {
             max_newton_iterations: 0,
             pcg_iterations: 0,
             limited_edges: 0,
+            morphology_steps: 0,
+            max_bed_change: 0.0,
+            max_avalanche_iterations: 0,
+            unconverged_avalanches: 0,
         }
     }
 }
 
 impl Progress {
-    /// 1ステップの記録を加える。
-    pub fn add(&mut self, report: &StepReport) {
+    /// 1ステップの記録を加える。`sediment` は河床変動を計算したステップの記録。
+    pub fn add(&mut self, report: &StepReport, sediment: Option<&SedimentStepReport>) {
         self.steps += 1;
         self.dt_min = self.dt_min.min(report.dt);
         self.dt_max = self.dt_max.max(report.dt);
@@ -238,6 +262,14 @@ impl Progress {
         self.max_newton_iterations = self.max_newton_iterations.max(report.newton_iterations);
         self.pcg_iterations += report.pcg_iterations;
         self.limited_edges += report.limited_edges;
+        if let Some(sediment) = sediment {
+            let bed = &sediment.bed;
+            self.morphology_steps += 1;
+            self.max_bed_change = self.max_bed_change.max(bed.max_change);
+            self.max_avalanche_iterations =
+                self.max_avalanche_iterations.max(bed.avalanche_iterations);
+            self.unconverged_avalanches += u64::from(bed.avalanche_unconverged);
+        }
     }
 }
 
@@ -290,8 +322,8 @@ impl Model {
     /// - `u_cell` を `u_n` から Perot 法で再構成する。
     ///
     /// 配列の長さが格子と合わないとき、流量境界なのに上流端の辺がないとき、水位・水深境界
-    /// なのに下流端の辺がないとき、まだ実装していない流砂（`[sediment]`）を含むときは
-    /// [`ModelError::Setup`] を返す。
+    /// なのに下流端の辺がないとき、まだ実装していない浮遊砂（`[sediment.suspended]`）を含む
+    /// ときは [`ModelError::Setup`] を返す。
     pub fn with_state(config: Config, mesh: Mesh, mut state: State) -> Result<Self, ModelError> {
         config.validate()?;
         check_setup(&config, &mesh, &state)?;
@@ -342,6 +374,7 @@ impl Model {
             },
             time_step,
             steps: 0,
+            last_sediment: None,
             config,
             mesh,
             state,
@@ -384,6 +417,16 @@ impl Model {
     /// 土砂の収支。
     pub fn sediment_balance(&self) -> &SedimentBalance {
         &self.sediment_balance
+    }
+
+    /// 流砂のソルバー（固定床なら `None`）。
+    pub fn sediment(&self) -> Option<&SedimentSolver> {
+        self.sediment.as_ref()
+    }
+
+    /// 直前のステップの流砂の記録（そのステップで河床変動を計算しなかったら `None`）。
+    pub fn last_sediment_report(&self) -> Option<&SedimentStepReport> {
+        self.last_sediment.as_ref()
     }
 
     /// 時間刻みの決め方。
@@ -432,13 +475,17 @@ impl Model {
         self.water.inflow += dt * inflow;
         self.water.outflow += dt * outflow;
 
+        self.last_sediment = None;
         if let Some(sediment) = self.sediment.as_mut() {
             if self.state.time > self.config.time.morphology_start {
-                // 河床変動の段階で、河床の更新による水の体積の変化（bed_exchange）と
-                // 土砂の収支を加える。
-                sediment.compute_bedload(&self.mesh, &self.state, dt);
-                sediment.step_suspended(&self.mesh, &mut self.state, self.hydro.theta_flux(), dt);
-                sediment.update_bed(&self.mesh, &mut self.state, dt);
+                let bedload = sediment.compute_bedload(&self.mesh, &self.state, dt);
+                let bed = sediment.update_bed(&self.mesh, &mut self.state, dt);
+                self.water.bed_exchange += bed.water_volume_change;
+                let balance = &mut self.sediment_balance;
+                balance.bed_change += bed.bed_volume_change;
+                balance.inflow += bedload.inflow;
+                balance.outflow += bedload.outflow;
+                self.last_sediment = Some(SedimentStepReport { bedload, bed });
             }
         }
         self.water.volume = water_volume(&self.mesh, &self.state);
@@ -497,7 +544,7 @@ impl Model {
         while !self.finished() {
             let written = self.writer.entries().len();
             let report = self.step()?;
-            progress.add(&report);
+            progress.add(&report, self.last_sediment.as_ref());
             if self.writer.entries().len() > written {
                 on_output(self, &progress);
                 progress = Progress::default();
@@ -508,8 +555,12 @@ impl Model {
 
     /// 現在の状態を `.vtu` に書き、`.pvd` を書き直す（出力時刻とは別に書きたいとき）。
     pub fn write_output(&mut self) -> Result<(), ModelError> {
-        self.writer
-            .write_step(&self.mesh, &self.state, &self.zb_initial)?;
+        self.writer.write_step(
+            &self.mesh,
+            &self.state,
+            &self.zb_initial,
+            self.sediment.as_ref().map(SedimentSolver::bedload_flux),
+        )?;
         self.writer.write_collection()?;
         Ok(())
     }
@@ -544,9 +595,13 @@ fn check_setup(config: &Config, mesh: &Mesh, state: &State) -> Result<(), ModelE
         problems
             .push("a water level or depth boundary needs downstream edges in the mesh".to_owned());
     }
-    if config.sediment.is_some() {
+    if config
+        .sediment
+        .as_ref()
+        .is_some_and(|sediment| sediment.suspended.is_some())
+    {
         problems.push(
-            "sediment transport is not implemented yet: remove [sediment] to run a fixed-bed simulation"
+            "suspended sediment is not implemented yet: remove [sediment.suspended] to compute bedload only"
                 .to_owned(),
         );
     }
@@ -762,8 +817,8 @@ manning_n = 0.03
 kind = "discharge"
 discharge = 0.5
 [boundary.downstream]
-kind = "depth"
-depth = 0.2
+kind = "water_level"
+level = 0.7
 [output]
 dir = {dir:?}
 interval = 1.0
@@ -826,7 +881,7 @@ height = 1.0
     }
 
     #[test]
-    fn new_rejects_file_meshes_and_sediment_for_now() {
+    fn new_rejects_file_meshes_and_suspended_sediment_for_now() {
         let mut config = channel_config("reject", "", "dt = 0.1");
         config.mesh = MeshConfig::File {
             path: "mesh.toml".into(),
@@ -838,15 +893,53 @@ height = 1.0
         );
 
         let mut config = channel_config("reject", "", "dt = 0.1");
-        config.sediment =
-            crate::config::Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sill.toml"))
-                .expect("examples/sill.toml must be valid")
-                .sediment;
+        let mut sediment = sill_sediment();
+        sediment.suspended = Some(crate::config::SuspendedConfig {
+            entrainment: crate::config::EntrainmentFormula::GarciaParker,
+            min_depth: 0.05,
+            diffusivity_coef: 0.15,
+        });
+        config.sediment = Some(sediment);
         let err = Model::new(config).unwrap_err();
         assert!(
-            matches!(&err, ModelError::Setup(m) if m.contains("sediment transport is not implemented")),
+            matches!(&err, ModelError::Setup(m) if m.contains("suspended sediment is not implemented")),
             "{err}"
         );
+    }
+
+    /// `examples/sill.toml` の流砂の設定（掃流砂だけ）。
+    fn sill_sediment() -> crate::config::SedimentConfig {
+        Config::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sill.toml"))
+            .expect("examples/sill.toml must be valid")
+            .sediment
+            .expect("examples/sill.toml has [sediment]")
+    }
+
+    /// 移動床でも、土砂と水の収支が丸め誤差の範囲で合う。床止めのセルは非侵食層より下がらない。
+    #[test]
+    fn movable_bed_keeps_sediment_and_water_balances() {
+        let mut config = channel_config("movable", SILL, "courant = 0.5\ndt_max = 0.2");
+        config.sediment = Some(sill_sediment());
+        config.time.morphology_start = 1.0;
+        let mut model = Model::new(config).expect("the channel must build");
+        let mut morphology_steps = 0;
+        while !model.finished() {
+            model.step().expect("the step must succeed");
+            if let Some(report) = model.last_sediment_report() {
+                morphology_steps += 1;
+                assert!(report.bed.max_change.is_finite());
+            }
+            let state = model.state();
+            assert!((0..state.zb.len()).all(|c| state.zb[c] >= state.z_ne[c]));
+            assert!((0..state.zb.len()).all(|c| state.eta[c] >= state.zb[c]));
+        }
+        assert!(morphology_steps > 0);
+        let sediment = model.sediment_balance();
+        assert!(sediment.inflow > 0.0, "{sediment:?}");
+        let scale = sediment.inflow + sediment.outflow + sediment.bed_change.abs();
+        assert!(sediment.error().abs() <= 1e-12 * scale, "{sediment:?}");
+        let water = model.water_balance();
+        assert!(water.error().abs() <= 1e-10 * water.inflow, "{water:?}");
     }
 
     /// 可変の時間刻みは上限とクーラン数を守り、出力時刻・河床変動の開始時刻・終了時刻に
