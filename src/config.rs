@@ -159,16 +159,68 @@ impl Default for PhysicsConfig {
 }
 
 /// 時間積分の設定。時刻はすべて流れの時間（MORFAC を掛ける前）で表す。
+///
+/// 時間刻みは、固定（`dt`）か可変（`courant` と `dt_max`）のどちらか一方で与える
+/// （[`TimeConfig::step_control`]）。可変のときは、各ステップの初めに、セルから1ステップで
+/// 流出する体積がセルの体積の `courant` 倍以下になる最大の値を、`dt_max` で頭打ちにして使う
+/// （ADR-0010）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeConfig {
-    /// 時間刻み Δt \[s\]。移流の CFL 条件で上限が決まる（重力波には制約されない）。
-    pub dt: f64,
+    /// 固定の時間刻み Δt \[s\]。移流の CFL 条件で上限が決まる（重力波には制約されない）。
+    /// `courant` と同時には書けない。
+    pub dt: Option<f64>,
+    /// 可変の時間刻みの目標のクーラン数 C（0 < C ≤ 1）\[-\]。セルの流出量の比
+    /// Δt Σ_流出 L_j q_j / V_i の最大値がこの値になるように Δt を決める。`dt` と同時には書けない。
+    pub courant: Option<f64>,
+    /// 可変の時間刻みの上限 \[s\]。`courant` を書くときは必須（流れのない状態から始めると、
+    /// クーラン数の条件からは時間刻みが決まらないため）。
+    pub dt_max: Option<f64>,
     /// 計算の終了時刻 \[s\]。
     pub end: f64,
     /// 河床変動の計算を始める時刻 \[s\]。それまでは固定床で流れだけを解く（助走計算）。
     #[serde(default)]
     pub morphology_start: f64,
+}
+
+/// 時間刻みの決め方（[`TimeConfig::step_control`] が設定から作る）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TimeStep {
+    /// 固定の時間刻み。
+    Fixed {
+        /// 時間刻み Δt \[s\]。
+        dt: f64,
+    },
+    /// クーラン数で決める可変の時間刻み。
+    Adaptive {
+        /// 目標のクーラン数（セルの流出量の比の最大値）\[-\]。
+        courant: f64,
+        /// 時間刻みの上限 \[s\]。
+        dt_max: f64,
+    },
+}
+
+impl TimeStep {
+    /// 時間刻みの上限 \[s\]（固定ならその値）。時刻の比較の許容差の目安に使う。
+    pub fn max_dt(self) -> f64 {
+        match self {
+            Self::Fixed { dt } => dt,
+            Self::Adaptive { dt_max, .. } => dt_max,
+        }
+    }
+}
+
+impl TimeConfig {
+    /// 時間刻みの決め方。`dt` だけなら固定、`courant` と `dt_max` なら可変。それ以外の
+    /// 組み合わせ（両方ある、どちらもない、`courant` に `dt_max` がない、`dt` に `dt_max` が
+    /// ある）は `None`（[`Config::validate`] がエラーにする）。
+    pub fn step_control(&self) -> Option<TimeStep> {
+        match (self.dt, self.courant, self.dt_max) {
+            (Some(dt), None, None) => Some(TimeStep::Fixed { dt }),
+            (None, Some(courant), Some(dt_max)) => Some(TimeStep::Adaptive { courant, dt_max }),
+            _ => None,
+        }
+    }
 }
 
 /// 流れの計算の設定。
@@ -529,11 +581,43 @@ impl Config {
         );
 
         let time = &self.time;
-        require(positive(time.dt), "time.dt must be > 0");
-        require(
-            positive(time.end) && time.dt <= time.end,
-            "time.end must be > 0 and >= time.dt",
-        );
+        require(positive(time.end), "time.end must be > 0");
+        match (time.dt, time.courant, time.dt_max) {
+            (Some(_), Some(_), _) => require(
+                false,
+                "time: give either dt (fixed time step) or courant (adaptive time step), not both",
+            ),
+            (None, None, _) => require(
+                false,
+                "time: dt (fixed time step) or courant (adaptive time step) is required",
+            ),
+            (Some(dt), None, dt_max) => {
+                require(
+                    positive(dt) && dt <= time.end,
+                    "time.dt must be > 0 and <= time.end",
+                );
+                require(
+                    dt_max.is_none(),
+                    "time.dt_max is used only with time.courant (adaptive time step)",
+                );
+            }
+            (None, Some(courant), dt_max) => {
+                require(
+                    positive(courant) && courant <= 1.0,
+                    "time.courant must be in (0, 1]",
+                );
+                match dt_max {
+                    Some(dt_max) => require(
+                        positive(dt_max) && dt_max <= time.end,
+                        "time.dt_max must be > 0 and <= time.end",
+                    ),
+                    None => require(
+                        false,
+                        "time.dt_max is required with time.courant (the Courant condition gives no bound while nothing flows)",
+                    ),
+                }
+            }
+        }
         require(
             time.morphology_start.is_finite() && time.morphology_start >= 0.0,
             "time.morphology_start must be >= 0",
@@ -721,10 +805,18 @@ impl fmt::Display for Summary<'_> {
                 )?,
             }
         }
+        match c.time.step_control() {
+            Some(TimeStep::Fixed { dt }) => write!(f, "time       : dt {dt} s")?,
+            Some(TimeStep::Adaptive { courant, dt_max }) => write!(
+                f,
+                "time       : adaptive dt (Courant {courant}, dt <= {dt_max} s)"
+            )?,
+            None => write!(f, "time       : invalid time step")?,
+        }
         writeln!(
             f,
-            "time       : dt {} s, end {} s, morphology from {} s",
-            c.time.dt, c.time.end, c.time.morphology_start
+            ", end {} s, morphology from {} s",
+            c.time.end, c.time.morphology_start
         )?;
         writeln!(
             f,
@@ -822,9 +914,11 @@ mod tests {
             }
             other => panic!("expected ConfigError::Invalid, got {other:?}"),
         }
-        let start = text.find("[sediment]").expect("sill.toml has [sediment]");
+        let start = text
+            .find("\n[sediment]\n")
+            .expect("sill.toml has [sediment]");
         let end = text
-            .find("[boundary.upstream]")
+            .find("\n[boundary.upstream]\n")
             .expect("sill.toml has [boundary.upstream]");
         let fixed_bed = format!("{}{}", &text[..start], &text[end..]);
         let config: Config = fixed_bed.parse().expect("n = 0 is valid on a fixed bed");
@@ -859,10 +953,64 @@ mod tests {
         ));
     }
 
+    /// `[time]` の時間刻みの行を `lines` に置き換えた設定。
+    fn with_time_step(lines: &str) -> Result<Config, ConfigError> {
+        let start = SILL.find("\n[time]\n").expect("sill.toml has [time]");
+        let end = SILL[start..]
+            .find("end =")
+            .map(|i| start + i)
+            .expect("sill.toml has time.end");
+        format!("{}[time]\n{lines}\n{}", &SILL[..start], &SILL[end..]).parse()
+    }
+
+    fn invalid_messages(result: Result<Config, ConfigError>) -> Vec<String> {
+        match result {
+            Err(ConfigError::Invalid(messages)) => messages,
+            other => panic!("expected ConfigError::Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time_step_is_either_fixed_or_adaptive() {
+        let fixed = with_time_step("dt = 0.1").expect("a fixed dt is valid");
+        assert_eq!(fixed.time.step_control(), Some(TimeStep::Fixed { dt: 0.1 }));
+        let adaptive =
+            with_time_step("courant = 0.5\ndt_max = 0.2").expect("an adaptive dt is valid");
+        assert_eq!(
+            adaptive.time.step_control(),
+            Some(TimeStep::Adaptive {
+                courant: 0.5,
+                dt_max: 0.2
+            })
+        );
+        assert!(
+            adaptive
+                .summary()
+                .to_string()
+                .contains("adaptive dt (Courant 0.5, dt <= 0.2 s)")
+        );
+
+        for (lines, expected) in [
+            ("dt = 0.1\ncourant = 0.5\ndt_max = 0.2", "not both"),
+            ("", "is required"),
+            ("courant = 0.5", "time.dt_max is required"),
+            ("dt = 0.1\ndt_max = 0.2", "used only with time.courant"),
+            ("courant = 1.5\ndt_max = 0.2", "time.courant"),
+            ("courant = 0.5\ndt_max = 0.0", "time.dt_max"),
+            ("dt = -0.1", "time.dt"),
+        ] {
+            let messages = invalid_messages(with_time_step(lines));
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "{lines:?}: {messages:?}"
+            );
+        }
+    }
+
     #[test]
     fn physics_section_can_be_omitted() {
-        let start = SILL.find("[physics]").expect("sill.toml has [physics]");
-        let end = SILL.find("[time]").expect("sill.toml has [time]");
+        let start = SILL.find("\n[physics]\n").expect("sill.toml has [physics]");
+        let end = SILL.find("\n[time]\n").expect("sill.toml has [time]");
         let text = format!("{}{}", &SILL[..start], &SILL[end..]);
         let config: Config = text.parse().expect("valid without [physics]");
         assert_eq!(config.physics, PhysicsConfig::default());

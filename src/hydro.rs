@@ -82,6 +82,8 @@
 //!    H_j は風上側の水位から辺の河床高 max(z_{b,1}, z_{b,2}) を引いた値（Stelling & Duinmeijer,
 //!    2003）。上流端の流量 Q を、通水能に比例して境界辺に配分する（上の「境界条件」）。
 //!    辺の単位幅流量 q_j^n = H_j^n u_j^n（流量境界では配分した流入量）を求める。
+//!    この流量で、セルの流出量の比（クーラン数）Δt max_i Σ_流出 L q / V を記録する
+//!    （[`HydroSolver::max_outflow_rate`]。可変の時間刻みはこの比から決める。ADR-0010）。
 //! 2. 移流を保存型の風上差分で陽的に評価し、F u_j^n を求める（[`advection`]、上の「移流」）。
 //!    `hydro.advection = "none"` のときは F u_j^n = u_j^n とする。
 //! 3. 摩擦係数 γ_j、G_j、重み w_j、右辺 b_i を組み立てる。
@@ -143,6 +145,11 @@ impl HydroParams {
 /// 1ステップの計算の記録。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct StepReport {
+    /// 時間刻み Δt \[s\]。
+    pub dt: f64,
+    /// セルの流出量の比（クーラン数）Δt Σ_{流出する辺} L_j q_j^n / V_i の最大値 \[-\]。
+    /// 1 以下なら、陽的に扱う部分で水深が負にならない（[`HydroSolver::max_outflow_rate`]）。
+    pub outflow_courant: f64,
     /// Newton 法の反復回数（解いた線形系の数）。
     pub newton_iterations: usize,
     /// PCG の反復回数の合計。
@@ -359,18 +366,26 @@ impl HydroSolver {
         &self.theta_flux
     }
 
-    /// 時刻を `dt` だけ進め、`state` の η, u_n, u_cell を更新する。
+    /// 時刻 n の状態で、セルの流出量の比 max_i Σ_{流出する辺} L_j q_j^n / V_i \[1/s\] を返す。
     ///
-    /// `state` は、全セルで η ≥ z_b、壁の辺で u_n = 0、`u_cell` が `u_n` を再構成した値で
-    /// あることを前提にする（ステップの最後にこの状態に揃えて返す）。失敗したときの
-    /// `state` は途中の値になる。
-    pub fn step(
+    /// q_j^n = H_j^n u_j^n は [`HydroSolver::step`] の最初の段と同じ値（流量境界の辺は流入なので
+    /// 数えない）。これに Δt を掛けた値が、そのステップのセルの流出量の比（クーラン数）になり、
+    /// 1 以下なら陽的に扱う部分（連続式の辺の水深と移流）で水深が負にならない
+    /// （`docs/design/overview.md` の第7章）。可変の時間刻みは Δt = C / この値で決める
+    /// （ADR-0010）。どのセルからも流出がなければ 0。
+    pub fn max_outflow_rate(
         &mut self,
         mesh: &Mesh,
-        state: &mut State,
+        state: &State,
         boundary: &BoundaryConfig,
-        dt: f64,
-    ) -> Result<StepReport, HydroError> {
+    ) -> f64 {
+        self.prepare_edges(mesh, state, boundary);
+        outflow_rate(mesh, state, &self.edge_flux)
+    }
+
+    /// ステップの最初の段：辺の役割、辺の水深 H_j^n、辺の単位幅流量 q_j^n（流量境界では
+    /// 配分した流入量）、運動量式を解く辺を決める。
+    fn prepare_edges(&mut self, mesh: &Mesh, state: &State, boundary: &BoundaryConfig) {
         let Self {
             params,
             role,
@@ -378,23 +393,8 @@ impl HydroSolver {
             edge_depth,
             edge_flux,
             momentum_edge,
-            advection: advection_workspace,
-            advected,
-            friction,
-            explicit_part,
-            weight,
-            explicit_flux,
-            rhs,
-            wet_area,
-            residual,
-            correction,
-            theta_flux,
-            pcg,
+            ..
         } = self;
-        let (g, theta) = (params.gravity, params.theta);
-        let n2 = params.manning_n * params.manning_n;
-
-        // 1. 辺の役割と辺の水深
         for (e, (r, level)) in role.iter_mut().zip(outside_level.iter_mut()).enumerate() {
             *r = edge_role(mesh, state, boundary, e);
             *level = match *r {
@@ -430,9 +430,51 @@ impl HydroSolver {
                 EdgeRole::Interior | EdgeRole::Level(_) => (h * state.u_n[e], h > 0.0),
             };
         }
+    }
+
+    /// 時刻を `dt` だけ進め、`state` の η, u_n, u_cell を更新する。
+    ///
+    /// `state` は、全セルで η ≥ z_b、壁の辺で u_n = 0、`u_cell` が `u_n` を再構成した値で
+    /// あることを前提にする（ステップの最後にこの状態に揃えて返す）。失敗したときの
+    /// `state` は途中の値になる。
+    pub fn step(
+        &mut self,
+        mesh: &Mesh,
+        state: &mut State,
+        boundary: &BoundaryConfig,
+        dt: f64,
+    ) -> Result<StepReport, HydroError> {
+        // 1. 辺の役割と辺の水深、辺の流量
+        self.prepare_edges(mesh, state, boundary);
+        let Self {
+            params,
+            role,
+            outside_level,
+            edge_depth,
+            edge_flux,
+            momentum_edge,
+            advection: advection_workspace,
+            advected,
+            friction,
+            explicit_part,
+            weight,
+            explicit_flux,
+            rhs,
+            wet_area,
+            residual,
+            correction,
+            theta_flux,
+            pcg,
+        } = self;
+        let (g, theta) = (params.gravity, params.theta);
+        let n2 = params.manning_n * params.manning_n;
+        let mut report = StepReport {
+            dt,
+            outflow_courant: dt * outflow_rate(mesh, state, edge_flux),
+            ..StepReport::default()
+        };
 
         // 2. 移流
-        let mut report = StepReport::default();
         match params.advection {
             AdvectionScheme::Upwind => {
                 let stats = advection(
@@ -555,6 +597,26 @@ impl HydroSolver {
 /// セルの水の体積 V = A max(η − z_b, 0) \[m³\]。
 fn volume(area: f64, eta: f64, zb: f64) -> f64 {
     area * (eta - zb).max(0.0)
+}
+
+/// セルの流出量の比 max_i Σ_{流出する辺} L_j q_j / V_i \[1/s\]（流出がなければ 0）。
+///
+/// 流出する辺の水深は風上側（このセル）の水位から求めるので、流出のあるセルは水深が
+/// `dry_depth` 以上で、V_i > 0 になっている。
+fn outflow_rate(mesh: &Mesh, state: &State, edge_flux: &[f64]) -> f64 {
+    let mut max = 0.0_f64;
+    for c in 0..mesh.n_cells() {
+        let outflow: f64 = mesh.edges_on_cell[c]
+            .iter()
+            .zip(&mesh.edge_sign_on_cell[c])
+            .map(|(&e, &s)| (s * mesh.dv_edge[e] * edge_flux[e]).max(0.0))
+            .sum();
+        if outflow > 0.0 {
+            let v = volume(mesh.area_cell[c], state.eta[c], state.zb[c]);
+            max = max.max(outflow / v);
+        }
+    }
+    max
 }
 
 /// 辺 `e` での流速の大きさ |u|_j \[m/s\]。
@@ -1098,6 +1160,40 @@ mod tests {
         }
         assert_eq!(state.eta, initial.eta);
         assert!(state.u_n.iter().all(|&u| u == 0.0));
+    }
+
+    /// セルの流出量の比は、正方形配置の一様流では u/Δx になり（流量境界の流入は数えない）、
+    /// 流れがなければ 0 になる。`step` の記録の `outflow_courant` は、その Δt 倍。
+    #[test]
+    fn outflow_rate_is_velocity_over_cell_size_in_uniform_flow() {
+        let mesh = mesh(10.0, 2.0, 0.5, ChannelLayout::Rectangular);
+        let (u, h) = (0.8, 1.0);
+        let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+        state.eta.fill(h);
+        for e in 0..mesh.n_edges() {
+            state.u_n[e] = u * mesh.normal_edge[e][0];
+        }
+        reconstruct_cell_velocity(&mesh, &state.u_n, &mut state.u_cell);
+        let boundary = BoundaryConfig {
+            upstream: UpstreamBoundary::Discharge {
+                discharge: u * h * 2.0,
+                sediment_supply: crate::config::SedimentSupply::default(),
+            },
+            downstream: DownstreamBoundary::WaterLevel { level: h },
+        };
+        let mut solver = HydroSolver::new(&mesh, params(0.03));
+        let rate = solver.max_outflow_rate(&mesh, &state, &boundary);
+        assert!((rate - u / 0.5).abs() < 1e-12, "rate = {rate}");
+
+        let dt = 0.1;
+        let report = solver
+            .step(&mesh, &mut state.clone(), &boundary, dt)
+            .expect("the step must succeed");
+        assert_eq!(report.dt, dt);
+        assert!((report.outflow_courant - dt * rate).abs() < 1e-15);
+
+        state.u_n.fill(0.0);
+        assert_eq!(solver.max_outflow_rate(&mesh, &state, &closed()), 0.0);
     }
 
     /// 上流端の流量は、断面で共通の水位から求めた通水能に比例して配分される。
