@@ -59,5 +59,6 @@
 - 設定からモデルを組み立てる `model::Model::new`（`mesh.kind = "channel"`）：直線水路の格子を作り、`[bed]` の河床高と床止め（かさ上げ・非侵食層）を母点で評価する（端にちょうど乗る母点を丸め誤差で取りこぼさないよう、格子幅の $10^{-9}$ 倍の許容差）。初期状態は乾いた河床（η = z_b、u = 0）。`mesh.kind = "file"`（格子ファイルに河床高がない）と、未実装の流砂（`[sediment]`）は `ModelError::Setup` で拒否する。格子の誤り `ModelError::Mesh` を追加
 - 可変の時間刻み（ADR-0010）：`[time]` に `dt`（固定）か `courant` と `dt_max`（可変）のどちらか一方を書く。可変のときは、時刻 n の流量でセルの流出量の比 max_i Σ_流出 L q / V（`hydro::HydroSolver::max_outflow_rate`）を求め、Δt = min(C / 比, `dt_max`) とし、出力時刻・`morphology_start`・終了時刻にちょうど止める。`config::TimeStep`、`ModelError::TimeStep`。`StepReport` に時間刻み `dt` と実際のクーラン数 `outflow_courant` を追加。`docs/design/overview.md` の第5章と第7章を更新
 - `model::Model::run_with`（出力のたびに直前の出力からの記録 `model::Progress` を渡す）、`Model::finished`、`Model::time_step`
+- コマンドライン `vormorph run <config.toml>`：計算を実行し、出力時刻ごとに時刻・ステップ数・時間刻み・クーラン数・反復回数・水の収支の誤差を表示する。バイナリを実行するテスト `tests/cli.rs`
 - 例題 `examples/sill.toml` を可変の時間刻み（`courant = 0.5`、`dt_max = 0.2`）に変更。固定の 0.2 s では、床止めの直下の射流で移流の局所クーラン数が 1.75 になり、安全策が毎ステップ約 860 辺で働いていた。乾いた状態から定常になるまで約 500 s かかるので、`morphology_start` を 300 s から 600 s に延ばした
 - ライセンス：MIT OR Apache-2.0
