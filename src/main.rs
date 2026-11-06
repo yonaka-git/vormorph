@@ -102,6 +102,7 @@ fn run(path: &str) -> ExitCode {
 }
 
 /// 進み具合の1行：時刻、ステップ数、時間刻み、クーラン数、反復回数、水の収支の誤差。
+/// 河床変動を計算したときは、1ステップの河床の変化の最大値と土砂の収支の誤差も加える。
 fn progress_line(model: &Model, progress: &Progress) -> String {
     let dt = match model.time_step() {
         TimeStep::Fixed { dt } => format!("dt {dt} s"),
@@ -125,6 +126,22 @@ fn progress_line(model: &Model, progress: &Progress) -> String {
             " | advection limited on {} edges",
             progress.limited_edges
         ));
+    }
+    if progress.morphology_steps > 0 {
+        let sediment = model.sediment_balance();
+        let scale =
+            (sediment.inflow + sediment.outflow + sediment.bed_change.abs()).max(f64::MIN_POSITIVE);
+        line.push_str(&format!(
+            " | bed change <= {:.2e} m/step | sediment balance {:.1e}",
+            progress.max_bed_change,
+            sediment.error() / scale
+        ));
+        if progress.unconverged_avalanches > 0 {
+            line.push_str(&format!(
+                " | avalanching hit the iteration limit in {} steps",
+                progress.unconverged_avalanches
+            ));
+        }
     }
     line
 }

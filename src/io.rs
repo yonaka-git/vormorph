@@ -28,9 +28,14 @@
 //! | `dzb` | 初期からの河床変動量 | m |
 //! | `velocity` | Perot 法で再構成した流速（3成分、z 成分は 0） | m/s |
 //! | `x_cell`, `y_cell` | 母点の座標 | m |
+//! | `qb` | 掃流砂量ベクトル（移動床のときだけ。3成分、z 成分は 0） | m²/s |
+//! | `fixed_bed` | 非侵食層のあるセルなら 1、なければ 0（移動床のときだけ） | – |
 //!
-//! 辺の法線流速 u_n は出力せず、セル中心へ再構成した値（[`State::u_cell`]）を出す。
+//! 辺の法線流速 u_n は出力せず、セル中心へ再構成した値（[`State::u_cell`]）を出す。掃流砂量も
+//! 同じく、辺の法線成分 q_{b,j} から Perot 法と同じ式で再構成したセル中心のベクトルを出す
+//! （一様な掃流砂量なら厳密）。MORFAC は掛けない（流れの時間あたりの量）。
 
+use crate::hydro::reconstruct_cell_velocity;
 use crate::mesh::Mesh;
 use crate::state::State;
 use std::borrow::Cow;
@@ -71,17 +76,19 @@ impl VtkWriter {
 
     /// 1時刻分の `.vtu` を書き、書いたファイルのパスを返す。
     ///
-    /// `zb_initial` は初期の河床高（`dzb` の計算に使う）。配列の長さが格子と合わない場合は
-    /// [`io::ErrorKind::InvalidInput`]、出力する値に NaN や無限大がある場合は
+    /// `zb_initial` は初期の河床高（`dzb` の計算に使う）。`bedload` は辺の掃流砂量 q_{b,j}
+    /// \[m²/s\]（移動床のとき。`Some` なら `qb` と `fixed_bed` も書く）。配列の長さが格子と
+    /// 合わない場合は [`io::ErrorKind::InvalidInput`]、出力する値に NaN や無限大がある場合は
     /// [`io::ErrorKind::InvalidData`] の誤りを返し、ファイルを書かない。
     pub fn write_step(
         &mut self,
         mesh: &Mesh,
         state: &State,
         zb_initial: &[f64],
+        bedload: Option<&[f64]>,
     ) -> io::Result<PathBuf> {
-        check_lengths(mesh, state, zb_initial)?;
-        let fields = CellFields::new(mesh, state, zb_initial, self.dry_depth);
+        check_lengths(mesh, state, zb_initial, bedload)?;
+        let fields = CellFields::new(mesh, state, zb_initial, bedload, self.dry_depth);
         fields.check_finite(mesh, state.time)?;
 
         fs::create_dir_all(&self.dir)?;
@@ -124,12 +131,18 @@ impl VtkWriter {
 struct CellFields<'a> {
     /// スカラー（名前、値）
     scalars: Vec<(&'static str, Cow<'a, [f64]>)>,
-    /// 流速（`velocity`）
-    velocity: &'a [[f64; 2]],
+    /// 平面のベクトル（名前、値）。最初は流速（`velocity`）
+    vectors: Vec<(&'static str, Cow<'a, [[f64; 2]]>)>,
 }
 
 impl<'a> CellFields<'a> {
-    fn new(mesh: &'a Mesh, state: &'a State, zb_initial: &[f64], dry_depth: f64) -> Self {
+    fn new(
+        mesh: &'a Mesh,
+        state: &'a State,
+        zb_initial: &[f64],
+        bedload: Option<&[f64]>,
+        dry_depth: f64,
+    ) -> Self {
         let n = mesh.n_cells();
         let h = (0..n).map(|c| state.depth(c)).collect();
         let c = (0..n).map(|c| state.concentration(c, dry_depth)).collect();
@@ -139,7 +152,7 @@ impl<'a> CellFields<'a> {
             .zip(zb_initial)
             .map(|(z, z0)| z - z0)
             .collect();
-        let scalars = vec![
+        let mut scalars = vec![
             ("eta", Cow::Borrowed(state.eta.as_slice())),
             ("zb", Cow::Borrowed(state.zb.as_slice())),
             ("h", Cow::Owned(h)),
@@ -148,10 +161,19 @@ impl<'a> CellFields<'a> {
             ("x_cell", Cow::Borrowed(mesh.x_cell.as_slice())),
             ("y_cell", Cow::Borrowed(mesh.y_cell.as_slice())),
         ];
-        Self {
-            scalars,
-            velocity: &state.u_cell,
+        let mut vectors = vec![("velocity", Cow::Borrowed(state.u_cell.as_slice()))];
+        if let Some(bedload) = bedload {
+            let mut qb = vec![[0.0; 2]; n];
+            reconstruct_cell_velocity(mesh, bedload, &mut qb);
+            vectors.push(("qb", Cow::Owned(qb)));
+            let fixed = state
+                .z_ne
+                .iter()
+                .map(|z| if z.is_finite() { 1.0 } else { 0.0 })
+                .collect();
+            scalars.push(("fixed_bed", Cow::Owned(fixed)));
         }
+        Self { scalars, vectors }
     }
 
     /// 書き出す値がすべて有限であることを確かめる。
@@ -162,7 +184,10 @@ impl<'a> CellFields<'a> {
         for (name, values) in &self.scalars {
             check_finite(name, values.iter().copied())?;
         }
-        check_finite("velocity", self.velocity.iter().flatten().copied())
+        for (name, values) in &self.vectors {
+            check_finite(name, values.iter().flatten().copied())?;
+        }
+        Ok(())
     }
 }
 
@@ -229,11 +254,13 @@ fn write_vtu(w: &mut impl Write, mesh: &Mesh, time: f64, fields: &CellFields) ->
         }
         end_array(w)?;
     }
-    begin_array(w, "Float64", Some("velocity"), 3)?;
-    for [u, v] in fields.velocity {
-        writeln!(w, "          {} {} 0", number(*u), number(*v))?;
+    for (name, values) in &fields.vectors {
+        begin_array(w, "Float64", Some(name), 3)?;
+        for [u, v] in values.iter() {
+            writeln!(w, "          {} {} 0", number(*u), number(*v))?;
+        }
+        end_array(w)?;
     }
-    end_array(w)?;
     writeln!(w, "      </CellData>")?;
 
     writeln!(w, "    </Piece>")?;
@@ -289,19 +316,34 @@ fn escape(s: &str) -> String {
     out
 }
 
-fn check_lengths(mesh: &Mesh, state: &State, zb_initial: &[f64]) -> io::Result<()> {
-    let n = mesh.n_cells();
+fn check_lengths(
+    mesh: &Mesh,
+    state: &State,
+    zb_initial: &[f64],
+    bedload: Option<&[f64]>,
+) -> io::Result<()> {
+    let (n, n_edges) = (mesh.n_cells(), mesh.n_edges());
     let lengths = [
-        ("state.eta", state.eta.len()),
-        ("state.zb", state.zb.len()),
-        ("state.hc", state.hc.len()),
-        ("state.u_cell", state.u_cell.len()),
-        ("zb_initial", zb_initial.len()),
+        ("state.eta", state.eta.len(), n, "cells"),
+        ("state.zb", state.zb.len(), n, "cells"),
+        ("state.z_ne", state.z_ne.len(), n, "cells"),
+        ("state.hc", state.hc.len(), n, "cells"),
+        ("state.u_cell", state.u_cell.len(), n, "cells"),
+        ("zb_initial", zb_initial.len(), n, "cells"),
+        (
+            "bedload",
+            bedload.map_or(n_edges, <[f64]>::len),
+            n_edges,
+            "edges",
+        ),
     ];
-    match lengths.iter().find(|&&(_, len)| len != n) {
-        Some((name, len)) => Err(io::Error::new(
+    match lengths
+        .iter()
+        .find(|&&(_, len, expected, _)| len != expected)
+    {
+        Some((name, len, expected, what)) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{name} has {len} values but the mesh has {n} cells"),
+            format!("{name} has {len} values but the mesh has {expected} {what}"),
         )),
         None => Ok(()),
     }

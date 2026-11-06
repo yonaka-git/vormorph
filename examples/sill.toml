@@ -6,10 +6,10 @@
 # 目安：単位幅流量 q = 2 m²/s、n = 0.025 のとき、
 #       等流水深 h = (n q / √I)^(3/5) ≈ 1.07 m、フルード数 ≈ 0.58。
 #
-# 初期状態は乾いた河床で、水は上流端（流量）と下流端（水深一定）から入る。
+# 初期状態は乾いた河床で、水は上流端（流量）と下流端（水位固定）から入る。
 #
-# `vormorph check examples/sill.toml` で設定を検証できる。流砂は未実装なので、
-# `vormorph run` は [sediment] を外した固定床の設定でだけ動く。
+# `vormorph check examples/sill.toml` で設定を検証し、`vormorph run examples/sill.toml` で計算する
+# （掃流砂だけ。浮遊砂は未実装）。
 # 設定キーは src/config.rs と一致させること（config.rs の単体テストがこのファイルを読む）。
 
 title = "sill"
@@ -83,9 +83,11 @@ kind = "discharge"
 discharge = 40.0                # [m³/s]（通水能に比例して境界辺に配分）
 sediment_supply = "equilibrium"
 
+# 下流端は水位を固定する（下流端の河床高 0 m + 等流水深）。移動床では水深一定の境界は使えない
+# （水位が河床とともに上下し、下流端から河床低下が進むため。ADR-0011）。
 [boundary.downstream]
-kind = "depth"
-depth = 1.07                    # 等流水深 [m]
+kind = "water_level"
+level = 1.07                    # [m]
 
 [output]
 dir = "output/sill"

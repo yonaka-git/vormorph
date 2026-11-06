@@ -64,8 +64,8 @@ kind = "discharge"
 discharge = 0.5
 
 [boundary.downstream]
-kind = "depth"
-depth = 0.2
+kind = "water_level"
+level = 0.2
 
 [output]
 dir = {:?}
@@ -106,12 +106,43 @@ fn run_writes_vtk_and_reports_progress() {
 }
 
 #[test]
-fn run_rejects_sediment_until_it_is_implemented() {
-    let out = vormorph(&["run", SILL]);
+fn run_reports_bed_changes_on_a_movable_bed() {
+    let dir = work_dir("cli-movable");
+    let config = small_case(&dir);
+    let text_config = std::fs::read_to_string(&config).expect("the config must be readable");
+    let movable = text_config.replace(
+        "[boundary.upstream]",
+        "[sediment]\ngrain_size = 0.002\nmorfac = 10.0\nangle_of_repose = 32.0\n\n\
+         [sediment.bedload]\nformula = \"mpm\"\ncritical_shields = 0.047\n\n\
+         [boundary.upstream]",
+    );
+    std::fs::write(&config, movable).expect("the config must be writable");
+    let out = vormorph(&["run", config.to_str().expect("utf-8 path")]);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{}\n{stdout}", text(&out.stderr));
+    assert_eq!(stdout.matches("| bed change <=").count(), 2, "{stdout}");
+    let vtu =
+        std::fs::read_to_string(dir.join("out/small_000002.vtu")).expect("the .vtu must exist");
+    assert!(vtu.contains("Name=\"qb\""));
+    assert!(vtu.contains("Name=\"fixed_bed\""));
+}
+
+#[test]
+fn run_rejects_suspended_sediment_until_it_is_implemented() {
+    let dir = work_dir("cli-suspended");
+    let text_config = std::fs::read_to_string(SILL)
+        .expect("examples/sill.toml must be readable")
+        .replace("# [sediment.suspended]", "[sediment.suspended]")
+        .replace("# entrainment =", "entrainment =")
+        .replace("# min_depth =", "min_depth =")
+        .replace("# diffusivity_coef =", "diffusivity_coef =");
+    let config = dir.join("suspended.toml");
+    std::fs::write(&config, text_config).expect("the config must be writable");
+    let out = vormorph(&["run", config.to_str().expect("utf-8 path")]);
     assert!(!out.status.success());
     let stderr = text(&out.stderr);
     assert!(
-        stderr.contains("sediment transport is not implemented yet"),
+        stderr.contains("suspended sediment is not implemented yet"),
         "{stderr}"
     );
 }
