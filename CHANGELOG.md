@@ -91,4 +91,7 @@
 - `hydro::HydroSolver::step` を、陽的な部分（`explicit_terms`）と陰的な部分（`implicit_solve`）に分ける。`StepReport::outflow_courant` は、2段の時間積分でも時刻 n の値（時間刻みを決めた値）を記録する
 - `tools/advection_stability.py` に予測子・修正子と、平均流のない重力波の1周期あたりの減衰（`--gravity`）を追加
 - `tools/plot_verification.py` の V09 の図：`v09_summary.csv` の文字列の列 `advection` を読めるようにし、格子2段の組を移流の種類ごとに分ける
+- 既定の移流を `"second_order"`、時間積分を `"predictor_corrector"` に切り替え（ADR-0016、ADR-0017）。`examples/sill.toml` もこの設定にし、クーラン数を 0.5 から 0.8 に上げる（河床の変化の差は最大 2 mm で、計算時間は約 0.6 倍）。すべての検証ケースの値と図を、新しい既定で記録し直す
+- 2次の移流で、開境界（上流端・下流端）の辺を持つセルの勾配を 0 にする（ADR-0018）。乾いた河床に下流端の水位境界から水が入る `examples/sill.toml` の初期に、境界へ向かう流入速度を片側の勾配の外挿で強めて発散したため。`model` の単体テストに、この例題の最初の 10 s を追加
+- 検証ケース V09 を既定の設定（2次の移流、予測子・修正子、クーラン数 0.8）で計算し直し、短い波長（L = 100 m）の組を 20・40 行にする。比較用に1次の移流（同じ時間積分）の4ケースを残す。V11・V12 のクーラン数も 0.8 に上げる
 - ライセンス：MIT OR Apache-2.0
