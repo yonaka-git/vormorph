@@ -73,7 +73,7 @@ pub mod formulas;
 
 use crate::config::{Config, DownstreamBoundary, SedimentConfig, SedimentSupply, UpstreamBoundary};
 use crate::hydro;
-use crate::mesh::{EdgeKind, Mesh, NONE};
+use crate::mesh::{EdgeKind, Mesh, NONE, gradient};
 use crate::state::State;
 
 /// 安息角補正の緩和係数（その辺だけなら勾配がちょうど tan φ になる体積に掛ける）。
@@ -455,41 +455,23 @@ fn boundary_slope(mesh: &Mesh, zb: &[f64], e: usize) -> f64 {
     gx * nx + gy * ny
 }
 
-/// セル `c` の河床勾配ベクトル \[-\]：隣のセル（境界の外は除く）との差の最小二乗。
+/// セル `c` の河床勾配ベクトル \[-\]：隣のセル（境界の外は除く）との差の最小二乗
+/// （[`crate::mesh::gradient`]）。
 ///
 /// 河床が平面なら厳密。隣のセルが一直線に並ぶ（幅が1セルの水路など）ときは、その方向の
 /// 成分だけを求め、直交する成分は 0 とする。周期境界の継ぎ目の向こうのセルは、平行移動した
 /// 位置（[`Mesh::neighbor_position_from`]）で数える（河床高は勾配を除いた値のまま）。
+/// 開境界の辺でしか使わないので、重みはその都度計算する。
 pub fn bed_gradient(mesh: &Mesh, zb: &[f64], c: usize) -> [f64; 2] {
-    let (xc, yc) = (mesh.x_cell[c], mesh.y_cell[c]);
-    let (mut mxx, mut mxy, mut myy, mut bx, mut by) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    for (&e, &k) in mesh.edges_on_cell[c].iter().zip(&mesh.cells_on_cell[c]) {
-        if k == NONE {
-            continue;
+    let weights = gradient::least_squares_weights(mesh, c);
+    let mut g = [0.0, 0.0];
+    for (&k, [wx, wy]) in mesh.cells_on_cell[c].iter().zip(weights) {
+        if k != NONE {
+            g[0] += wx * (zb[k] - zb[c]);
+            g[1] += wy * (zb[k] - zb[c]);
         }
-        let [xk, yk] = mesh.neighbor_position_from(e, c);
-        let (dx, dy, dz) = (xk - xc, yk - yc, zb[k] - zb[c]);
-        mxx += dx * dx;
-        mxy += dx * dy;
-        myy += dy * dy;
-        bx += dx * dz;
-        by += dy * dz;
     }
-    let trace = mxx + myy;
-    if trace <= 0.0 {
-        return [0.0, 0.0];
-    }
-    let det = mxx * myy - mxy * mxy;
-    if det > 1.0e-10 * trace * trace {
-        [(myy * bx - mxy * by) / det, (mxx * by - mxy * bx) / det]
-    } else {
-        // 階数 1：M = trace v vᵀ（v は隣のセルの並ぶ向き）なので、勾配は v 方向の成分だけ
-        let (vx, vy) = if mxx >= myy { (mxx, mxy) } else { (mxy, myy) };
-        let norm = vx.hypot(vy);
-        let (vx, vy) = (vx / norm, vy / norm);
-        let g = (vx * bx + vy * by) / trace;
-        [g * vx, g * vy]
-    }
+    g
 }
 
 /// セル `c` から辺を通って出る量の合計 Σ_k max(s L f, 0)（`with_length` が偽なら L を掛けない）。
