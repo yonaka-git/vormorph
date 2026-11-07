@@ -633,6 +633,10 @@ V09_MAIN = (
 """振幅の時系列を描くケース（ケース名、凡例、系列の色の番号、線の種類）。"""
 
 
+V09_TEXT_COLUMNS = ("case", "layout", "advection")
+"""`v09_summary.csv` の文字列の列（それ以外は数値）。"""
+
+
 def read_bar_summary(path: Path) -> list[dict[str, str | float]]:
     """`v09_summary.csv` を読み、行ごとの辞書にする（数値の列は float）。"""
     lines = path.read_text(encoding="utf-8").strip().splitlines()
@@ -642,22 +646,22 @@ def read_bar_summary(path: Path) -> list[dict[str, str | float]]:
         values = line.split(",")
         row: dict[str, str | float] = {}
         for key, value in zip(header, values, strict=True):
-            row[key] = value if key in ("case", "layout") else float(value)
+            row[key] = value if key in V09_TEXT_COLUMNS else float(value)
         rows.append(row)
     return rows
 
 
 def bar_refinement_pairs(rows: list[dict[str, str | float]]) -> list[tuple[str, dict, dict]]:
-    """V09 の結果を、配置・幅・波長が同じ組に分け、行数の少ない方と多い方の組（配置, 粗, 細）を返す。
+    """V09 の結果を、移流・配置・幅・波長が同じ組に分け、行数の少ない方と多い方の組（配置, 粗, 細）を返す。
 
     行数がちょうど2倍の組だけを返す（1つしかない組は除く）。
     """
     groups: dict[tuple, list[dict[str, str | float]]] = {}
     for row in rows:
-        key = (row["layout"], row["width"], row["wavelength"])
+        key = (row["advection"], row["layout"], row["width"], row["wavelength"])
         groups.setdefault(key, []).append(row)
     pairs = []
-    for (layout, _, _), members in groups.items():
+    for (_, layout, _, _), members in groups.items():
         members = sorted(members, key=lambda r: float(r["rows"]))
         for coarse, fine in itertools.pairwise(members):
             if float(fine["rows"]) == 2.0 * float(coarse["rows"]):
