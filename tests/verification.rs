@@ -20,7 +20,7 @@
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
-use vormorph::config::{AdvectionScheme, ChannelLayout, Config, SedimentConfig};
+use vormorph::config::{AdvectionScheme, ChannelLayout, Config, SedimentConfig, TimeIntegration};
 use vormorph::hydro;
 use vormorph::mesh::channel::{self, ChannelSpec};
 use vormorph::mesh::{EdgeKind, Mesh, NONE, file};
@@ -1231,6 +1231,11 @@ fn v08_trench_migration() {
 /// - 幅 10 m（β = 4.7。どの波長でも減衰する）、L = 142.5 m：正方形配置の 5・10 行。
 ///   六角形配置の 10 行でも減衰すること
 ///
+/// ここまでは既定の1次の風上差分・1段（クーラン数 0.5）。さらに、2次の移流と1ステップ全体の
+/// SSP-RK2（ADR-0016。クーラン数 0.8）で、幅 40 m・L = 211.4 m を正方形配置の 10・20 行と
+/// 六角形配置の 20・40 行で計算し、同じ基準で確かめる（六角形配置の 10 行は減衰するので除く）。
+/// 辺の水深が1次精度なので、2次の移流でも成長率の収束は1次のまま（誤差の定数が小さくなる）。
+///
 /// 理論の値は `tools/bar_theory.py` で計算した（`tools/tests/test_bar_theory.py` で同じ値を確かめる）。
 /// `VORMORPH_VERIFICATION_OUTPUT` を指定すると、ケースごとに振幅の時系列 `amplitude.csv` と最後の
 /// 状態の VTK を、全ケースの結果を `v09_summary.csv` に書く。
@@ -1243,6 +1248,8 @@ fn v09_alternate_bars() {
         wavelength: f64,
         /// 線形理論の成長率 \[1/s\]と移動速度 \[m/s\]（流れの時間あたり、MORFAC 100）。
         theory: (f64, f64),
+        /// 移流・時間積分・クーラン数。
+        numerics: BarNumerics,
     }
     let case = |layout, rows, width, wavelength, theory| Case {
         layout,
@@ -1250,6 +1257,11 @@ fn v09_alternate_bars() {
         width,
         wavelength,
         theory,
+        numerics: BarNumerics::FIRST_ORDER,
+    };
+    let second = |layout, rows, width, wavelength, theory| Case {
+        numerics: BarNumerics::SECOND_ORDER,
+        ..case(layout, rows, width, wavelength, theory)
     };
     use ChannelLayout::{Hexagonal, Rectangular};
     let main = (2.5895e-3, 0.33858);
@@ -1268,14 +1280,19 @@ fn v09_alternate_bars() {
         case(Rectangular, 5, 10.0, 142.5, stable),
         case(Rectangular, 10, 10.0, 142.5, stable),
         case(Hexagonal, 10, 10.0, 142.5, stable),
+        second(Rectangular, 10, 40.0, 211.4, main),
+        second(Rectangular, 20, 40.0, 211.4, main),
+        second(Hexagonal, 20, 40.0, 211.4, main),
+        second(Hexagonal, 40, 40.0, 211.4, main),
     ];
     let name = |c: &Case| {
         format!(
-            "v09_{}_{}rows_b{}_l{}",
+            "v09_{}_{}rows_b{}_l{}{}",
             format!("{:?}", c.layout).to_lowercase(),
             c.rows,
             c.width,
-            c.wavelength
+            c.wavelength,
+            c.numerics.suffix
         )
     };
     let runs: Vec<BarModeRun> = std::thread::scope(|scope| {
@@ -1284,7 +1301,15 @@ fn v09_alternate_bars() {
             .map(|c| {
                 let case = name(c);
                 scope.spawn(move || {
-                    bar_mode_run(c.layout, c.rows, c.width, c.wavelength, c.theory.0, &case)
+                    bar_mode_run(
+                        c.layout,
+                        c.rows,
+                        c.width,
+                        c.wavelength,
+                        c.theory.0,
+                        c.numerics,
+                        &case,
+                    )
                 })
             })
             .collect();
@@ -1305,12 +1330,13 @@ fn v09_alternate_bars() {
         })
         .collect();
     let mut summary = String::from(
-        "case,layout,rows,width,wavelength,cells,growth,celerity,theory_growth,theory_celerity\n",
+        "case,layout,rows,width,wavelength,advection,cells,steps,growth,celerity,theory_growth,theory_celerity\n",
     );
     for ((c, run), (growth_error, celerity_error)) in cases.iter().zip(&runs).zip(&errors) {
         println!(
-            "V09 {:?}, {} rows, B = {} m, L = {} m: {} cells, {} steps, \
+            "V09 {}{:?}, {} rows, B = {} m, L = {} m: {} cells, {} steps, \
              growth {:.4e} 1/s ({:+.1}%), celerity {:.4e} m/s ({:+.1}%), amplitude {:.2e} -> {:.2e} m",
+            c.numerics.label,
             c.layout,
             c.rows,
             c.width,
@@ -1325,13 +1351,15 @@ fn v09_alternate_bars() {
             run.amplitude.1
         );
         summary.push_str(&format!(
-            "{},{:?},{},{},{},{},{:e},{:e},{:e},{:e}\n",
+            "{},{:?},{},{},{},{:?},{},{},{:e},{:e},{:e},{:e}\n",
             name(c),
             c.layout,
             c.rows,
             c.width,
             c.wavelength,
+            c.numerics.advection,
             run.cells,
+            run.steps,
             run.growth,
             run.celerity,
             c.theory.0,
@@ -1344,9 +1372,12 @@ fn v09_alternate_bars() {
     }
 
     // 格子2段の組（粗い方, 細かい方）
-    for (coarse, fine) in [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)] {
+    for (coarse, fine) in [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (11, 12), (13, 14)] {
         let c = &cases[fine];
-        let label = format!("{:?}, B = {} m, L = {} m", c.layout, c.width, c.wavelength);
+        let label = format!(
+            "{}{:?}, B = {} m, L = {} m",
+            c.numerics.label, c.layout, c.width, c.wavelength
+        );
         let (e_coarse, e_fine) = (errors[coarse].0, errors[fine].0);
         let ratio = e_fine / e_coarse;
         let extrapolated = 2.0 * e_fine - e_coarse;
@@ -1420,6 +1451,38 @@ mod bar_case {
     pub const EFOLDS: f64 = 3.0;
 }
 
+/// V09 の移流・時間積分・クーラン数の組み合わせ。
+#[derive(Debug, Clone, Copy)]
+struct BarNumerics {
+    advection: AdvectionScheme,
+    time_integration: TimeIntegration,
+    /// 可変の時間刻みの目標のクーラン数。
+    courant: f64,
+    /// 出力の表示の接頭辞。
+    label: &'static str,
+    /// ケース名の接尾辞。
+    suffix: &'static str,
+}
+
+impl BarNumerics {
+    /// 1次の風上差分、1段（既定の設定）。クーラン数 0.5。
+    const FIRST_ORDER: Self = Self {
+        advection: AdvectionScheme::Upwind,
+        time_integration: TimeIntegration::Euler,
+        courant: 0.5,
+        label: "",
+        suffix: "",
+    };
+    /// 2次の移流、1ステップ全体の SSP-RK2（ADR-0016）。クーラン数 0.8。
+    const SECOND_ORDER: Self = Self {
+        advection: AdvectionScheme::SecondOrder,
+        time_integration: TimeIntegration::SspRk2,
+        courant: 0.8,
+        label: "second order, ",
+        suffix: "_second_order",
+    };
+}
+
 /// 周期的な水路（幅 `width`、周期 `wavelength`、横断方向に `rows` 行）の等流に、
 /// 振幅 [`bar_case::EPSILON`] の単一モードの河床の起伏を与え、固定床で助走したあと、
 /// 線形理論の成長率 `expected_growth` で振幅が e^3 倍（減衰なら e^{-3} 倍）になる時間だけ
@@ -1431,6 +1494,7 @@ fn bar_mode_run(
     width: f64,
     wavelength: f64,
     expected_growth: f64,
+    numerics: BarNumerics,
     case: &str,
 ) -> BarModeRun {
     use bar_case::*;
@@ -1463,8 +1527,10 @@ kind = "periodic"
         UNIT_DISCHARGE * width
     );
     let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, end);
+    config.hydro.advection = numerics.advection;
+    config.hydro.time_integration = numerics.time_integration;
     config.time.dt = None;
-    config.time.courant = Some(0.5);
+    config.time.courant = Some(numerics.courant);
     config.time.dt_max = Some(1.0);
     config.time.morphology_start = SPIN_UP;
     let mut sediment = sill_sediment();

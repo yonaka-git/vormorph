@@ -37,6 +37,14 @@
 | Perot, B. | 2000 | Conservation properties of unstructured staggered mesh schemes | J. Comput. Phys., 159(1), 58–89 | [10.1006/jcph.2000.6424](https://doi.org/10.1006/jcph.2000.6424) | 要手動入手（有料） |
 | Ringler, T. D., Thuburn, J., Klemp, J. B., Skamarock, W. C. | 2010 | A unified approach to energy conservation and potential vorticity dynamics for arbitrarily-structured C-grids | J. Comput. Phys., 229(9), 3065–3090 | [10.1016/j.jcp.2009.12.007](https://doi.org/10.1016/j.jcp.2009.12.007) | 要手動入手（有料） |
 
+## 時間積分
+
+1ステップ全体の SSP-RK2（`[hydro] time_integration = "ssp_rk2"`）の判断の理由は [ADR-0016](design/adr/0016-second-order-advection-ssp-rk2.md) にあります。
+
+| 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
+|---|---|---|---|---|---|
+| Gottlieb, S., Shu, C.-W., Tadmor, E. | 2001 | Strong stability-preserving high-order time discretization methods | SIAM Review, 43(1), 89–112 | [10.1137/S003614450036757X](https://doi.org/10.1137/S003614450036757X) | 要手動入手（有料。書誌情報は 2026-11-07 に Crossref で確認。SSP-RK2 は Heun 法と同じ） |
+
 ## 格子生成
 
 格子生成ツール（`tools/make_mesh.py`）の手順は [design/mesh-generation.md](design/mesh-generation.md)、判断の理由は [ADR-0005](design/adr/0005-mesh-generator.md) にあります。

@@ -19,6 +19,9 @@ VORMORPH_VERIFICATION_OUTPUT=output/verification \
 uv run --project tools python tools/plot_verification.py v06 output/verification \
     -o docs/images/v06_uniform_flow.png
 
+# 移流と時間積分の限界クーラン数（ADR-0016）
+uv run --project tools python tools/advection_stability.py
+
 # テスト
 uv run --project tools pytest tools/tests
 ```
@@ -33,6 +36,8 @@ uv run --project tools pytest tools/tests
 | `vormesh/plot.py` | 格子の図（セルを番号で塗り分け、母点を番号順に結ぶ） |
 | `plot_profile.py` | `.vtu` のセルデータ（`x_cell`, `y_cell`, `zb`, `eta`, `h`）から縦断図を描く |
 | `plot_verification.py` | 検証ケースの図。ケースの条件は `tests/verification.rs` の定数と合わせる |
+| `bar_theory.py` | 交互砂州の線形安定解析（V09 の比較対象） |
+| `advection_stability.py` | 移流と時間積分の1次元の線形安定解析（限界クーラン数。ADR-0016 の根拠） |
 | `tests/` | pytest のテスト。`test_gmsh.py` は gmsh を読み込めない環境では飛ばす（`VORMORPH_REQUIRE_GMSH=1` のときは失敗させる） |
 
 手順と格子ファイルの形式は [docs/design/mesh-generation.md](../docs/design/mesh-generation.md) にあります。格子ファイルの形式は Rust 側の `src/mesh/file.rs` と、セルデータの名前は `src/io.rs` の出力の規約と合わせています。変えるときは両方を直してください。

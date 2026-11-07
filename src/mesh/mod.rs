@@ -69,6 +69,7 @@
 
 pub mod channel;
 pub mod file;
+pub mod gradient;
 pub mod voronoi;
 
 use std::error::Error;
