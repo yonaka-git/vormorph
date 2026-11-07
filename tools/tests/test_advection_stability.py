@@ -1,8 +1,9 @@
 """移流と時間積分の1次元の線形安定解析（tools/advection_stability.py）のテスト。
 
-移流の行列が移流項 −U ∂u/∂x の1次・2次の近似になっていることと、ADR-0016 が根拠にする
-安定性（1ステップ全体の SSP-RK2 はクーラン数 1 まで安定、2次の移流を前進 Euler で進めると
-不安定）を確かめる。
+移流の行列が移流項 −U ∂u/∂x の1次・2次の近似になっていることと、ADR-0016・ADR-0017 が根拠に
+する性質（予測子・修正子と1ステップ全体の SSP-RK2 はクーラン数 1 まで安定、2次の移流を
+前進 Euler で進めると不安定、SSP-RK2 は重力波を余分に減衰させ、予測子・修正子は θ 法と同じ）を
+確かめる。
 """
 
 import numpy as np
@@ -40,12 +41,28 @@ def test_advection_matrix_matches_the_function():
         assert matrix @ u == pytest.approx(stab.advected(u, 0.4, scheme), abs=1e-14)
 
 
+@pytest.mark.parametrize("method", ["predictor_corrector", "ssp_rk2"])
 @pytest.mark.parametrize("scheme", stab.ADVECTION)
 @pytest.mark.parametrize("froude", [0.2, 0.58, 0.95])
-def test_whole_step_ssp_rk2_is_stable_up_to_courant_one(scheme, froude):
+def test_two_stage_methods_are_stable_up_to_courant_one(method, scheme, froude):
     for courant in (0.25, 0.5, 0.8, 1.0):
-        radius = stab.spectral_radius(scheme, "ssp_rk2", froude, courant, n=24)
-        assert radius <= 1.0 + 1e-9, (courant, radius)
+        for friction in (False, True):
+            radius = stab.spectral_radius(scheme, method, froude, courant, friction=friction, n=24)
+            assert radius <= 1.0 + 1e-9, (courant, friction, radius)
+
+
+def test_predictor_corrector_damps_gravity_waves_like_the_theta_method():
+    # 1周期 200 ステップ（V04 と同じ）
+    euler = stab.gravity_wave_amplitude("euler", 200)
+    assert euler == pytest.approx(0.990, abs=1e-3)
+    assert stab.gravity_wave_amplitude("predictor_corrector", 200) == pytest.approx(euler, abs=1e-12)
+    # SSP-RK2 は時間について1次で余分に減衰する：ステップ数を2倍にすると減衰の不足分が約半分
+    ssp = [1.0 - stab.gravity_wave_amplitude("ssp_rk2", steps) for steps in (200, 400)]
+    assert ssp[0] == pytest.approx(0.103, abs=2e-3)
+    assert ssp[1] / ssp[0] == pytest.approx(0.5, abs=0.03)
+    # θ = 0.5 なら θ 法は減衰しないが、SSP-RK2 は減衰する
+    assert stab.gravity_wave_amplitude("euler", 200, theta=0.5) == pytest.approx(1.0, abs=1e-9)
+    assert stab.gravity_wave_amplitude("ssp_rk2", 200, theta=0.5) < 0.91
 
 
 def test_second_order_advection_is_unstable_with_forward_euler():
@@ -70,3 +87,5 @@ def test_unknown_names_are_rejected():
         stab.spectral_radius("upwind", "rk4", 0.5, 0.5, n=8)
     with pytest.raises(ValueError):
         stab.spectral_radius("upwind", "lax_wendroff", 0.5, 0.5, n=8)
+    with pytest.raises(ValueError):
+        stab.gravity_wave_amplitude("ab3", 100)
