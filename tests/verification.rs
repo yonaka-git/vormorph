@@ -20,7 +20,10 @@
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
-use vormorph::config::{AdvectionScheme, ChannelLayout, Config, SedimentConfig, TimeIntegration};
+use vormorph::config::{
+    AdvectionScheme, ChannelLayout, Config, SecondaryFlowConfig, SecondaryFlowKind, SedimentConfig,
+    TimeIntegration,
+};
 use vormorph::hydro;
 use vormorph::mesh::channel::{self, ChannelSpec};
 use vormorph::mesh::{EdgeKind, Mesh, NONE, file};
@@ -1239,6 +1242,11 @@ fn v08_trench_migration() {
 /// 正方形配置・六角形配置の 10・20 行で計算し、同じ基準で確かめる。辺の水深が1次精度なので、
 /// 2次の移流でも成長率の収束は1次のまま（誤差の定数が小さくなる）。
 ///
+/// 二次流による掃流砂の向きの補正（輸送方程式型、N* = 7、α_D = 0.15。ADR-0019）を入れて、
+/// 幅 40 m・L = 211.4 m を正方形配置の 10・20 行、六角形配置の 20・40 行で計算し、二次流を含めた
+/// 線形理論（I を5番目の状態にした 5×5 の系）と同じ基準で比べる。二次流は砂州の流れの曲がりから
+/// 生じ、この条件では成長率を 45% 大きくする。
+///
 /// 理論の値は `tools/bar_theory.py` で計算した（`tools/tests/test_bar_theory.py` で同じ値を確かめる）。
 /// `VORMORPH_VERIFICATION_OUTPUT` を指定すると、ケースごとに振幅の時系列 `amplitude.csv` と最後の
 /// 状態の VTK を、全ケースの結果を `v09_summary.csv` に書く。
@@ -1266,11 +1274,16 @@ fn v09_alternate_bars() {
         numerics: BarNumerics::UPWIND,
         ..case(layout, rows, width, wavelength, theory)
     };
+    let secondary = |layout, rows, width, wavelength, theory| Case {
+        numerics: BarNumerics::SECONDARY_FLOW,
+        ..case(layout, rows, width, wavelength, theory)
+    };
     use ChannelLayout::{Hexagonal, Rectangular};
     let main = (2.5895e-3, 0.33858);
     let long = (1.6758e-3, 0.22031);
     let short = (2.1121e-3, 0.53126);
     let stable = (-5.0585e-3, 0.31199);
+    let main_secondary = (3.7512e-3, 0.35747);
     let cases = [
         case(Rectangular, 10, 40.0, 211.4, main),
         case(Rectangular, 20, 40.0, 211.4, main),
@@ -1287,6 +1300,10 @@ fn v09_alternate_bars() {
         upwind(Rectangular, 20, 40.0, 211.4, main),
         upwind(Hexagonal, 10, 40.0, 211.4, main),
         upwind(Hexagonal, 20, 40.0, 211.4, main),
+        secondary(Rectangular, 10, 40.0, 211.4, main_secondary),
+        secondary(Rectangular, 20, 40.0, 211.4, main_secondary),
+        secondary(Hexagonal, 20, 40.0, 211.4, main_secondary),
+        secondary(Hexagonal, 40, 40.0, 211.4, main_secondary),
     ];
     let name = |c: &Case| {
         format!(
@@ -1333,7 +1350,7 @@ fn v09_alternate_bars() {
         })
         .collect();
     let mut summary = String::from(
-        "case,layout,rows,width,wavelength,advection,cells,steps,growth,celerity,theory_growth,theory_celerity\n",
+        "case,layout,rows,width,wavelength,advection,secondary_flow,cells,steps,growth,celerity,theory_growth,theory_celerity\n",
     );
     for ((c, run), (growth_error, celerity_error)) in cases.iter().zip(&runs).zip(&errors) {
         println!(
@@ -1354,13 +1371,18 @@ fn v09_alternate_bars() {
             run.amplitude.1
         );
         summary.push_str(&format!(
-            "{},{:?},{},{},{},{:?},{},{},{:e},{:e},{:e},{:e}\n",
+            "{},{:?},{},{},{},{:?},{},{},{},{:e},{:e},{:e},{:e}\n",
             name(c),
             c.layout,
             c.rows,
             c.width,
             c.wavelength,
             c.numerics.advection,
+            match c.numerics.secondary_flow {
+                None => "none",
+                Some(SecondaryFlowKind::Transport) => "transport",
+                Some(SecondaryFlowKind::Equilibrium) => "equilibrium",
+            },
             run.cells,
             run.steps,
             run.growth,
@@ -1375,7 +1397,17 @@ fn v09_alternate_bars() {
     }
 
     // 格子2段の組（粗い方, 細かい方）
-    for (coarse, fine) in [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (11, 12), (13, 14)] {
+    for (coarse, fine) in [
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (8, 9),
+        (11, 12),
+        (13, 14),
+        (15, 16),
+        (17, 18),
+    ] {
         let c = &cases[fine];
         let label = format!(
             "{}{:?}, B = {} m, L = {} m",
@@ -1465,6 +1497,8 @@ struct BarNumerics {
     label: &'static str,
     /// ケース名の接尾辞。
     suffix: &'static str,
+    /// 二次流による掃流砂の向きの補正（`None` なら補正しない）。
+    secondary_flow: Option<SecondaryFlowKind>,
 }
 
 impl BarNumerics {
@@ -1475,12 +1509,20 @@ impl BarNumerics {
         courant: 0.8,
         label: "",
         suffix: "",
+        secondary_flow: None,
     };
     /// 比較用の1次の風上差分（時間積分とクーラン数は既定と同じ）。
     const UPWIND: Self = Self {
         advection: AdvectionScheme::Upwind,
         label: "first order, ",
         suffix: "_upwind",
+        ..Self::DEFAULT
+    };
+    /// 二次流（輸送方程式型、N* = 7、α_D = 0.15。ADR-0019）で掃流砂の向きを補正する。
+    const SECONDARY_FLOW: Self = Self {
+        label: "secondary flow, ",
+        suffix: "_secondary",
+        secondary_flow: Some(SecondaryFlowKind::Transport),
         ..Self::DEFAULT
     };
 }
@@ -1537,6 +1579,11 @@ kind = "periodic"
     config.time.morphology_start = SPIN_UP;
     let mut sediment = sill_sediment();
     sediment.morfac = MORFAC;
+    sediment.secondary_flow = numerics.secondary_flow.map(|kind| SecondaryFlowConfig {
+        kind,
+        n_star: 7.0,
+        diffusivity_coef: 0.15,
+    });
     config.sediment = Some(sediment);
 
     let k = 2.0 * PI / wavelength;

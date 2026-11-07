@@ -101,4 +101,6 @@
 - VTK 出力に二次流の強さ `spiral`（二次流を考えるときだけ）。`io::VtkWriter::write_step` の移動床の引数を `io::SedimentOutput` に変更
 - `vormorph check` の要約に二次流の設定を表示する
 - ADR-0019（二次流の強さを輸送方程式で求め、掃流砂の向きを内岸側へ回す）。`docs/design/overview.md` の第2.5節・第4.10節（新設）、第2.2節、第4.6節、第5章、第7章、第8章（運動量式への効果と、スカラーの移流の2次精度化を未決事項に）
+- 交互砂州の線形安定解析 `tools/bar_theory.py` に二次流を追加（`Closure.secondary_flow = "transport" | "equilibrium"`、`--secondary-flow`）。輸送方程式型は二次流の強さを5番目の状態にした 5×5 の系。係数行列は二次流を含む非線形の式の数値的な線形化と照合する
+- 検証ケース V09 に二次流ありのケース（輸送方程式型、幅 40 m・L = 211.4 m、正方形 10・20 行、六角形 20・40 行）を追加。外挿した成長率は理論と +1.3%・+0.1%、移動速度は +1.0%。`v09_summary.csv` に `secondary_flow` の列を追加し、`tools/plot_verification.py` の V09 の図に二次流ありの組と理論の曲線を描く
 - ライセンス：MIT OR Apache-2.0
