@@ -161,7 +161,7 @@ mesh       : channel 200 m x 20 m, cell size 1 m, hexagonal
 bed        : slope 0.002, z_downstream 0 m
 structure  : sill x = 80..82 m, drop 1 m
 time       : adaptive dt (Courant 0.5, dt <= 0.2 s), end 3600 s, morphology from 600 s
-hydro      : theta 0.55, Manning n 0.025, advection upwind
+hydro      : theta 0.55, Manning n 0.025, advection upwind, time integration euler
 sediment   : d 0.002 m, bedload mpm, MORFAC 10, suspended off
 upstream   : discharge 40 m^3/s, sediment supply equilibrium
 downstream : water level 1.07 m
