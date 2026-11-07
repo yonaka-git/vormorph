@@ -376,6 +376,11 @@ pub struct BedloadConfig {
     /// 勾配補正（長谷川の式）に使う動摩擦係数 μ_k \[-\]。
     #[serde(default = "default_kinetic_friction")]
     pub kinetic_friction: f64,
+    /// 砂漣係数 μ = (C/C_90)^{3/2} \[-\]（Struiksma, 1983）。流砂量式の有効掃流力 τ*_e = μ τ* に
+    /// 使う（ADR-0021）。既定の 1 なら τ*_e = τ*（河床波の形状抵抗を考えない）。勾配補正の γ には
+    /// 使わない。0 < μ ≤ 1。
+    #[serde(default = "default_ripple_factor")]
+    pub ripple_factor: f64,
 }
 
 fn default_static_friction() -> f64 {
@@ -384,6 +389,10 @@ fn default_static_friction() -> f64 {
 
 fn default_kinetic_friction() -> f64 {
     0.45
+}
+
+fn default_ripple_factor() -> f64 {
+    1.0
 }
 
 /// 掃流砂量式。設定ファイルでは `"mpm"` または `"ashida_michiue"`。
@@ -798,6 +807,10 @@ impl Config {
                 positive(bedload.static_friction) && positive(bedload.kinetic_friction),
                 "sediment.bedload: static_friction and kinetic_friction must be > 0",
             );
+            require(
+                bedload.ripple_factor > 0.0 && bedload.ripple_factor <= 1.0,
+                "sediment.bedload.ripple_factor must be in (0, 1]",
+            );
             if let Some(suspended) = &sediment.suspended {
                 require(
                     positive(suspended.min_depth),
@@ -1015,9 +1028,16 @@ impl fmt::Display for Summary<'_> {
             Some(s) => {
                 write!(
                     f,
-                    "sediment   : d {} m, bedload {}, MORFAC {}, suspended {}",
+                    "sediment   : d {} m, bedload {}",
                     s.grain_size,
-                    s.bedload.formula.name(),
+                    s.bedload.formula.name()
+                )?;
+                if s.bedload.ripple_factor != 1.0 {
+                    write!(f, " (ripple factor {})", s.bedload.ripple_factor)?;
+                }
+                write!(
+                    f,
+                    ", MORFAC {}, suspended {}",
                     s.morfac,
                     if s.suspended.is_some() { "on" } else { "off" }
                 )?;
@@ -1365,6 +1385,46 @@ mod tests {
             messages.iter().any(|m| m.contains("physics.von_karman")),
             "{messages:?}"
         );
+    }
+
+    /// 砂漣係数は省略すると 1（今までの計算と同じ）。(0, 1] の外は設定の誤り。
+    #[test]
+    fn ripple_factor_defaults_to_one_and_is_range_checked() {
+        let config: Config = SILL.parse().expect("valid");
+        let bedload = &config
+            .sediment
+            .as_ref()
+            .expect("sill.toml has [sediment]")
+            .bedload;
+        assert_eq!(bedload.ripple_factor, 1.0);
+        assert!(!config.summary().to_string().contains("ripple factor"));
+
+        let with = |value: &str| {
+            let text = SILL.replacen(
+                "ripple_factor = 1.0",
+                &format!("ripple_factor = {value}"),
+                1,
+            );
+            assert_ne!(text, SILL, "sill.toml has ripple_factor");
+            text.parse::<Config>()
+        };
+        let config = with("0.35").expect("valid");
+        assert_eq!(
+            config.sediment.as_ref().map(|s| s.bedload.ripple_factor),
+            Some(0.35)
+        );
+        let summary = config.summary().to_string();
+        assert!(
+            summary.contains("bedload mpm (ripple factor 0.35), MORFAC"),
+            "{summary}"
+        );
+        for value in ["0.0", "-0.2", "1.2", "nan"] {
+            let messages = invalid_messages(with(value));
+            assert!(
+                messages.iter().any(|m| m.contains("ripple_factor")),
+                "{value}: {messages:?}"
+            );
+        }
     }
 
     #[test]

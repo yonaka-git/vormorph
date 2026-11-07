@@ -54,13 +54,17 @@ $$
 \tau_\ast = \frac{u_\ast^2}{s g d}, \qquad u_\ast^2 = \frac{g n^2 \lvert\mathbf{u}\rvert^2}{h^{1/3}}, \qquad q_b = \sqrt{s g d^3}\;\Phi(\tau_\ast)
 $$
 
-$\Phi$ は Meyer-Peter & Müller (1948) の式と芦田・道上 (1972) の式から、設定で選びます（$\tau_\ast \le \tau_{\ast c}$ では 0）。
+$\Phi$ は Meyer-Peter & Müller (1948) の式と芦田・道上 (1972) の式から、設定で選びます。
 
 $$
-\Phi_{\mathrm{MPM}} = 8\left(\tau_\ast - \tau_{\ast c}\right)^{3/2}, \qquad \Phi_{\mathrm{AM}} = 17\,\tau_{\ast e}^{3/2}\left(1 - \frac{\tau_{\ast c}}{\tau_\ast}\right)\left(1 - \sqrt{\frac{\tau_{\ast c}}{\tau_\ast}}\right)
+\Phi_{\mathrm{MPM}} = 8\left(\tau_{\ast e} - \tau_{\ast c}\right)^{3/2}, \qquad \Phi_{\mathrm{AM}} = 17\,\tau_{\ast e}^{3/2}\left(1 - \frac{\tau_{\ast c}}{\tau_\ast}\right)\left(1 - \sqrt{\frac{\tau_{\ast c}}{\tau_\ast}}\right), \qquad \tau_{\ast e} = \mu\,\tau_\ast
 $$
 
-$\tau_{\ast e}$ は有効掃流力です。当面は $\tau_{\ast e} = \tau_\ast$ とします。
+$\tau_{\ast e}$ は有効掃流力（河床波の形状抵抗を除いた、砂粒に働く分）で、$\mu$ は砂漣係数です（`[sediment.bedload] ripple_factor`、既定 1）。決め方の理由は [ADR-0021](adr/0021-ripple-factor.md) にあります。
+
+- 砂漣係数は $\mu = (C/C_{90})^{3/2}$、$C_{90} = 18\log_{10}(12h/D_{90})$ と定義されます（Struiksma, 1983）。設定では定数で与えます。
+- MPM 式は $\tau_{\ast e}$ で限界と比べます（$\tau_{\ast e} \le \tau_{\ast c}$ では 0。Struiksma, 1983 の式 (1)）。芦田・道上式は、原著のとおり $\tau_{\ast e}$ を先頭の係数だけに使い、括弧の中と限界の判定（$\tau_\ast \le \tau_{\ast c}$ では 0）は全掃流力 $\tau_\ast$ で行います。
+- $\mu = 1$ なら $\tau_{\ast e} = \tau_\ast$ です。
 
 掃流砂の向きは流速の向きを基本とし、河床勾配による補正を長谷川の式（長谷川, 1984。式の形は長谷川, 1983 と Nays2DH マニュアルで確認）で加えます。任意の方向 $\mathbf{n}$ の成分は次のとおりです。
 
@@ -68,7 +72,7 @@ $$
 \mathbf{q}_b\cdot\mathbf{n} = q_b\left(\frac{\mathbf{u}_b\cdot\mathbf{n}}{\lvert\mathbf{u}_b\rvert} - \gamma\,\frac{\partial z_b}{\partial n}\right), \qquad \gamma = \sqrt{\frac{\tau_{\ast c}}{\mu_s \mu_k \tau_\ast}}
 $$
 
-$\mu_s$ は静止摩擦係数、$\mu_k$ は動摩擦係数です。$\mathbf{u}_b$ は河床近傍の流速です。二次流を考えないとき（`[sediment.secondary_flow]` がないとき）は、水深平均流速 $\mathbf{u}$ で代用します。二次流を考えるときは、水深平均流速から内岸側へ回した向きにします（2.5節）。
+$\mu_s$ は静止摩擦係数、$\mu_k$ は動摩擦係数です。$\gamma$ には、Nays2DH と同じく全掃流力 $\tau_\ast$ を使います（砂漣係数は掛けません。ADR-0021）。$\mathbf{u}_b$ は河床近傍の流速です。二次流を考えないとき（`[sediment.secondary_flow]` がないとき）は、水深平均流速 $\mathbf{u}$ で代用します。二次流を考えるときは、水深平均流速から内岸側へ回した向きにします（2.5節）。
 
 ### 2.3 浮遊砂
 
@@ -342,19 +346,19 @@ $$
 掃流砂量は、辺 $j$ の法線成分を直接評価します。
 
 $$
-q_{b,j} = \sqrt{s g d^3}\;\Phi\left(\tau_{\ast j}\right)\left[\frac{u_j}{\lvert\mathbf{u}\rvert_j} - \gamma_j\,\frac{z_{b,2(j)} - z_{b,1(j)}}{\delta_j}\right]
+q_{b,j} = \sqrt{s g d^3}\;\Phi\left(\mu\tau_{\ast j},\ \tau_{\ast j}\right)\left[\frac{u_j}{\lvert\mathbf{u}\rvert_j} - \gamma_j\,\frac{z_{b,2(j)} - z_{b,1(j)}}{\delta_j}\right]
 $$
 
 $$
 \tau_{\ast j} = \frac{g n^2 \lvert\mathbf{u}\rvert_j^2}{H_j^{1/3}\, s g d}, \qquad \gamma_j = \sqrt{\frac{\tau_{\ast c}}{\mu_s \mu_k \tau_{\ast j}}}
 $$
 
-決め方の理由は [ADR-0011](adr/0011-edge-bedload.md) にあります。
+決め方の理由は [ADR-0011](adr/0011-edge-bedload.md) にあります。$\Phi(\tau_{\ast e}, \tau_\ast)$ は2.2節の式で、有効掃流力 $\tau_{\ast e} = \mu\tau_{\ast j}$ と全掃流力 $\tau_{\ast j}$ から求めます（[ADR-0021](adr/0021-ripple-factor.md)）。$\gamma_j$ は全掃流力のままです。
 
 - 流れの値は、流れを進めた後（時刻 $n+1$）の $u_j$、$\eta$ を使います。
 - 二次流を考えるとき（2.5節）は、向きの項 $u_j/\lvert\mathbf{u}\rvert_j$ を $(u_j - \tan\delta_j\,u_{t,j})/(\lvert\mathbf{u}\rvert_j\sqrt{1 + \tan^2\delta_j})$ に置き換えます。$\tan\delta_j = N_\ast I_j/\lvert\mathbf{u}\rvert_j$、$u_{t,j}$ は $\lvert\mathbf{u}\rvert_j$ と同じ平均の接線成分、$I_j$ は両側のセルの平均（境界辺は内側のセルの値）です（4.10節）。
 - 辺の水深 $H_j$ は4.1節と同じ規則（風上側の水位 − 両側の高い方の河床高）で、$\lvert\mathbf{u}\rvert_j$ は摩擦と同じ値（法線成分 $u_j$ と、両側のセルの Perot 流速の平均の接線成分）です。したがって掃流力は、運動量式の摩擦が表す底面のせん断力と一致します。
-- $H_j <$ `dry_depth` の辺と、$\tau_\ast \le \tau_{\ast c}$ の辺では $q_{b,j} = 0$ です（勾配の項も 0）。
+- $H_j <$ `dry_depth` の辺と、$\Phi = 0$ の辺（MPM 式では $\mu\tau_\ast \le \tau_{\ast c}$、芦田・道上式では $\tau_\ast \le \tau_{\ast c}$）では $q_{b,j} = 0$ です（勾配の項も 0）。
 - 母点を結ぶ線分が辺に直交するので、法線方向の河床勾配は2点差分で求まります。勾配補正は全方向（流下方向と横断方向）にかけます。
 - 周期境界では河床高を縦断勾配 $I_p$ を除いた値で持つので、勾配の項は $(z_{b,2(j)} - z_{b,1(j)})/\delta_j - I_p n_{x,j}$ にします。
 - 壁の辺では $q_{b,j} = 0$ とします。上流端と下流端の辺では、内側のセルの水深と辺の流速から同じ式で求めます。勾配には、内側のセルの河床勾配ベクトル（隣のセルとの差の最小二乗）の法線成分を使います（6章）。

@@ -22,7 +22,10 @@
 //!   周期境界では河床高を縦断勾配 I を除いた値で持つので、勾配は
 //!   (z_{b,2(j)} − z_{b,1(j)}) / δ_j − I n_{x,j} になる（[`SedimentParams::background_slope`]、
 //!   ADR-0014）。安息角補正の高低差にも、除いた勾配の分 I n_{x,j} δ_j を戻す。
-//! - Φ は [`formulas`] の MPM 式または芦田・道上式（設定で切り替える）。
+//! - Φ は [`formulas`] の MPM 式または芦田・道上式（設定で切り替える）で、有効掃流力
+//!   τ*_e = μ τ*_j（μ は砂漣係数 `ripple_factor`、既定 1。[`formulas::bedload_intensity`]、
+//!   ADR-0021）を使う。MPM 式は τ*_e で限界と比べ、芦田・道上式は τ*_e を先頭の係数だけに使う。
+//!   勾配補正の γ_j は全掃流力 τ*_j のまま。
 //! - 二次流（`[sediment.secondary_flow]`）を考えるときは、向きの項 u_j / |u|_j を、河床付近の
 //!   流速の向き（水深平均流速から内岸側へ tan δ = N* I / |u| だけ回した向き）の法線成分に置き換える
 //!   （[`secondary_flow::bedload_direction`]）。二次流の強さ I は、流れを進めた後に
@@ -70,6 +73,7 @@
 //! ## 参考文献
 //!
 //! - Meyer-Peter & Müller (1948), 芦田・道上 (1972): 掃流砂量式
+//! - Struiksma (1983): 砂漣係数 μ = (C/C_90)^{3/2} を掛けた MPM 式
 //! - 長谷川 (1984)（式の形は長谷川, 1983 と Nays2DH マニュアルで確認）: 河床勾配の補正
 //! - Itakura & Kishi (1980), Garcia & Parker (1991): 浮遊砂の浮上量
 //! - Rubey (1933): 沈降速度
@@ -477,7 +481,12 @@ fn edge_capacity(
     }
     let bedload = &params.sediment.bedload;
     let tau = params.shields(speed, depth);
-    let phi = formulas::bedload_intensity(bedload.formula, tau, bedload.critical_shields);
+    let phi = formulas::bedload_intensity(
+        bedload.formula,
+        tau,
+        bedload.ripple_factor,
+        bedload.critical_shields,
+    );
     if phi <= 0.0 {
         return 0.0;
     }
@@ -675,6 +684,7 @@ mod tests {
                     critical_shields: 0.047,
                     static_friction: 1.0,
                     kinetic_friction: 0.45,
+                    ripple_factor: 1.0,
                 },
                 suspended: None,
                 secondary_flow: None,
@@ -751,6 +761,45 @@ mod tests {
             assert!(bed.max_change < 1e-15, "{layout:?}: {}", bed.max_change);
             assert_eq!(bed.avalanche_iterations, 0);
         }
+    }
+
+    /// 砂漣係数 μ：等流の辺の流砂量は √(s g d³) 8 (μτ* − τ*_c)^{3/2} (1 + γ I) n_x で、
+    /// γ は全掃流力 τ* のまま（ADR-0021）。給砂量と流出量も同じ式で、河床は変わらない。
+    #[test]
+    fn ripple_factor_reduces_the_bedload_but_not_the_slope_correction() {
+        let (slope, h, u, mu) = (0.002, 1.069235, 1.870496, 0.35);
+        let mesh = mesh(20.0, 6.0, 1.0, ChannelLayout::Hexagonal);
+        let mut state = uniform_flow(&mesh, slope, h, u);
+        let mut p = params(Some(SedimentSupply::Equilibrium), true);
+        p.sediment.bedload.ripple_factor = mu;
+        let mut solver = SedimentSolver::new(&mesh, p.clone());
+        let report = solver.compute_bedload(&mesh, &state, 0.1);
+
+        let tau = p.shields(u, h);
+        let qb0 = p.bedload_scale() * 8.0 * (mu * tau - 0.047).powf(1.5);
+        let gamma = (0.047 / (0.45 * tau)).sqrt();
+        for e in 0..mesh.n_edges() {
+            let expected = match mesh.edge_kind[e] {
+                EdgeKind::Wall => 0.0,
+                _ => qb0 * (1.0 + gamma * slope) * mesh.normal_edge[e][0],
+            };
+            let q = solver.bedload_flux()[e];
+            assert!(
+                (q - expected).abs() <= 1e-12 * qb0,
+                "edge {e} ({:?}): {q} vs {expected}",
+                mesh.edge_kind[e]
+            );
+        }
+        assert!((report.inflow - report.outflow).abs() <= 1e-12 * report.inflow);
+        let bed = solver.update_bed(&mesh, &mut state, 0.1);
+        assert!(bed.max_change < 1e-15, "{}", bed.max_change);
+
+        // μ τ* ≤ τ*_c なら掃流砂は動かない
+        p.sediment.bedload.ripple_factor = 0.04 / tau;
+        let mut still = SedimentSolver::new(&mesh, p);
+        let report = still.compute_bedload(&mesh, &state, 0.1);
+        assert!(still.bedload_flux().iter().all(|&q| q == 0.0));
+        assert_eq!(report.inflow, 0.0);
     }
 
     /// 二次流の設定（輸送方程式型、N* = 7）。

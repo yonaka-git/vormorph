@@ -72,6 +72,7 @@ formula = "mpm"             # "mpm" または "ashida_michiue"
 critical_shields = 0.047    # MPM 原著の値
 static_friction = 1.0       # μ_s（勾配補正）
 kinetic_friction = 0.45     # μ_k（勾配補正）
+ripple_factor = 1.0         # 砂漣係数 μ（有効掃流力 μτ* に使う。1 なら補正なし。ADR-0021）
 
 # 浮遊砂も計算する場合はコメントを外す。
 # d = 2 mm では u*/w_f ≈ 1 で浮遊砂の寄与は小さいと見込み、まずは掃流砂だけで計算する。
