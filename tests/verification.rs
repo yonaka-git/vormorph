@@ -497,7 +497,7 @@ fn v04_closed_basin_oscillation() {
     for layout in LAYOUTS {
         let case = format!("v04_{}", format!("{layout:?}").to_lowercase());
         println!("V04 {layout:?}:");
-        let run = thacker_run(layout, AdvectionScheme::Upwind, &case);
+        let run = thacker_run(layout, AdvectionScheme::SecondOrder, &case);
         assert!(
             run.volume_error <= 1e-10,
             "{layout:?}: volume error {:e}",
@@ -1216,25 +1216,28 @@ fn v08_trench_migration() {
 /// ε cos(πy/B) cos(2πx/L)（ε = 1 mm、L は水路の周期）を与え、振幅の成長率と移動速度を、
 /// 同じ式の線形安定解析（`tools/bar_theory.py`。流れの非定常項と MORFAC を含む）と比べる。
 ///
-/// 移流と辺の水深の1次の風上差分の数値拡散で、成長率は理論より小さく出る（短い波ほど大きい）。
-/// 誤差は格子幅に比例して減る（1次の収束）ので、横断方向の行数 N と 2N の2段の計算から、
-/// 1次精度を仮定した Richardson 外挿 2σ_{2N} − σ_N で理論と比べる。
+/// 辺の水深（と、比較用のケースでは移流）の1次の風上差分の数値拡散で、成長率は理論より小さく
+/// 出る（短い波ほど大きい）。誤差は格子幅に比例して減る（1次の収束）ので、横断方向の行数 N と
+/// 2N の2段の計算から、1次精度を仮定した Richardson 外挿 2σ_{2N} − σ_N で理論と比べる。
 ///
 /// - 誤差の比 e_{2N} / e_N が 0.4〜0.6（1次の収束）
 /// - 外挿した成長率の誤差が、正方形配置で 5%、六角形配置で 10% 以下
 /// - 細かい方の格子の移動速度の誤差が、正方形配置で 2%、六角形配置で 5% 以下
 ///
-/// ケースは次のとおり（β = B/2H。この流れの発生の境は β_c ≈ 8.0）。
+/// ケースは次のとおり（β = B/2H。この流れの発生の境は β_c ≈ 8.0）。既定の設定（2次の移流、
+/// 予測子・修正子。ADR-0016、ADR-0017）で、可変の時間刻みのクーラン数は 0.8。
 ///
-/// - 幅 40 m（β = 18.7）、L = 211.4 m：正方形配置・六角形配置の 10・20 行
-/// - 幅 40 m、L = 400 m と L = 100 m：正方形配置の 10・20 行
+/// - 幅 40 m（β = 18.7）、L = 211.4 m：正方形配置の 10・20 行、六角形配置の 20・40 行
+///   （六角形配置の 10 行は減衰する）
+/// - 幅 40 m、L = 400 m：正方形配置の 10・20 行
+/// - 幅 40 m、L = 100 m：正方形配置の 20・40 行（10 行と 20 行では誤差が −196%・−95% と大きく、
+///   1次の収束の範囲に入らない）
 /// - 幅 10 m（β = 4.7。どの波長でも減衰する）、L = 142.5 m：正方形配置の 5・10 行。
 ///   六角形配置の 10 行でも減衰すること
 ///
-/// ここまでは既定の1次の風上差分・1段（クーラン数 0.5）。さらに、2次の移流と予測子・修正子
-/// （ADR-0016、ADR-0017。クーラン数 0.8）で、幅 40 m・L = 211.4 m を正方形配置の 10・20 行と
-/// 六角形配置の 20・40 行で計算し、同じ基準で確かめる（六角形配置の 10 行は減衰するので除く）。
-/// 辺の水深が1次精度なので、2次の移流でも成長率の収束は1次のまま（誤差の定数が小さくなる）。
+/// 比較のために、1次の風上差分（時間積分とクーラン数は同じ）で、幅 40 m・L = 211.4 m を
+/// 正方形配置・六角形配置の 10・20 行で計算し、同じ基準で確かめる。辺の水深が1次精度なので、
+/// 2次の移流でも成長率の収束は1次のまま（誤差の定数が小さくなる）。
 ///
 /// 理論の値は `tools/bar_theory.py` で計算した（`tools/tests/test_bar_theory.py` で同じ値を確かめる）。
 /// `VORMORPH_VERIFICATION_OUTPUT` を指定すると、ケースごとに振幅の時系列 `amplitude.csv` と最後の
@@ -1257,10 +1260,10 @@ fn v09_alternate_bars() {
         width,
         wavelength,
         theory,
-        numerics: BarNumerics::FIRST_ORDER,
+        numerics: BarNumerics::DEFAULT,
     };
-    let second = |layout, rows, width, wavelength, theory| Case {
-        numerics: BarNumerics::SECOND_ORDER,
+    let upwind = |layout, rows, width, wavelength, theory| Case {
+        numerics: BarNumerics::UPWIND,
         ..case(layout, rows, width, wavelength, theory)
     };
     use ChannelLayout::{Hexagonal, Rectangular};
@@ -1271,19 +1274,19 @@ fn v09_alternate_bars() {
     let cases = [
         case(Rectangular, 10, 40.0, 211.4, main),
         case(Rectangular, 20, 40.0, 211.4, main),
-        case(Hexagonal, 10, 40.0, 211.4, main),
         case(Hexagonal, 20, 40.0, 211.4, main),
+        case(Hexagonal, 40, 40.0, 211.4, main),
         case(Rectangular, 10, 40.0, 400.0, long),
         case(Rectangular, 20, 40.0, 400.0, long),
-        case(Rectangular, 10, 40.0, 100.0, short),
         case(Rectangular, 20, 40.0, 100.0, short),
+        case(Rectangular, 40, 40.0, 100.0, short),
         case(Rectangular, 5, 10.0, 142.5, stable),
         case(Rectangular, 10, 10.0, 142.5, stable),
         case(Hexagonal, 10, 10.0, 142.5, stable),
-        second(Rectangular, 10, 40.0, 211.4, main),
-        second(Rectangular, 20, 40.0, 211.4, main),
-        second(Hexagonal, 20, 40.0, 211.4, main),
-        second(Hexagonal, 40, 40.0, 211.4, main),
+        upwind(Rectangular, 10, 40.0, 211.4, main),
+        upwind(Rectangular, 20, 40.0, 211.4, main),
+        upwind(Hexagonal, 10, 40.0, 211.4, main),
+        upwind(Hexagonal, 20, 40.0, 211.4, main),
     ];
     let name = |c: &Case| {
         format!(
@@ -1465,21 +1468,20 @@ struct BarNumerics {
 }
 
 impl BarNumerics {
-    /// 1次の風上差分、1段（既定の設定）。クーラン数 0.5。
-    const FIRST_ORDER: Self = Self {
-        advection: AdvectionScheme::Upwind,
-        time_integration: TimeIntegration::Euler,
-        courant: 0.5,
-        label: "",
-        suffix: "",
-    };
-    /// 2次の移流、予測子・修正子（ADR-0016、ADR-0017）。クーラン数 0.8。
-    const SECOND_ORDER: Self = Self {
+    /// 既定の設定（2次の移流、予測子・修正子。ADR-0016、ADR-0017）。クーラン数 0.8。
+    const DEFAULT: Self = Self {
         advection: AdvectionScheme::SecondOrder,
         time_integration: TimeIntegration::PredictorCorrector,
         courant: 0.8,
-        label: "second order, ",
-        suffix: "_second_order",
+        label: "",
+        suffix: "",
+    };
+    /// 比較用の1次の風上差分（時間積分とクーラン数は既定と同じ）。
+    const UPWIND: Self = Self {
+        advection: AdvectionScheme::Upwind,
+        label: "first order, ",
+        suffix: "_upwind",
+        ..Self::DEFAULT
     };
 }
 
@@ -1690,7 +1692,7 @@ level = {h_n:?}
     let end = MORPHOLOGY_START + DURATION;
     let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, DURATION / 4.0);
     config.time.dt = None;
-    config.time.courant = Some(0.5);
+    config.time.courant = Some(0.8);
     config.time.dt_max = Some(0.5);
     config.time.morphology_start = MORPHOLOGY_START;
     config.sediment = Some(sill_sediment());
@@ -1915,7 +1917,7 @@ level = {h_n:?}
     );
     let mut config = flow_config(case, 1.0, end, MANNING_N, &boundary, end / 4.0);
     config.time.dt = None;
-    config.time.courant = Some(0.5);
+    config.time.courant = Some(0.8);
     config.time.dt_max = Some(1.0);
     config.sediment = Some(sill_sediment());
 
@@ -2128,7 +2130,7 @@ kind = "periodic"
     let case = format!("v12_periodic_{}_2m", format!("{layout:?}").to_lowercase());
     let mut config = flow_config(&case, 1.0, end, MANNING_N, &boundary, end / 4.0);
     config.time.dt = None;
-    config.time.courant = Some(0.5);
+    config.time.courant = Some(0.8);
     config.time.dt_max = Some(1.0);
     config.sediment = Some(sill_sediment());
 

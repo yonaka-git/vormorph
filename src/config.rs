@@ -239,10 +239,11 @@ pub struct HydroConfig {
     /// wet/dry を判定する水深の閾値 \[m\]。
     #[serde(default = "default_dry_depth")]
     pub dry_depth: f64,
-    /// 運動量の移流の扱い（省略時は保存型の風上差分）。
+    /// 運動量の移流の扱い（省略時は2次精度の保存型の差分）。
     #[serde(default)]
     pub advection: AdvectionScheme,
-    /// 時間積分の方法（省略時は1段）。2次の移流には `"predictor_corrector"` が必要（ADR-0016、ADR-0017）。
+    /// 時間積分の方法（省略時は予測子・修正子）。2次の移流には `"predictor_corrector"` が必要
+    /// （ADR-0016、ADR-0017）。
     #[serde(default)]
     pub time_integration: TimeIntegration,
     /// 水位の連立方程式の反復解法。
@@ -254,16 +255,16 @@ fn default_dry_depth() -> f64 {
     1.0e-3
 }
 
-/// 運動量の移流の扱い。設定ファイルでは `"upwind"`、`"second_order"`、`"none"` のいずれか。
+/// 運動量の移流の扱い。設定ファイルでは `"second_order"`（既定）、`"upwind"`、`"none"` のいずれか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub enum AdvectionScheme {
     /// 保存型の1次風上差分（[`crate::hydro::advection`]。ADR-0008, ADR-0009）。
-    #[default]
     #[serde(rename = "upwind")]
     Upwind,
     /// 保存型の2次精度の差分（[`crate::hydro::advection_second_order`]。ADR-0016）。
     /// セルの流速の勾配（最小二乗）で面の値を再構成する。`time_integration = "predictor_corrector"`
     /// が必要。
+    #[default]
     #[serde(rename = "second_order")]
     SecondOrder,
     /// 移流項を省く（F u_j = u_j）。検証で移流の効果を比べるためのもので、急変流には使えない。
@@ -271,19 +272,19 @@ pub enum AdvectionScheme {
     Disabled,
 }
 
-/// 流れの時間積分の方法。設定ファイルでは `"euler"` または `"predictor_corrector"`。
+/// 流れの時間積分の方法。設定ファイルでは `"predictor_corrector"`（既定）または `"euler"`。
 ///
 /// どちらも、水位勾配は θ 法、摩擦は陰的に扱う。違いは陽的な部分（移流と、連続式の風上の
 /// 辺の水深）の扱い（[`crate::hydro::HydroSolver::step`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub enum TimeIntegration {
-    /// S を1回（移流は前進 Euler）。
-    #[default]
+    /// 時刻 n の陽的な部分で1回解く（移流は前進 Euler）。1次の移流か、移流なしと組み合わせる。
     #[serde(rename = "euler")]
     Euler,
     /// 予測子・修正子：時刻 n で1段解いた予測子 U* と時刻 n の陽的な部分を平均し（Heun 法）、
     /// 時刻 n から水位を解き直す。計算量は2倍だが、2次の移流でも安定で、定常解は Δt によらず、
     /// 重力波の減衰は θ 法と同じ（ADR-0017）。
+    #[default]
     #[serde(rename = "predictor_corrector")]
     PredictorCorrector,
 }
@@ -1038,23 +1039,8 @@ mod tests {
 
     #[test]
     fn advection_can_be_disabled_and_rejects_unknown_schemes() {
-        assert_eq!(
-            SILL.parse::<Config>().expect("valid").hydro.advection,
-            AdvectionScheme::Upwind
-        );
-        let text = SILL.replacen("advection = \"upwind\"", "advection = \"none\"", 1);
-        let config: Config = text.parse().expect("advection = \"none\" is valid");
-        assert_eq!(config.hydro.advection, AdvectionScheme::Disabled);
-        let text = SILL
-            .replacen("advection = \"upwind\"", "advection = \"second_order\"", 1)
-            .replacen(
-                "time_integration = \"euler\"",
-                "time_integration = \"predictor_corrector\"",
-                1,
-            );
-        let config: Config = text
-            .parse()
-            .expect("second_order with predictor_corrector is valid");
+        const SECOND: &str = "advection = \"second_order\"";
+        let config: Config = SILL.parse().expect("valid");
         assert_eq!(config.hydro.advection, AdvectionScheme::SecondOrder);
         assert_eq!(
             config.hydro.time_integration,
@@ -1066,52 +1052,41 @@ mod tests {
                 .to_string()
                 .contains("advection second_order, time integration predictor_corrector")
         );
-        let omitted = SILL.replacen("advection = \"upwind\"", "", 1);
+        let text = SILL.replacen(SECOND, "advection = \"none\"", 1);
+        let config: Config = text.parse().expect("advection = \"none\" is valid");
+        assert_eq!(config.hydro.advection, AdvectionScheme::Disabled);
+        let text = SILL.replacen(SECOND, "advection = \"upwind\"", 1);
+        let config: Config = text
+            .parse()
+            .expect("upwind with predictor_corrector is valid");
+        assert_eq!(config.hydro.advection, AdvectionScheme::Upwind);
+        let omitted = SILL.replacen(SECOND, "", 1);
         assert_eq!(
             omitted.parse::<Config>().expect("valid").hydro.advection,
-            AdvectionScheme::default()
+            AdvectionScheme::SecondOrder
         );
-        let unknown = SILL.replacen("advection = \"upwind\"", "advection = \"elm\"", 1);
+        let unknown = SILL.replacen(SECOND, "advection = \"elm\"", 1);
         assert!(matches!(
             unknown.parse::<Config>(),
             Err(ConfigError::Parse(_))
         ));
     }
 
-    /// 時間積分は省略すると1段。2次の移流は1段では不安定なので、組み合わせを誤りにする。
+    /// 時間積分は省略すると予測子・修正子。2次の移流は1段（euler）では不安定なので、組み合わせを
+    /// 誤りにする。1段は1次の移流となら使える。
     #[test]
     fn second_order_advection_needs_predictor_corrector() {
-        let config: Config = SILL.parse().expect("valid");
-        assert_eq!(config.hydro.time_integration, TimeIntegration::Euler);
-        assert!(
-            config
-                .summary()
-                .to_string()
-                .contains("advection upwind, time integration euler")
-        );
-        let omitted = SILL.replacen("time_integration = \"euler\"", "", 1);
+        const PREDICTOR_CORRECTOR: &str = "time_integration = \"predictor_corrector\"";
+        let omitted = SILL.replacen(PREDICTOR_CORRECTOR, "", 1);
         assert_eq!(
             omitted
                 .parse::<Config>()
                 .expect("valid")
                 .hydro
                 .time_integration,
-            TimeIntegration::default()
-        );
-        let upwind = SILL.replacen(
-            "time_integration = \"euler\"",
-            "time_integration = \"predictor_corrector\"",
-            1,
-        );
-        assert_eq!(
-            upwind
-                .parse::<Config>()
-                .expect("valid")
-                .hydro
-                .time_integration,
             TimeIntegration::PredictorCorrector
         );
-        let euler = SILL.replacen("advection = \"upwind\"", "advection = \"second_order\"", 1);
+        let euler = SILL.replacen(PREDICTOR_CORRECTOR, "time_integration = \"euler\"", 1);
         match euler.parse::<Config>() {
             Err(ConfigError::Invalid(messages)) => {
                 assert!(
@@ -1122,11 +1097,16 @@ mod tests {
             }
             other => panic!("expected ConfigError::Invalid, got {other:?}"),
         }
-        let unknown = SILL.replacen(
-            "time_integration = \"euler\"",
-            "time_integration = \"rk4\"",
-            1,
+        let upwind = euler.replacen("advection = \"second_order\"", "advection = \"upwind\"", 1);
+        let config: Config = upwind.parse().expect("upwind with euler is valid");
+        assert_eq!(config.hydro.time_integration, TimeIntegration::Euler);
+        assert!(
+            config
+                .summary()
+                .to_string()
+                .contains("advection upwind, time integration euler")
         );
+        let unknown = SILL.replacen(PREDICTOR_CORRECTOR, "time_integration = \"rk4\"", 1);
         assert!(matches!(
             unknown.parse::<Config>(),
             Err(ConfigError::Parse(_))
@@ -1230,7 +1210,7 @@ mod tests {
         let summary = config.summary().to_string();
         assert!(summary.contains("hexagonal"), "{summary}");
         assert!(summary.contains("bedload mpm"), "{summary}");
-        assert!(summary.contains("advection upwind"), "{summary}");
+        assert!(summary.contains("advection second_order"), "{summary}");
         assert!(
             summary.contains("upstream   : discharge 40 m^3/s"),
             "{summary}"

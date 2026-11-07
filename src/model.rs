@@ -848,6 +848,42 @@ interval = 100.0
         assert_eq!(b.error(), 0.0);
     }
 
+    /// `examples/sill.toml` の最初の 10 s（乾いた河床に、上流端の流量と下流端の水位境界から
+    /// 水が入る）。2次の移流で、開境界の辺を持つセルの勾配を 0 にしないと、下流端の境界の辺の
+    /// 流入速度が増え続けて t ≈ 2 s で発散した。流速が有界で、水の収支が合うことを確かめる。
+    #[test]
+    fn sill_example_starts_from_a_dry_bed() {
+        let mut config: Config = include_str!("../examples/sill.toml")
+            .parse()
+            .expect("examples/sill.toml must be valid");
+        config.time.end = 10.0;
+        config.output.dir =
+            std::env::temp_dir().join(format!("vormorph-sill-start-{}", std::process::id()));
+        config.output.interval = 100.0;
+        let mut model = Model::new(config).expect("the sill example must build");
+        while !model.finished() {
+            model.step().expect("the step must succeed");
+            // 流れ込み始め（約 0.4 s まで）は、上流端の流入量を水深の浅い入口のセルで割った
+            // 大きな流速が入口付近の辺に出る（1次の移流でも同じ）。その後の流速で確かめる
+            if model.state().time < 1.0 {
+                continue;
+            }
+            let max_u = model
+                .state()
+                .u_n
+                .iter()
+                .fold(0.0_f64, |m, u| m.max(u.abs()));
+            assert!(
+                max_u < 20.0,
+                "t = {}: max |u_n| = {max_u}",
+                model.state().time
+            );
+        }
+        let water = model.water_balance();
+        assert!(water.inflow > 0.0);
+        assert!(water.error().abs() <= 1e-10 * water.inflow, "{water:?}");
+    }
+
     /// 直線水路の設定（正方形配置、格子幅 0.5 m で母点は x = 0.25, 0.75, …, 9.75 m）。
     fn channel_config(name: &str, structures: &str, time: &str) -> Config {
         let dir = std::env::temp_dir().join(format!("vormorph-{name}-{}", std::process::id()));
