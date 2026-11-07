@@ -1,7 +1,8 @@
 //! 流砂と河床変動：掃流砂、浮遊砂、Exner 式（均一粒径）。
 //!
-//! 離散式の詳細は `docs/design/overview.md` の第4.6〜4.8節、判断の理由は ADR-0011（掃流砂）と
-//! ADR-0012（河床の更新）。浮遊砂（[`SedimentSolver::step_suspended`]）は未実装。
+//! 離散式の詳細は `docs/design/overview.md` の第4.6〜4.8節と第4.10節、判断の理由は ADR-0011
+//! （掃流砂）、ADR-0012（河床の更新）、ADR-0019（二次流）。浮遊砂
+//! （[`SedimentSolver::step_suspended`]）は未実装。
 //!
 //! ## 掃流砂（辺の法線成分）
 //!
@@ -22,6 +23,10 @@
 //!   (z_{b,2(j)} − z_{b,1(j)}) / δ_j − I n_{x,j} になる（[`SedimentParams::background_slope`]、
 //!   ADR-0014）。安息角補正の高低差にも、除いた勾配の分 I n_{x,j} δ_j を戻す。
 //! - Φ は [`formulas`] の MPM 式または芦田・道上式（設定で切り替える）。
+//! - 二次流（`[sediment.secondary_flow]`）を考えるときは、向きの項 u_j / |u|_j を、河床付近の
+//!   流速の向き（水深平均流速から内岸側へ tan δ = N* I / |u| だけ回した向き）の法線成分に置き換える
+//!   （[`secondary_flow::bedload_direction`]）。二次流の強さ I は、流れを進めた後に
+//!   [`SedimentSolver::step_secondary_flow`] で求める（[`secondary_flow`]）。
 //! - 境界辺：壁では 0。上流端（平衡給砂）と下流端（自由流出）では、内側のセルの水深と辺の流速から
 //!   同じ式で求め、勾配 ∂z_b/∂n には内側のセルの河床勾配（隣のセルとの最小二乗。[`bed_gradient`]）
 //!   の法線成分を使う。上流端は流入だけ、下流端は流出だけを許す。勾配を内側のセルから
@@ -70,11 +75,13 @@
 //! - Rubey (1933): 沈降速度
 
 pub mod formulas;
+pub mod secondary_flow;
 
 use crate::config::{Config, DownstreamBoundary, SedimentConfig, SedimentSupply, UpstreamBoundary};
 use crate::hydro;
 use crate::mesh::{EdgeKind, Mesh, NONE, gradient};
 use crate::state::State;
+use secondary_flow::{SecondaryFlow, SecondaryFlowParams};
 
 /// 安息角補正の緩和係数（その辺だけなら勾配がちょうど tan φ になる体積に掛ける）。
 const AVALANCHE_RELAXATION: f64 = 0.5;
@@ -92,6 +99,8 @@ pub struct SedimentParams {
     pub water_density: f64,
     /// 水の動粘性係数 ν \[m²/s\]。
     pub kinematic_viscosity: f64,
+    /// カルマン定数 κ（二次流の適応長に使う）。
+    pub von_karman: f64,
     /// マニングの粗度係数 n（掃流力の評価に使う）。
     pub manning_n: f64,
     /// wet/dry を判定する水深の閾値 \[m\]。
@@ -115,6 +124,7 @@ impl SedimentParams {
             gravity: config.physics.gravity,
             water_density: config.physics.water_density,
             kinematic_viscosity: config.physics.kinematic_viscosity,
+            von_karman: config.physics.von_karman,
             manning_n: config.hydro.manning_n,
             dry_depth: config.hydro.dry_depth,
             sediment,
@@ -194,6 +204,8 @@ pub struct SedimentSolver {
     avalanche_flux: Vec<f64>,
     /// 更新前の河床高 \[m\]
     zb_old: Vec<f64>,
+    /// 二次流の強さのソルバー（`[sediment.secondary_flow]` がなければ `None`）
+    secondary_flow: Option<SecondaryFlow>,
     /// 一定の給砂量（`constant`）で保つ、上流端からの給砂量の合計 Σ L_j q_{b,j}（流入を負）
     /// \[m³/s\]（最初の [`SedimentSolver::compute_bedload`] で決める。それまでは `None`）
     held_supply: Option<f64>,
@@ -209,8 +221,22 @@ impl SedimentSolver {
     /// 格子の大きさに合わせて作業配列を確保する。
     pub fn new(mesh: &Mesh, params: SedimentParams) -> Self {
         let (n_cells, n_edges) = (mesh.n_cells(), mesh.n_edges());
+        let secondary_flow = params.sediment.secondary_flow.as_ref().map(|config| {
+            SecondaryFlow::new(
+                mesh,
+                SecondaryFlowParams {
+                    config: config.clone(),
+                    gravity: params.gravity,
+                    manning_n: params.manning_n,
+                    von_karman: params.von_karman,
+                    dry_depth: params.dry_depth,
+                    background_slope: params.background_slope,
+                },
+            )
+        });
         Self {
             params,
+            secondary_flow,
             bedload_flux: vec![0.0; n_edges],
             edge_depth: vec![0.0; n_edges],
             outside_level: vec![f64::NEG_INFINITY; n_edges],
@@ -226,6 +252,11 @@ impl SedimentSolver {
     /// パラメータ。
     pub fn params(&self) -> &SedimentParams {
         &self.params
+    }
+
+    /// 二次流の強さのソルバー（`[sediment.secondary_flow]` がなければ `None`）。
+    pub fn secondary_flow(&self) -> Option<&SecondaryFlow> {
+        self.secondary_flow.as_ref()
     }
 
     /// 直前に計算した辺の掃流砂量 q_{b,j}（頭打ちの後）\[m²/s\]。
@@ -312,6 +343,23 @@ impl SedimentSolver {
             }
         }
         report
+    }
+
+    /// 二次流の強さ I（`state.spiral`）を `dt` だけ進める（[`secondary_flow`]）。
+    /// `[sediment.secondary_flow]` がなければ何もしない。
+    ///
+    /// `state` は流れを進めた後（時刻 n+1）の状態、`theta_flux` はその流れの計算の θ 平均の
+    /// 単位幅流量。河床変動を始める前（`time.morphology_start` まで）も毎ステップ呼ぶ。
+    pub fn step_secondary_flow(
+        &mut self,
+        mesh: &Mesh,
+        state: &mut State,
+        theta_flux: &[f64],
+        dt: f64,
+    ) {
+        if let Some(solver) = self.secondary_flow.as_mut() {
+            solver.step(mesh, state, theta_flux, dt);
+        }
     }
 
     /// 浮遊砂 hC を `dt` だけ進める。`theta_flux` は連続式と同じ θ 平均の単位幅流量。
@@ -439,7 +487,13 @@ fn edge_capacity(
         bedload.static_friction,
         bedload.kinetic_friction,
     );
-    let q = scale * phi * (u / speed - gamma * slope);
+    let direction = match &params.sediment.secondary_flow {
+        Some(secondary) => {
+            secondary_flow::bedload_direction(mesh, state, e, speed, secondary.n_star)
+        }
+        None => u / speed,
+    };
+    let q = scale * phi * (direction - gamma * slope);
     match kind {
         EdgeKind::Upstream => q.min(0.0),
         EdgeKind::Downstream => q.max(0.0),
@@ -607,6 +661,7 @@ mod tests {
             gravity: 9.81,
             water_density: 1000.0,
             kinematic_viscosity: 1.0e-6,
+            von_karman: 0.41,
             manning_n: 0.025,
             dry_depth: 1.0e-3,
             sediment: SedimentConfig {
@@ -622,6 +677,7 @@ mod tests {
                     kinetic_friction: 0.45,
                 },
                 suspended: None,
+                secondary_flow: None,
             },
             supply,
             downstream_open,
@@ -695,6 +751,102 @@ mod tests {
             assert!(bed.max_change < 1e-15, "{layout:?}: {}", bed.max_change);
             assert_eq!(bed.avalanche_iterations, 0);
         }
+    }
+
+    /// 二次流の設定（輸送方程式型、N* = 7）。
+    fn with_secondary_flow(p: SedimentParams) -> SedimentParams {
+        let mut p = p;
+        p.sediment.secondary_flow = Some(crate::config::SecondaryFlowConfig {
+            kind: crate::config::SecondaryFlowKind::Transport,
+            n_star: 7.0,
+            diffusivity_coef: 0.15,
+        });
+        p
+    }
+
+    /// 二次流：一様な勾配の等流に一様な I を与えると、辺の掃流砂量は
+    /// q_b0 (cos δ n_x + sin δ n_y + γ I_b n_x)（tan δ = N* I / |u|。内岸側＝左へ δ 回る）。
+    /// 境界辺も同じ式で、I = 0 なら二次流を考えないときと一致する。
+    #[test]
+    fn secondary_flow_turns_the_bedload_towards_the_inner_bank() {
+        let (slope, h, u, intensity) = (0.002, 1.069235, 1.870496, 0.05);
+        for layout in [ChannelLayout::Rectangular, ChannelLayout::Hexagonal] {
+            let mesh = mesh(20.0, 6.0, 1.0, layout);
+            let mut state = uniform_flow(&mesh, slope, h, u);
+            let p = with_secondary_flow(params(Some(SedimentSupply::Equilibrium), true));
+            let mut solver = SedimentSolver::new(&mesh, p.clone());
+            let mut plain =
+                SedimentSolver::new(&mesh, params(Some(SedimentSupply::Equilibrium), true));
+            solver.compute_bedload(&mesh, &state, 0.1);
+            plain.compute_bedload(&mesh, &state, 0.1);
+            assert_eq!(solver.bedload_flux(), plain.bedload_flux());
+
+            state.spiral.fill(intensity);
+            solver.compute_bedload(&mesh, &state, 0.1);
+            let tau = p.shields(u, h);
+            let qb0 = p.bedload_scale() * 8.0 * (tau - 0.047).powf(1.5);
+            let gamma = (0.047 / (0.45 * tau)).sqrt();
+            let delta = (7.0 * intensity / u).atan();
+            for e in 0..mesh.n_edges() {
+                let [nx, ny] = mesh.normal_edge[e];
+                let expected = match mesh.edge_kind[e] {
+                    EdgeKind::Wall => 0.0,
+                    _ => qb0 * (delta.cos() * nx + delta.sin() * ny + gamma * slope * nx),
+                };
+                let q = solver.bedload_flux()[e];
+                assert!(
+                    (q - expected).abs() <= 1e-12 * qb0,
+                    "{layout:?} edge {e} ({:?}): {q} vs {expected}",
+                    mesh.edge_kind[e]
+                );
+            }
+        }
+    }
+
+    /// 十分発達した湾曲部の横断勾配（合成の状態）：x 方向の一様流に一様な I を与え、河床と水面を
+    /// 横断方向に勾配 S = sin δ / γ で傾ける（水深は一様）と、横断方向の掃流砂が 0 になり、
+    /// 河床は変わらない（周期境界の正方形配置）。I = 0 なら勾配を下る掃流砂で側壁沿いが変わる。
+    #[test]
+    fn transverse_bed_slope_balances_the_secondary_flow() {
+        let (h, u, intensity) = (1.0, 1.8, 0.02);
+        let mesh = channel::build_periodic(&ChannelSpec {
+            length: 12.0,
+            width: 6.0,
+            cell_size: 1.0,
+            layout: ChannelLayout::Rectangular,
+        })
+        .expect("valid periodic channel");
+        let p = with_secondary_flow(params(None, false));
+        let tau = p.shields(u, h);
+        let gamma = (0.047 / (0.45 * tau)).sqrt();
+        let delta = (7.0 * intensity / u).atan();
+        let transverse = delta.sin() / gamma;
+        // 内岸（左、y の大きい側）が高い
+        let tilted = |spiral: f64| {
+            let mut state = uniform_flow(&mesh, 0.0, h, u);
+            for c in 0..mesh.n_cells() {
+                state.zb[c] = transverse * mesh.y_cell[c];
+                state.eta[c] = state.zb[c] + h;
+            }
+            state.spiral.fill(spiral);
+            state
+        };
+        let mut state = tilted(intensity);
+        let mut solver = SedimentSolver::new(&mesh, p.clone());
+        solver.compute_bedload(&mesh, &state, 1.0);
+        let qb0 = p.bedload_scale() * 8.0 * (tau - 0.047).powf(1.5);
+        for e in (0..mesh.n_edges()).filter(|&e| mesh.normal_edge[e][1].abs() > 0.5) {
+            let q = solver.bedload_flux()[e];
+            assert!(q.abs() <= 1e-14 * qb0, "edge {e}: {q}");
+        }
+        let report = solver.update_bed(&mesh, &mut state, 1.0);
+        assert!(report.max_change < 1e-15, "{report:?}");
+        assert_eq!(report.avalanche_iterations, 0);
+
+        let mut state = tilted(0.0);
+        solver.compute_bedload(&mesh, &state, 1.0);
+        let report = solver.update_bed(&mesh, &mut state, 1.0);
+        assert!(report.max_change > 1.0e-4, "{report:?}");
     }
 
     /// 周期境界：勾配を除いた一様な河床の等流でも、辺の掃流砂量は除いた勾配の分の補正を含む

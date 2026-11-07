@@ -30,6 +30,7 @@
 //! | `x_cell`, `y_cell` | 母点の座標 | m |
 //! | `qb` | 掃流砂量ベクトル（移動床のときだけ。3成分、z 成分は 0） | m²/s |
 //! | `fixed_bed` | 非侵食層のあるセルなら 1、なければ 0（移動床のときだけ） | – |
+//! | `spiral` | 二次流の強さ I（`[sediment.secondary_flow]` のときだけ。左へ曲がる流れで正） | m/s |
 //!
 //! 辺の法線流速 u_n は出力せず、セル中心へ再構成した値（[`State::u_cell`]）を出す。掃流砂量も
 //! 同じく、辺の法線成分 q_{b,j} から Perot 法と同じ式で再構成したセル中心のベクトルを出す
@@ -42,6 +43,15 @@ use std::borrow::Cow;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+/// 移動床のときに書く値（[`VtkWriter::write_step`]）。
+#[derive(Debug, Clone, Copy)]
+pub struct SedimentOutput<'a> {
+    /// 辺の掃流砂量 q_{b,j} \[m²/s\]（`qb` と `fixed_bed` を書く）。
+    pub bedload: &'a [f64],
+    /// 二次流の強さ I（[`State::spiral`]）を `spiral` として書くか。
+    pub spiral: bool,
+}
 
 /// `.vtu` の時系列と `.pvd` を書き出す。
 #[derive(Debug, Clone)]
@@ -76,8 +86,8 @@ impl VtkWriter {
 
     /// 1時刻分の `.vtu` を書き、書いたファイルのパスを返す。
     ///
-    /// `zb_initial` は初期の河床高（`dzb` の計算に使う）。`bedload` は辺の掃流砂量 q_{b,j}
-    /// \[m²/s\]（移動床のとき。`Some` なら `qb` と `fixed_bed` も書く）。配列の長さが格子と
+    /// `zb_initial` は初期の河床高（`dzb` の計算に使う）。`sediment` は移動床のときの値で、
+    /// `Some` なら `qb` と `fixed_bed`、二次流を考えるときは `spiral` も書く。配列の長さが格子と
     /// 合わない場合は [`io::ErrorKind::InvalidInput`]、出力する値に NaN や無限大がある場合は
     /// [`io::ErrorKind::InvalidData`] の誤りを返し、ファイルを書かない。
     pub fn write_step(
@@ -85,10 +95,10 @@ impl VtkWriter {
         mesh: &Mesh,
         state: &State,
         zb_initial: &[f64],
-        bedload: Option<&[f64]>,
+        sediment: Option<SedimentOutput>,
     ) -> io::Result<PathBuf> {
-        check_lengths(mesh, state, zb_initial, bedload)?;
-        let fields = CellFields::new(mesh, state, zb_initial, bedload, self.dry_depth);
+        check_lengths(mesh, state, zb_initial, sediment)?;
+        let fields = CellFields::new(mesh, state, zb_initial, sediment, self.dry_depth);
         fields.check_finite(mesh, state.time)?;
 
         fs::create_dir_all(&self.dir)?;
@@ -140,7 +150,7 @@ impl<'a> CellFields<'a> {
         mesh: &'a Mesh,
         state: &'a State,
         zb_initial: &[f64],
-        bedload: Option<&[f64]>,
+        sediment: Option<SedimentOutput>,
         dry_depth: f64,
     ) -> Self {
         let n = mesh.n_cells();
@@ -162,7 +172,7 @@ impl<'a> CellFields<'a> {
             ("y_cell", Cow::Borrowed(mesh.y_cell.as_slice())),
         ];
         let mut vectors = vec![("velocity", Cow::Borrowed(state.u_cell.as_slice()))];
-        if let Some(bedload) = bedload {
+        if let Some(SedimentOutput { bedload, spiral }) = sediment {
             let mut qb = vec![[0.0; 2]; n];
             reconstruct_cell_velocity(mesh, bedload, &mut qb);
             vectors.push(("qb", Cow::Owned(qb)));
@@ -172,6 +182,9 @@ impl<'a> CellFields<'a> {
                 .map(|z| if z.is_finite() { 1.0 } else { 0.0 })
                 .collect();
             scalars.push(("fixed_bed", Cow::Owned(fixed)));
+            if spiral {
+                scalars.push(("spiral", Cow::Borrowed(state.spiral.as_slice())));
+            }
         }
         Self { scalars, vectors }
     }
@@ -320,15 +333,23 @@ fn check_lengths(
     mesh: &Mesh,
     state: &State,
     zb_initial: &[f64],
-    bedload: Option<&[f64]>,
+    sediment: Option<SedimentOutput>,
 ) -> io::Result<()> {
     let (n, n_edges) = (mesh.n_cells(), mesh.n_edges());
+    let bedload = sediment.map(|s| s.bedload);
+    let spiral = sediment.is_some_and(|s| s.spiral);
     let lengths = [
         ("state.eta", state.eta.len(), n, "cells"),
         ("state.zb", state.zb.len(), n, "cells"),
         ("state.z_ne", state.z_ne.len(), n, "cells"),
         ("state.hc", state.hc.len(), n, "cells"),
         ("state.u_cell", state.u_cell.len(), n, "cells"),
+        (
+            "state.spiral",
+            if spiral { state.spiral.len() } else { n },
+            n,
+            "cells",
+        ),
         ("zb_initial", zb_initial.len(), n, "cells"),
         (
             "bedload",

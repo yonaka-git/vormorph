@@ -82,6 +82,7 @@
 | 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
 |---|---|---|---|---|---|
 | Colombini, M., Seminara, G., Tubino, M. | 1987 | Finite-amplitude alternate bars | J. Fluid Mech., 181, 213–232 | [10.1017/S0022112087002064](https://doi.org/10.1017/S0022112087002064) | 要手動入手（有料。交互砂州の線形・弱非線形の安定解析。`tools/bar_theory.py` の線形安定解析は、同じ考え方を vormorph の式に当てはめたもの） |
+| Engelund, F. | 1974 | Flow and bed topography in channel bends | J. Hydraul. Div., ASCE, 100(HY11), 1631–1648 | [10.1061/JYCEAJ.0004109](https://doi.org/10.1061/JYCEAJ.0004109) | 書誌のみ（有料。湾曲部の二次流による掃流砂の偏角 tan δ = 7 h/R。係数 N* = 7 は Nays2DH マニュアルの式 (78) で確認。ADR-0019） |
 | Federici, B., Seminara, G. | 2003 | On the convective nature of bar instability | J. Fluid Mech., 487, 125–145 | [10.1017/S0022112003004737](https://doi.org/10.1017/S0022112003004737) | 要手動入手（有料。交互砂州の不安定が移流型であることを示した論文。周期境界を加えた理由として ADR-0014 で引用） |
 
 ## 実装・マニュアル（公式配布）

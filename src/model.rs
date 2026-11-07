@@ -25,14 +25,16 @@
 //!      までの残りが Δt 以下ならちょうどそこまで進め、時刻をその値にそろえる。残りが 2Δt 未満
 //!      なら、半分ずつ2ステップで進める（極端に短いステップを作らないため）。ADR-0010。
 //! 2. [`HydroSolver::step`] で η と u_n を時刻 n+1 へ進める。
-//! 3. t > `time.morphology_start` かつ移動床なら、[`SedimentSolver::compute_bedload`] と
+//! 3. 二次流（`[sediment.secondary_flow]`）を考えるなら、流れの θ 平均流量で二次流の強さ I を
+//!    進める（[`SedimentSolver::step_secondary_flow`]）。河床変動を始める前も毎ステップ行う。
+//! 4. t > `time.morphology_start` かつ移動床なら、[`SedimentSolver::compute_bedload`] と
 //!    [`SedimentSolver::update_bed`] で掃流砂と河床を更新し、土砂の収支（[`SedimentBalance`]）と、
 //!    湛水セルの水位を保ったことによる水の体積の変化（[`MassBalance::bed_exchange`]）を加える。
 //!    浮遊砂（[`SedimentSolver::step_suspended`]）は未実装なので、`[sediment.suspended]` の
 //!    ある設定は組み立ての時点でエラーにする。
-//! 4. 水の収支（[`MassBalance`]）を更新する。上流端・下流端の流量は、連続式と同じ θ 平均流量
+//! 5. 水の収支（[`MassBalance`]）を更新する。上流端・下流端の流量は、連続式と同じ θ 平均流量
 //!    （[`HydroSolver::theta_flux`]）から求める。
-//! 5. 出力時刻なら [`VtkWriter::write_step`] で書き出す。[`Model::run`] は最初に初期状態も書く。
+//! 6. 出力時刻なら [`VtkWriter::write_step`] で書き出す。[`Model::run`] は最初に初期状態も書く。
 //!
 //! ## 質量収支
 //!
@@ -51,7 +53,7 @@ use crate::config::{
     UpstreamBoundary,
 };
 use crate::hydro::{self, HydroError, HydroParams, HydroSolver, StepReport};
-use crate::io::VtkWriter;
+use crate::io::{SedimentOutput, VtkWriter};
 use crate::mesh::channel::{self, ChannelSpec};
 use crate::mesh::{EdgeKind, Mesh, MeshError};
 use crate::sediment::{BedUpdateReport, BedloadReport, SedimentParams, SedimentSolver};
@@ -492,6 +494,7 @@ impl Model {
 
         self.last_sediment = None;
         if let Some(sediment) = self.sediment.as_mut() {
+            sediment.step_secondary_flow(&self.mesh, &mut self.state, self.hydro.theta_flux(), dt);
             if self.state.time > self.config.time.morphology_start {
                 let bedload = sediment.compute_bedload(&self.mesh, &self.state, dt);
                 let bed = sediment.update_bed(&self.mesh, &mut self.state, dt);
@@ -574,7 +577,10 @@ impl Model {
             &self.mesh,
             &self.state,
             &self.zb_initial,
-            self.sediment.as_ref().map(SedimentSolver::bedload_flux),
+            self.sediment.as_ref().map(|sediment| SedimentOutput {
+                bedload: sediment.bedload_flux(),
+                spiral: sediment.secondary_flow().is_some(),
+            }),
         )?;
         self.writer.write_collection()?;
         Ok(())
@@ -591,6 +597,7 @@ fn check_setup(config: &Config, mesh: &Mesh, state: &State) -> Result<(), ModelE
         ("z_ne", state.z_ne.len(), n_cells),
         ("hc", state.hc.len(), n_cells),
         ("u_cell", state.u_cell.len(), n_cells),
+        ("spiral", state.spiral.len(), n_cells),
         ("u_n", state.u_n.len(), n_edges),
     ] {
         if len != expected {
@@ -1090,6 +1097,39 @@ interval = 1000.0
             assert_eq!((sediment.inflow, sediment.outflow), (0.0, 0.0), "{layout}");
             assert!(sediment.error().abs() <= 1e-12, "{layout}: {sediment:?}");
         }
+    }
+
+    /// 二次流の強さ I は、河床変動を始める前から毎ステップ進む（直線水路の等流では I_e = 0 なので
+    /// 一様に減衰する）。出力には `spiral` を書く。
+    #[test]
+    fn secondary_flow_is_advanced_every_step_and_written() {
+        let mut config = periodic_config("secondary-flow", "rectangular");
+        let mut sediment = sill_sediment();
+        sediment.secondary_flow = Some(crate::config::SecondaryFlowConfig {
+            kind: crate::config::SecondaryFlowKind::Transport,
+            n_star: 7.0,
+            diffusivity_coef: 0.15,
+        });
+        config.sediment = Some(sediment);
+        config.time.end = 10.0;
+        config.time.morphology_start = 20.0;
+        let mut model = Model::new(config).expect("the periodic channel must build");
+        let i0 = 0.01;
+        model.state.spiral.fill(i0);
+        let mut previous = i0;
+        while !model.finished() {
+            model.step().expect("the step must succeed");
+            assert!(model.last_sediment_report().is_none());
+            let spiral = &model.state().spiral;
+            assert!(spiral.iter().all(|&i| (i - spiral[0]).abs() < 1e-14));
+            assert!(spiral[0] > 0.0 && spiral[0] < previous, "{}", spiral[0]);
+            previous = spiral[0];
+        }
+        model.write_output().expect("write the output");
+        let path = model.config().output.dir.join("secondary-flow_000000.vtu");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("Name=\"spiral\""));
+        std::fs::remove_dir_all(&model.config().output.dir).expect("clean up");
     }
 
     #[test]

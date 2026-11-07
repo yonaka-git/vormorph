@@ -2,7 +2,7 @@
 
 この文書は、vormorph の支配方程式、ボロノイ C 格子上の離散式、1ステップの計算手順をまとめたものです。設計判断の理由は [ADR](adr/README.md) に記録しています。
 
-> **状態**：流れの半陰解法（4.1〜4.3節）、wet/dry、移流（4.4節。1次と2次）、Perot 法による再構成（4.5節）、時間積分（4.9節）、境界条件（6章。直線水路の周期境界を含む）、時間刻みの決め方（7章）、掃流砂と河床の更新（4.6節、4.8節）は実装済みです。浮遊砂（4.7節と、4.8節の浮遊砂の項）はまだ実装していません。実装の過程で式や手順を変えた場合は、この文書と ADR を同時に更新します。末尾の「[未決事項](#8-未決事項)」も参照してください。
+> **状態**：流れの半陰解法（4.1〜4.3節）、wet/dry、移流（4.4節。1次と2次）、Perot 法による再構成（4.5節）、時間積分（4.9節）、境界条件（6章。直線水路の周期境界を含む）、時間刻みの決め方（7章）、掃流砂と河床の更新（4.6節、4.8節）、二次流による掃流砂の向きの補正（2.5節、4.10節）は実装済みです。浮遊砂（4.7節と、4.8節の浮遊砂の項）はまだ実装していません。実装の過程で式や手順を変えた場合は、この文書と ADR を同時に更新します。末尾の「[未決事項](#8-未決事項)」も参照してください。
 
 ## 目次
 
@@ -68,7 +68,7 @@ $$
 \mathbf{q}_b\cdot\mathbf{n} = q_b\left(\frac{\mathbf{u}_b\cdot\mathbf{n}}{\lvert\mathbf{u}_b\rvert} - \gamma\,\frac{\partial z_b}{\partial n}\right), \qquad \gamma = \sqrt{\frac{\tau_{\ast c}}{\mu_s \mu_k \tau_\ast}}
 $$
 
-$\mu_s$ は静止摩擦係数、$\mu_k$ は動摩擦係数です。$\mathbf{u}_b$ は河床近傍の流速で、二次流を考えない当面の実装では水深平均流速 $\mathbf{u}$ で代用します。
+$\mu_s$ は静止摩擦係数、$\mu_k$ は動摩擦係数です。$\mathbf{u}_b$ は河床近傍の流速です。二次流を考えないとき（`[sediment.secondary_flow]` がないとき）は、水深平均流速 $\mathbf{u}$ で代用します。二次流を考えるときは、水深平均流速から内岸側へ回した向きにします（2.5節）。
 
 ### 2.3 浮遊砂
 
@@ -92,6 +92,34 @@ $$
 $$
 
 地形変化の時間スケールを縮めるため、河床の更新量に MORFAC $M$ を掛けます（流れと浮遊砂の式には掛けません）。
+
+### 2.5 二次流
+
+湾曲した流れでは、遠心力で水面付近の水が外岸へ、河床付近の水が内岸へ向かう二次流（らせん流）が生じます。その強さ $I$（m/s。左へ曲がる流れで正）を、遠心加速度を生成項とする輸送方程式で求めます（Deltares, 2026 の式 5.13〜5.20。コリオリ力の項は除く）。決め方の理由は [ADR-0019](adr/0019-secondary-flow.md) にあります。
+
+$$
+\frac{\partial (hI)}{\partial t} + \nabla\cdot(\mathbf{q}\,I) = \nabla\cdot(hD\nabla I) + h\,\frac{I_e - I}{T_I}
+$$
+
+$$
+I_e = \frac{h\,a_n}{\lvert\mathbf{u}\rvert}, \qquad a_n = \frac{\left(\mathbf{u}\times(\mathbf{u}\cdot\nabla)\mathbf{u}\right)_z}{\lvert\mathbf{u}\rvert}, \qquad T_I = \frac{L_I}{\lvert\mathbf{u}\rvert}, \qquad L_I = \frac{(1 - 2\alpha)\,h}{2\kappa^2\alpha}, \qquad \alpha = \frac{\sqrt{g}\,n}{\kappa\,h^{1/6}}
+$$
+
+- $a_n$ は遠心加速度です。流線の曲率を $1/R$ とすると $a_n = \lvert\mathbf{u}\rvert^2/R$、$I_e = h\lvert\mathbf{u}\rvert/R$ です。曲率を経由せず、流速とその勾配から直接求めます。
+- $L_I$ は適応長、$\kappa$ はカルマン定数（`[physics] von_karman`、既定 0.41）です。$\alpha \ge 1/2$（ごく浅い流れ）では $L_I = 0$ とします。
+- 拡散係数は $D = \alpha_D u_\ast h$ です（`diffusivity_coef`、既定 0.15）。
+- `kind = "equilibrium"` では、各時刻の流れの平衡値 $I = I_e$ を使います（$L_I \to 0$ の極限。比較用）。
+
+掃流砂の向き（2.2節の $\mathbf{u}_b$）は、河床付近の流速を水深平均流速から反時計回りに $\delta$ だけ回した $\mathbf{u} + \tan\delta\,(\mathbf{k}\times\mathbf{u})$ の向きにします。左へ曲がる流れ（$I > 0$）で内岸側（左）へ回ります。
+
+$$
+\tan\delta = \frac{N_\ast I}{\lvert\mathbf{u}\rvert}, \qquad \frac{\mathbf{u}_b\cdot\mathbf{n}}{\lvert\mathbf{u}_b\rvert} = \frac{\mathbf{u}\cdot\mathbf{n} - \tan\delta\;\mathbf{u}\cdot(\mathbf{k}\times\mathbf{n})}{\lvert\mathbf{u}\rvert\sqrt{1 + \tan^2\delta}}
+$$
+
+- $N_\ast$ は偏角の係数で、既定は 7（Engelund, 1974）です（`n_star`）。十分発達した湾曲では $\tan\delta = N_\ast h/R$ です。
+- 横断方向の掃流砂が 0 になる河床の横断勾配は $\sin\delta = \gamma\,\partial z_b/\partial n$ です。$\delta$ が小さければ $N_\ast h/R = \gamma\,\partial z_b/\partial n$ になります。
+- Nays2DH（iRIC Project, 2023 の式 (78)(85)）は、分母の $\sqrt{1 + \tan^2\delta}$ を 1 で近似しています。
+- 二次流が運動量式に与える効果（分散応力）は入れていません（8章）。
 
 ## 3. 格子と変数配置
 
@@ -324,6 +352,7 @@ $$
 決め方の理由は [ADR-0011](adr/0011-edge-bedload.md) にあります。
 
 - 流れの値は、流れを進めた後（時刻 $n+1$）の $u_j$、$\eta$ を使います。
+- 二次流を考えるとき（2.5節）は、向きの項 $u_j/\lvert\mathbf{u}\rvert_j$ を $(u_j - \tan\delta_j\,u_{t,j})/(\lvert\mathbf{u}\rvert_j\sqrt{1 + \tan^2\delta_j})$ に置き換えます。$\tan\delta_j = N_\ast I_j/\lvert\mathbf{u}\rvert_j$、$u_{t,j}$ は $\lvert\mathbf{u}\rvert_j$ と同じ平均の接線成分、$I_j$ は両側のセルの平均（境界辺は内側のセルの値）です（4.10節）。
 - 辺の水深 $H_j$ は4.1節と同じ規則（風上側の水位 − 両側の高い方の河床高）で、$\lvert\mathbf{u}\rvert_j$ は摩擦と同じ値（法線成分 $u_j$ と、両側のセルの Perot 流速の平均の接線成分）です。したがって掃流力は、運動量式の摩擦が表す底面のせん断力と一致します。
 - $H_j <$ `dry_depth` の辺と、$\tau_\ast \le \tau_{\ast c}$ の辺では $q_{b,j} = 0$ です（勾配の項も 0）。
 - 母点を結ぶ線分が辺に直交するので、法線方向の河床勾配は2点差分で求まります。勾配補正は全方向（流下方向と横断方向）にかけます。
@@ -356,6 +385,7 @@ $$
 (hC)_i^{n+1} = \frac{(hC)_i^{\ast}}{1 + \Delta t\, w_f\, r_i / h_i^{n+1}}
 $$
 
+- 移流拡散は、二次流（4.10節）と共用するスカラーの移流拡散（`transport`）で解く予定です。
 - 連続式と同じ流量を使うと、濃度が一様な状態（$C$ = 一定）が移流で崩れません。上の式に $C$ = 一定を代入すると、移流の項が連続式の体積変化と打ち消し合います。
 - 水深が `min_depth` 未満のセルでは $E_i = 0$ として浮上を止めます。浅いセルで濃度が過大になるのを防ぐためです。
 - 移流は陽的な風上差分なので、$hC \ge 0$ を保つには7章の Courant 条件が必要です。
@@ -409,6 +439,28 @@ $\hat h_j^{\ast,s}$ は、状態 $s$（$n$ または $\ast$）の流量で連続
 - 河床変動（4.6節、4.8節）は、修正子の後の流れで1ステップに1回だけ計算します。
 - 当初は、1ステップ全体を SSP-RK2 にしていました（$\mathbf{U}^{n+1} = (\mathbf{U}^n + S(S(\mathbf{U}^n)))/2$。[ADR-0016](adr/0016-second-order-advection-ssp-rk2.md)）。$S$ は水位を陰的に解くので、この平均は時刻 $n$ と $n+2$ の状態の平均に近く、重力波に対して時間について1次で余分に減衰しました（同じ条件で 0.897 倍。V04 の Thacker の振動が基準を外れた）。
 
+### 4.10 二次流
+
+2.5節の二次流の強さ $I$ をセル中心に置き（`State::spiral`）、流れを進めた後（予測子・修正子では修正子の後）に1ステップに1回進めます。河床変動を始める前（`morphology_start` まで）も毎ステップ進めます。移流拡散は、浮遊砂と共用するスカラーの移流拡散（`transport`）で解きます。決め方の理由は [ADR-0019](adr/0019-secondary-flow.md) にあります。
+
+$$
+A_i h_i^{n+1} I_i^\ast = A_i h_i^n I_i^n - \Delta t\sum_{j\in\partial i} s_{i,j} L_j\, q_j^\theta\, I_{\mathrm{up}(j)}^n + \Delta t\sum_{j\in\partial i} \frac{L_j K_j}{\delta_j}\left(I_{k(i,j)}^n - I_i^n\right), \qquad h_i^n = h_i^{n+1} + \frac{\Delta t}{A_i}\sum_{j\in\partial i} s_{i,j} L_j\, q_j^\theta
+$$
+
+$$
+I_i^{n+1} = \frac{L_{I,i}\, I_i^\ast + \Delta t\, h_i\, a_{n,i}}{L_{I,i} + \Delta t\,\lvert\mathbf{u}_i\rvert}
+$$
+
+- **移流**：連続式と同じ θ 平均流量 $q_j^\theta$（4.7節）の1次風上差分です。
+- **時刻 $n$ の水深**：連続式を逆にたどって求めます。流れの計算は $V^{n+1} = V^n - \Delta t\sum_j s L q^\theta$ を Newton 法の残差の範囲で満たすので、$h^n$ は実際の値とその範囲で一致し、しかも上の式と丸め誤差まで整合します。$I$ が一様なら、移流で一様な状態が崩れません。状態には $hI$ ではなく $I$ を持つので、河床の更新（4.8節。湛水セルの水位を保つので水深が変わる）で $I$ は変わりません。
+- **拡散**：辺の2点差分で陽的に扱います。$K_j = (hD)_j = \alpha_D\, u_{\ast j} H_j^2$、$u_{\ast j} = \sqrt{g}\,n\lvert\mathbf{u}\rvert_j/H_j^{1/6}$ で、$H_j$ と $\lvert\mathbf{u}\rvert_j$ は掃流力と同じ辺の水深と速さです。乾いた辺と境界辺（壁・開境界）では 0、周期境界の継ぎ目の辺は内部の辺と同じです。
+- **緩和**：陰的に扱います。$h_i$、$\lvert\mathbf{u}_i\rvert$（Perot 流速の大きさ）、$a_{n,i}$、$L_{I,i}$ は時刻 $n+1$ の流れの値です。$\lvert\mathbf{u}\rvert$ で割らない形なので、$\lvert\mathbf{u}\rvert \to 0$ でも特異になりません。$L_I = 0$ なら $I = I_e$（平衡）、$L_I = 0$ かつ $\lvert\mathbf{u}\rvert = 0$ なら $I = I^\ast$ です。
+- **遠心加速度**：セル中心の Perot 流速 $\mathbf{u}_i$ と、その最小二乗の勾配（4.4節と同じ `mesh::gradient`）から $a_{n,i} = \left(\mathbf{u}\times(\mathbf{u}\cdot\nabla)\mathbf{u}\right)_z/\lvert\mathbf{u}\rvert$ を求めます。正多角形のセルでは、剛体回転の流れで $I_e = h\omega$ が丸め誤差まで一致します。
+- **汀線では $a_n = 0$**：セルか隣のセルに乾いた内部の辺（$H_j = 0$）があれば、勾配を使いません（4.4節の2次の移流と同じ規則）。汀線のセルの Perot 流速は小さく出るので、誤った遠心加速度を防ぎます。開境界の辺を持つセルは 0 にしません（二次流は流れに戻らないので、正のフィードバックがない）。
+- **境界**：乾いたセル（$h <$ `dry_depth`）では $I = 0$ です。上流端から流れ込む水の $I$ は 0、下流端は自由流出（逆流のときは内側のセルの値）です。
+- `kind = "equilibrium"` では、移流拡散を解かずに $I = h a_n/\lvert\mathbf{u}\rvert$（$\lvert\mathbf{u}\rvert = 0$ なら 0）とします。
+- 1次風上の数値拡散（$\lvert\mathbf{u}\rvert\Delta x/2$）は、物理の拡散よりずっと大きくなります（V09 の条件で約 1.9 m²/s と 0.023 m²/s）。それでも、適応長（V09 の条件で 10.5 m）が砂州の波長（211 m）よりずっと短いので、砂州の波長で $I$ の振幅に効く量は 1% 未満です。
+
 ## 5. 1ステップの手順
 
 | 段階 | 処理 | 主なモジュール |
@@ -420,14 +472,15 @@ $\hat h_j^{\ast,s}$ は、状態 $s$（$n$ または $\ast$）の流量で連続
 | 流れ 4 | Newton 法＋行列フリー PCG で $\boldsymbol{\eta}^{n+1}$ を求める | `hydro::WaterLevelOperator`, `linsolve::pcg` |
 | 流れ 5 | $u_j^{n+1}$ を更新し、θ 平均流量 $q_j^{\theta}$ を保存する | `hydro::HydroSolver::step` |
 | 流れ 6 | 乾いたセルの水位を河床高に揃え、Perot 法でセル中心の流速 $\mathbf{u}_i^{n+1}$ を再構成 | `hydro::reconstruct_cell_velocity` |
-| 流砂 7 | 辺の掃流砂量 $q_{b,j}$（勾配補正、非侵食層の頭打ち） | `sediment::SedimentSolver::compute_bedload` |
-| 流砂 8 | 浮遊砂 $(hC)^{n+1}$（沈降は陰的） | `sediment::SedimentSolver::step_suspended` |
-| 流砂 9 | Exner 式（MORFAC）、安息角補正、水位の調整 | `sediment::SedimentSolver::update_bed` |
-| 収支 10 | 水と土砂の質量収支を更新し、出力時刻なら VTK を書く | `model`, `io` |
+| 流砂 7 | 二次流の強さ $I^{n+1}$（`[sediment.secondary_flow]` のとき。4.10節） | `sediment::SedimentSolver::step_secondary_flow` |
+| 流砂 8 | 辺の掃流砂量 $q_{b,j}$（勾配補正、二次流による向きの補正、非侵食層の頭打ち） | `sediment::SedimentSolver::compute_bedload` |
+| 流砂 9 | 浮遊砂 $(hC)^{n+1}$（沈降は陰的） | `sediment::SedimentSolver::step_suspended` |
+| 流砂 10 | Exner 式（MORFAC）、安息角補正、水位の調整 | `sediment::SedimentSolver::update_bed` |
+| 収支 11 | 水と土砂の質量収支を更新し、出力時刻なら VTK を書く | `model`, `io` |
 
 `time_integration = "predictor_corrector"` では、流れ 1〜6 で予測子を求め、その状態で流れ 1〜2 を行って時刻 $n$ の値と平均し、時刻 $n$ の状態から流れ 3〜6 を行います（4.9節、`hydro::HydroSolver::step`）。
 
-セル中心の流速 $\mathbf{u}_i^n$（摩擦と移流に使う）は、前のステップの最後（初期状態ではモデルの組み立て時）に再構成した値です。流砂の段階（7〜9）は、時刻が `time.morphology_start` を過ぎてから行います。
+セル中心の流速 $\mathbf{u}_i^n$（摩擦と移流に使う）は、前のステップの最後（初期状態ではモデルの組み立て時）に再構成した値です。流砂の段階のうち 8〜10 は、時刻が `time.morphology_start` を過ぎてから行います。7（二次流）は、河床変動を始めたときに二次流が発達しているように、最初から毎ステップ行います。
 
 ## 6. 境界条件
 
@@ -470,6 +523,7 @@ $$
 \Delta t \sum_{j\in\partial i,\ s_{i,j} q_j > 0} s_{i,j}\, L_j\, q_j \le V_i
 $$
 
+- **二次流（4.10節）の拡散**：陽的に扱うので、$I^\ast$ が $I^n$ の凸結合になるには $\Delta t\sum_j\left(s_{i,j}L_j q_j^\theta\text{ の流出分} + L_j K_j/\delta_j\right) \le A_i h_i^n$ が必要です。拡散の部分は、おおよそ $4D\Delta t/\Delta x^2$ で、V09 の条件で約 0.02 です。$D/(\lvert\mathbf{u}\rvert h) = \alpha_D\sqrt{g}\,n/h^{1/6} \approx 0.015$ なので、格子幅が水深の数 % より大きければ、移流の条件より緩くなります。
 - **河床**：MORFAC を掛けた河床の変化が、1ステップで隣のセルとの高低差を逆転させない程度に抑えます。時間刻みは流れのクーラン数だけで決め、1ステップの河床の変化の最大値を記録して表示します（`BedUpdateReport::max_change`）。
 
 **移流と時間積分の安定性**：上の条件は陽的な部分で水深が負にならない条件で、安定の条件はもう少し厳しくなります。一様流のまわりで線形化した1次元の解析（`tools/advection_stability.py`、θ = 0.55、摩擦なし、[ADR-0016](adr/0016-second-order-advection-ssp-rk2.md)、[ADR-0017](adr/0017-predictor-corrector.md)）では、限界のクーラン数は次のとおりです。
@@ -508,7 +562,8 @@ $$
 - 辺の水深 $H_j = \eta_{\mathrm{up}} - \max(z_{b,1}, z_{b,2})$（4.1節）の2次精度化。連続式・運動量式・掃流砂で共用するこの値は1次精度で、流れに斜めの辺（六角形配置の大部分、正方形配置の横断方向の辺）では、勾配の差ではなく砂州の起伏で高い方の河床を選ぶので、辺の水深を系統的に小さくします。2次の移流と予測子・修正子にしても、V09 の成長率は1次の収束のままです（正方形配置 10・20 行で −22%・−11%、六角形配置 20・40 行で −63%・−32%）。試しに両側のセルの水深の平均 $(h_1 + h_2)/2$ にすると、六角形配置で 20 行 −9%・40 行 −2%、正方形配置 40 行で −0.6% まで縮みましたが（ADR-0016 の作業中の試算）、正方形配置の 20 行と、1次の移流との組み合わせでは、河床の格子規模の成分が育って不安定でした。段差（床止め）の上の流れを正しく表す性質（[ADR-0006](adr/0006-wet-dry-and-newton.md)）を保ったまま2次にするには、制限つきの再構成などの工夫が要ります。
 - 運動量保存形とエネルギー水頭保存形を切り替える判定方法
 - セル内の河床の起伏（サブグリッド地形、Casulli, 2009）を体積関数に入れるかどうか
-- 二次流による掃流砂の向きの補正（湾曲水路の検証ケース V10 で必要になる）
+- 二次流が運動量式に与える効果（分散応力。Deltares, 2026 の式 5.33〜5.38）。今は掃流砂の向きだけを補正しています（2.5節、[ADR-0019](adr/0019-secondary-flow.md)）。V09・V10 の結果を見て、必要かどうかを判断します。
+- セル中心のスカラー（二次流の強さ、浮遊砂の濃度）の移流の2次精度化。今は1次風上差分で（4.10節）、2次の再構成は前進 Euler と組み合わせると不安定なので（[ADR-0016](adr/0016-second-order-advection-ssp-rk2.md)）、予測子・修正子と組み合わせる形が必要です。
 - 混合粒径（平野, 1971 の交換層モデル）
 - 水平渦粘性の要否
 

@@ -36,6 +36,7 @@ height = 1.0            # 落差 [m]
 gravity = 9.81                  # [m/s²]
 water_density = 1000.0          # [kg/m³]
 kinematic_viscosity = 1.0e-6    # [m²/s]
+von_karman = 0.41               # カルマン定数（二次流の適応長に使う）
 
 [time]
 # 時間刻みは可変：セルから1ステップで流出する体積が、セルの体積の courant 倍以下になる
@@ -78,6 +79,13 @@ kinetic_friction = 0.45     # μ_k（勾配補正）
 # entrainment = "itakura_kishi"   # または "garcia_parker"
 # min_depth = 0.05                # [m]
 # diffusivity_coef = 0.15
+
+# 二次流（らせん流）で掃流砂の向きを内岸側へ回す場合はコメントを外す（湾曲水路向け。ADR-0019）。
+# 直線水路のこの例題では、流れの曲がりは床止めの付近に限られるので省略している。
+# [sediment.secondary_flow]
+# kind = "transport"              # "transport"（輸送方程式型）または "equilibrium"（平衡型）
+# n_star = 7.0                    # 偏角の係数 N*（tan δ = N* I / |u|）
+# diffusivity_coef = 0.15         # 二次流の強さの拡散係数 D = α u* h の α
 
 [boundary.upstream]
 kind = "discharge"
