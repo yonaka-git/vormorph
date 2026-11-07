@@ -132,10 +132,11 @@ fn run_rejects_suspended_sediment_until_it_is_implemented() {
     let dir = work_dir("cli-suspended");
     let text_config = std::fs::read_to_string(SILL)
         .expect("examples/sill.toml must be readable")
-        .replace("# [sediment.suspended]", "[sediment.suspended]")
-        .replace("# entrainment =", "entrainment =")
-        .replace("# min_depth =", "min_depth =")
-        .replace("# diffusivity_coef =", "diffusivity_coef =");
+        .replacen("# [sediment.suspended]", "[sediment.suspended]", 1)
+        .replacen("# entrainment =", "entrainment =", 1)
+        .replacen("# min_depth =", "min_depth =", 1)
+        // 浮遊砂の節の行（二次流の節の同名の行より前にある）
+        .replacen("# diffusivity_coef =", "diffusivity_coef =", 1);
     let config = dir.join("suspended.toml");
     std::fs::write(&config, text_config).expect("the config must be writable");
     let out = vormorph(&["run", config.to_str().expect("utf-8 path")]);

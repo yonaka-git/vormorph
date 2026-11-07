@@ -13,7 +13,9 @@
 //! - 隣のセルが一直線に並ぶ（幅が1セルの水路など）ときは、M の階数が 1 になる。その向きの
 //!   成分だけを求め、直交する成分は 0 とする。
 //!
-//! 使う所：開境界の辺の河床勾配（[`crate::sediment::bed_gradient`]）。
+//! 使う所：開境界の辺の河床勾配（[`crate::sediment::bed_gradient`]）、2次の移流の流速の勾配
+//! （[`crate::hydro::advection_second_order`]）、二次流の遠心加速度
+//! （[`crate::sediment::secondary_flow`]）。
 
 use super::{Jagged, Mesh, NONE};
 
@@ -91,6 +93,24 @@ impl CellGradient {
         }
         g
     }
+
+    /// セル中心のベクトル `values` の、セル `c` での勾配 ∂v_a/∂x_b（`[a][b]`）。
+    ///
+    /// 成分ごとに [`CellGradient::of`] と同じ和をとる。
+    pub fn of_vector(&self, mesh: &Mesh, values: &[[f64; 2]], c: usize) -> [[f64; 2]; 2] {
+        let mut g = [[0.0; 2]; 2];
+        let [ux, uy] = values[c];
+        for (&k, &[wx, wy]) in mesh.cells_on_cell[c].iter().zip(self.weights(c)) {
+            if k != NONE {
+                let [vx, vy] = values[k];
+                g[0][0] += wx * (vx - ux);
+                g[0][1] += wy * (vx - ux);
+                g[1][0] += wx * (vy - uy);
+                g[1][1] += wy * (vy - uy);
+            }
+        }
+        g
+    }
 }
 
 #[cfg(test)]
@@ -132,11 +152,16 @@ mod tests {
             let values: Vec<f64> = (0..mesh.n_cells())
                 .map(|c| 0.3 + gx * mesh.x_cell[c] + 0.05 * mesh.y_cell[c])
                 .collect();
+            // ベクトル：x 成分は上の場、y 成分は −2 倍の場
+            let vectors: Vec<[f64; 2]> = values.iter().map(|&v| [v, -2.0 * v]).collect();
             for c in 0..mesh.n_cells() {
                 let [x, y] = gradient.of(&mesh, &values, c);
                 let expected_y = if width > 1.0 { 0.05 } else { 0.0 };
                 assert!((x - gx).abs() < 1e-12, "{layout:?} cell {c}: {x}");
                 assert!((y - expected_y).abs() < 1e-12, "{layout:?} cell {c}: {y}");
+                let g = gradient.of_vector(&mesh, &vectors, c);
+                assert_eq!(g[0], [x, y]);
+                assert!((g[1][0] + 2.0 * x).abs() < 1e-15 && (g[1][1] + 2.0 * y).abs() < 1e-15);
             }
         }
     }

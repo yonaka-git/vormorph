@@ -12,7 +12,7 @@ use std::io;
 use std::path::PathBuf;
 use vormorph::config::ChannelLayout;
 use vormorph::hydro;
-use vormorph::io::VtkWriter;
+use vormorph::io::{SedimentOutput, VtkWriter};
 use vormorph::mesh::Mesh;
 use vormorph::mesh::channel::{self, ChannelSpec};
 use vormorph::state::State;
@@ -200,7 +200,8 @@ fn invalid_states_are_rejected_without_writing() {
 }
 
 /// 移動床のときは、辺の掃流砂量をセル中心へ再構成した `qb` と、非侵食層の印 `fixed_bed` を書く。
-/// 一様な掃流砂量なら、`qb` は丸め誤差の範囲で元のベクトルに一致する。固定床では書かない。
+/// 一様な掃流砂量なら、`qb` は丸め誤差の範囲で元のベクトルに一致する。二次流を考えるときは
+/// `spiral` も書く。固定床では書かない。
 #[test]
 fn bedload_fields_are_written_for_a_movable_bed() {
     let (mesh, mut state, zb_initial) = case();
@@ -214,7 +215,15 @@ fn bedload_fields_are_written_for_a_movable_bed() {
         .collect();
     let mut writer = VtkWriter::new(output_dir("bedload"), "case", DRY_DEPTH);
     let path = writer
-        .write_step(&mesh, &state, &zb_initial, Some(&bedload))
+        .write_step(
+            &mesh,
+            &state,
+            &zb_initial,
+            Some(SedimentOutput {
+                bedload: &bedload,
+                spiral: false,
+            }),
+        )
         .expect("write .vtu");
     let text = fs::read_to_string(&path).expect("read back");
     let qb = array(&text, "qb");
@@ -225,9 +234,36 @@ fn bedload_fields_are_written_for_a_movable_bed() {
     let fixed = array(&text, "fixed_bed");
     assert_eq!(fixed[0], 1.0);
     assert!(fixed[1..].iter().all(|&f| f == 0.0));
+    assert!(!text.contains("Name=\"spiral\""));
+
+    // 二次流を考えるときは、二次流の強さ I も書く
+    state.spiral = (0..n).map(|c| 1.0e-3 * c as f64 - 0.01).collect();
+    let with_spiral = SedimentOutput {
+        bedload: &bedload,
+        spiral: true,
+    };
+    let path = writer
+        .write_step(&mesh, &state, &zb_initial, Some(with_spiral))
+        .expect("write .vtu");
+    let text = fs::read_to_string(&path).expect("read back");
+    assert_eq!(array(&text, "spiral"), state.spiral);
+    let mut short = state.clone();
+    short.spiral.pop();
+    let err = writer
+        .write_step(&mesh, &short, &zb_initial, Some(with_spiral))
+        .expect_err("wrong length");
+    assert!(err.to_string().contains("state.spiral"), "{err}");
 
     let err = writer
-        .write_step(&mesh, &state, &zb_initial, Some(&bedload[1..]))
+        .write_step(
+            &mesh,
+            &state,
+            &zb_initial,
+            Some(SedimentOutput {
+                bedload: &bedload[1..],
+                spiral: false,
+            }),
+        )
         .expect_err("wrong length");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert!(err.to_string().contains("bedload"), "{err}");

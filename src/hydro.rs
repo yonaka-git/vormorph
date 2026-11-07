@@ -907,10 +907,18 @@ fn outflow_rate(mesh: &Mesh, state: &State, edge_flux: &[f64]) -> f64 {
 
 /// 辺 `e` での流速の大きさ |u|_j \[m/s\]。
 ///
-/// 法線成分は u_j、接線成分は両側のセルの Perot 流速の平均（境界辺では内側のセルの値）の
-/// 接線方向の成分とする。摩擦係数と、掃流砂の掃流力（[`crate::sediment`]）で同じ値を使う。
-/// 一様流では、Perot 法の再構成が厳密なので、元の速さに丸め誤差の範囲で一致する。
+/// 法線成分は u_j、接線成分は [`edge_tangential_velocity`] とする。摩擦係数と、掃流砂の掃流力
+/// （[`crate::sediment`]）で同じ値を使う。一様流では、Perot 法の再構成が厳密なので、元の速さに
+/// 丸め誤差の範囲で一致する。
 pub fn edge_speed(mesh: &Mesh, state: &State, e: usize) -> f64 {
+    state.u_n[e].hypot(edge_tangential_velocity(mesh, state, e))
+}
+
+/// 辺 `e` での流速の接線成分 u_t = **u**·(**k** × **n**_j) \[m/s\]（**k** × **n**_j は法線を
+/// 反時計回りに 90° 回した向き）。
+///
+/// 両側のセルの Perot 流速の平均（境界辺では内側のセルの値）の接線方向の成分。
+pub fn edge_tangential_velocity(mesh: &Mesh, state: &State, e: usize) -> f64 {
     let [c1, c2] = mesh.cells_on_edge[e];
     let [mut vx, mut vy] = state.u_cell[c1];
     if c2 != NONE {
@@ -919,8 +927,7 @@ pub fn edge_speed(mesh: &Mesh, state: &State, e: usize) -> f64 {
         vy = 0.5 * (vy + wy);
     }
     let [nx, ny] = mesh.normal_edge[e];
-    let tangential = vy * nx - vx * ny;
-    state.u_n[e].hypot(tangential)
+    vy * nx - vx * ny
 }
 
 /// 水位方程式の残差 r_i = b_i − V_i(η_i) − Σ_j w_j (η_i − η_{k(i,j)}) を `out` に書き、
@@ -1297,21 +1304,12 @@ fn velocity_gradients(
             .any(|&e| matches!(mesh.edge_kind[e], EdgeKind::Upstream | EdgeKind::Downstream))
     };
     for (c, g) in gradient.iter_mut().enumerate() {
-        *g = [[0.0; 2]; 2];
         let neighbors = &mesh.cells_on_cell[c];
-        if !wet[c] || open(c) || neighbors.iter().any(|&k| k != NONE && !wet[k]) {
-            continue;
-        }
-        let [ux, uy] = state.u_cell[c];
-        for (&k, &[wx, wy]) in neighbors.iter().zip(weights.weights(c)) {
-            if k != NONE {
-                let [vx, vy] = state.u_cell[k];
-                g[0][0] += wx * (vx - ux);
-                g[0][1] += wy * (vx - ux);
-                g[1][0] += wx * (vy - uy);
-                g[1][1] += wy * (vy - uy);
-            }
-        }
+        *g = if !wet[c] || open(c) || neighbors.iter().any(|&k| k != NONE && !wet[k]) {
+            [[0.0; 2]; 2]
+        } else {
+            weights.of_vector(mesh, &state.u_cell, c)
+        };
     }
 }
 

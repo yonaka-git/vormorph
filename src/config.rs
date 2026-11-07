@@ -26,7 +26,7 @@
 //! | `[physics]` | [`PhysicsConfig`] | 物理定数（省略時は既定値） |
 //! | `[time]` | [`TimeConfig`] | 時間刻み・終了時刻・河床変動の開始時刻 |
 //! | `[hydro]` | [`HydroConfig`] | θ、粗度係数、wet/dry の閾値、移流、時間積分、反復解法 |
-//! | `[sediment]` | [`SedimentConfig`] | 粒径・空隙率・流砂量式・MORFAC など（省略時は固定床） |
+//! | `[sediment]` | [`SedimentConfig`] | 粒径・空隙率・流砂量式・MORFAC・二次流など（省略時は固定床） |
 //! | `[boundary]` | [`BoundaryConfig`] | 上流端・下流端の境界条件（それ以外の境界は壁。両端を `periodic` にすると周期境界） |
 //! | `[output]` | [`OutputConfig`] | 出力先と出力間隔 |
 
@@ -150,6 +150,8 @@ pub struct PhysicsConfig {
     pub water_density: f64,
     /// 水の動粘性係数 ν \[m²/s\]。
     pub kinematic_viscosity: f64,
+    /// カルマン定数 κ \[-\]（二次流の適応長に使う）。
+    pub von_karman: f64,
 }
 
 impl Default for PhysicsConfig {
@@ -158,6 +160,7 @@ impl Default for PhysicsConfig {
             gravity: 9.81,
             water_density: 1000.0,
             kinematic_viscosity: 1.0e-6,
+            von_karman: 0.41,
         }
     }
 }
@@ -335,6 +338,9 @@ pub struct SedimentConfig {
     pub bedload: BedloadConfig,
     /// 浮遊砂。`None`（セクションを省略）のときは浮遊砂を考慮しない。
     pub suspended: Option<SuspendedConfig>,
+    /// 二次流による掃流砂の向きの補正。`None`（セクションを省略）のときは補正しない
+    /// （掃流砂は水深平均流速の向き）。
+    pub secondary_flow: Option<SecondaryFlowConfig>,
 }
 
 fn default_sediment_density() -> f64 {
@@ -393,6 +399,43 @@ pub struct SuspendedConfig {
     pub min_depth: f64,
     /// 水平拡散係数 ε = α u_* h の係数 α \[-\]。
     pub diffusivity_coef: f64,
+}
+
+/// 二次流（らせん流）の設定（[`crate::sediment::secondary_flow`]、ADR-0019）。
+///
+/// 二次流の強さ I を求め、掃流砂の向きを内岸側へ tan δ = N* I / |u| だけ回す。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondaryFlowConfig {
+    /// I の求め方（省略時は輸送方程式型）。
+    #[serde(default)]
+    pub kind: SecondaryFlowKind,
+    /// 掃流砂の偏角の係数 N* \[-\]（Engelund, 1974 の 7）。
+    #[serde(default = "default_n_star")]
+    pub n_star: f64,
+    /// I の水平拡散係数 D = α_D u_* h の係数 α_D \[-\]（輸送方程式型だけで使う）。
+    #[serde(default = "default_secondary_flow_diffusivity")]
+    pub diffusivity_coef: f64,
+}
+
+fn default_n_star() -> f64 {
+    7.0
+}
+
+fn default_secondary_flow_diffusivity() -> f64 {
+    0.15
+}
+
+/// 二次流の強さ I の求め方。設定ファイルでは `"transport"`（既定）または `"equilibrium"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondaryFlowKind {
+    /// 輸送方程式型（非平衡型）：遠心加速度を生成項とし、適応長 L_I で平衡値 I_e へ緩和する
+    /// I の移流拡散方程式を解く。湾曲部の下流でゆっくり減衰する二次流も表せる。
+    #[default]
+    Transport,
+    /// 平衡型：各時刻の流れの平衡値 I = I_e を使う（輸送方程式型の L_I → 0 の極限。比較用）。
+    Equilibrium,
 }
 
 /// 浮遊砂の浮上量式。設定ファイルでは `"itakura_kishi"` または `"garcia_parker"`。
@@ -641,6 +684,10 @@ impl Config {
             positive(physics.kinematic_viscosity),
             "physics.kinematic_viscosity must be > 0",
         );
+        require(
+            positive(physics.von_karman) && physics.von_karman < 1.0,
+            "physics.von_karman must be in (0, 1)",
+        );
 
         let time = &self.time;
         require(positive(time.end), "time.end must be > 0");
@@ -750,6 +797,16 @@ impl Config {
                     "sediment.suspended.diffusivity_coef must be >= 0",
                 );
             }
+            if let Some(secondary) = &sediment.secondary_flow {
+                require(
+                    secondary.n_star.is_finite() && secondary.n_star >= 0.0,
+                    "sediment.secondary_flow.n_star must be >= 0",
+                );
+                require(
+                    secondary.diffusivity_coef.is_finite() && secondary.diffusivity_coef >= 0.0,
+                    "sediment.secondary_flow.diffusivity_coef must be >= 0",
+                );
+            }
         }
 
         match &self.boundary.upstream {
@@ -857,6 +914,16 @@ impl TimeIntegration {
     }
 }
 
+impl SecondaryFlowKind {
+    /// 設定ファイルでの表記。
+    fn name(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Equilibrium => "equilibrium",
+        }
+    }
+}
+
 impl SedimentSupply {
     /// 設定ファイルでの表記。
     fn name(self) -> &'static str {
@@ -926,14 +993,22 @@ impl fmt::Display for Summary<'_> {
             c.hydro.time_integration.name()
         )?;
         match &c.sediment {
-            Some(s) => writeln!(
-                f,
-                "sediment   : d {} m, bedload {}, MORFAC {}, suspended {}",
-                s.grain_size,
-                s.bedload.formula.name(),
-                s.morfac,
-                if s.suspended.is_some() { "on" } else { "off" }
-            )?,
+            Some(s) => {
+                write!(
+                    f,
+                    "sediment   : d {} m, bedload {}, MORFAC {}, suspended {}",
+                    s.grain_size,
+                    s.bedload.formula.name(),
+                    s.morfac,
+                    if s.suspended.is_some() { "on" } else { "off" }
+                )?;
+                match &s.secondary_flow {
+                    Some(sf) => {
+                        writeln!(f, ", secondary flow {} (N* {})", sf.kind.name(), sf.n_star)?
+                    }
+                    None => writeln!(f, ", secondary flow off")?,
+                }
+            }
             None => writeln!(f, "sediment   : fixed bed")?,
         }
         match &c.boundary.upstream {
@@ -1202,6 +1277,75 @@ mod tests {
         let text = format!("{}{}", &SILL[..start], &SILL[end..]);
         let config: Config = text.parse().expect("valid without [physics]");
         assert_eq!(config.physics, PhysicsConfig::default());
+    }
+
+    /// `[sediment.secondary_flow]` は省略できる（補正なし）。節だけ書けば輸送方程式型・N* = 7・
+    /// α_D = 0.15 になる。
+    #[test]
+    fn secondary_flow_section_has_defaults() {
+        let config: Config = SILL.parse().expect("valid");
+        let sediment = config.sediment.as_ref().expect("sill.toml has [sediment]");
+        assert_eq!(sediment.secondary_flow, None);
+        assert!(config.summary().to_string().contains("secondary flow off"));
+        assert_eq!(config.physics.von_karman, 0.41);
+
+        let with = |lines: &str| {
+            SILL.replacen(
+                "\n[boundary.upstream]\n",
+                &format!("\n[sediment.secondary_flow]\n{lines}\n\n[boundary.upstream]\n"),
+                1,
+            )
+            .parse::<Config>()
+        };
+        let config = with("").expect("an empty section is valid");
+        let secondary = config
+            .sediment
+            .as_ref()
+            .and_then(|s| s.secondary_flow.clone())
+            .expect("secondary flow is on");
+        assert_eq!(
+            secondary,
+            SecondaryFlowConfig {
+                kind: SecondaryFlowKind::Transport,
+                n_star: 7.0,
+                diffusivity_coef: 0.15,
+            }
+        );
+        assert!(
+            config
+                .summary()
+                .to_string()
+                .contains("secondary flow transport (N* 7)")
+        );
+        let equilibrium = with("kind = \"equilibrium\"\nn_star = 11.0").expect("valid");
+        let secondary = equilibrium
+            .sediment
+            .and_then(|s| s.secondary_flow)
+            .expect("secondary flow is on");
+        assert_eq!(secondary.kind, SecondaryFlowKind::Equilibrium);
+        assert_eq!(secondary.n_star, 11.0);
+
+        let messages = invalid_messages(with("n_star = -1.0\ndiffusivity_coef = -0.1"));
+        assert!(
+            messages.iter().any(|m| m.contains("n_star")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("diffusivity_coef")),
+            "{messages:?}"
+        );
+        assert!(matches!(
+            with("kind = \"engelund\""),
+            Err(ConfigError::Parse(_))
+        ));
+        assert!(matches!(with("nstar = 7.0"), Err(ConfigError::Parse(_))));
+        let kappa = SILL.replacen("von_karman = 0.41", "von_karman = 0.0", 1);
+        assert_ne!(kappa, SILL, "sill.toml has von_karman");
+        let messages = invalid_messages(kappa.parse());
+        assert!(
+            messages.iter().any(|m| m.contains("physics.von_karman")),
+            "{messages:?}"
+        );
     }
 
     #[test]

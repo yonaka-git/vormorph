@@ -8,6 +8,7 @@
 //! | `hc` | セル | hC | 水深と水深平均濃度の積（浮遊砂の保存量） | m |
 //! | `u_n` | 辺 | u_n | 法線流速（`cells_on_edge[e][0]` から `[1]` へ向かう向きを正） | m/s |
 //! | `u_cell` | セル | **u**_i | Perot 法で再構成した流速ベクトル（流砂の評価と出力に使う） | m/s |
+//! | `spiral` | セル | I | 二次流（らせん流）の強さ（左へ曲がる流れで正。二次流を考えないときは 0） | m/s |
 //!
 //! 水深 h = max(η − z_b, 0) は保存せず、[`State::depth`] で都度計算する。
 //! 辺の水深 H_j は風上側の水位で決まるため、[`crate::hydro`] が計算する。
@@ -29,6 +30,9 @@ pub struct State {
     pub u_n: Vec<f64>,
     /// セル中心の流速ベクトル \[m/s\]（Perot 法による再構成）。
     pub u_cell: Vec<[f64; 2]>,
+    /// 二次流の強さ I \[m/s\]（セル。[`crate::sediment::secondary_flow`]）。水深の積 hI ではなく
+    /// I を持つ（河床の更新で水深が変わっても I は変わらない）。
+    pub spiral: Vec<f64>,
 }
 
 impl State {
@@ -42,6 +46,7 @@ impl State {
             hc: vec![0.0; n_cells],
             u_n: vec![0.0; n_edges],
             u_cell: vec![[0.0; 2]; n_cells],
+            spiral: vec![0.0; n_cells],
         }
     }
 
