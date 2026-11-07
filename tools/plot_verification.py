@@ -80,8 +80,8 @@ V04_L = 4.0
 V04_G = 9.81
 """重力加速度 [m/s²]。"""
 V04_CASES = (
-    ("v04_rectangular", "upwind advection, rectangular", "-"),
-    ("v04_hexagonal", "upwind advection, hexagonal", (0, (4, 2))),
+    ("v04_rectangular", "second-order advection, rectangular", "-"),
+    ("v04_hexagonal", "second-order advection, hexagonal", (0, (4, 2))),
     ("v04_rectangular_none", "no advection, rectangular", "-"),
 )
 """（ケース名, 凡例, 線種）。正方形配置と六角形配置の線は重なるので、六角形配置を破線にする。"""
@@ -627,10 +627,18 @@ V09_PLAN = "v09_rectangular_20rows_b40_l211.4"
 V09_MAIN = (
     ("v09_rectangular_10rows_b40_l211.4", "square, 10 rows", 0, "--"),
     ("v09_rectangular_20rows_b40_l211.4", "square, 20 rows", 0, "-"),
-    ("v09_hexagonal_10rows_b40_l211.4", "hexagonal, 10 rows", 1, "--"),
-    ("v09_hexagonal_20rows_b40_l211.4", "hexagonal, 20 rows", 1, "-"),
+    ("v09_hexagonal_20rows_b40_l211.4", "hexagonal, 20 rows", 1, "--"),
+    ("v09_hexagonal_40rows_b40_l211.4", "hexagonal, 40 rows", 1, "-"),
+    ("v09_rectangular_20rows_b40_l211.4_upwind", "first-order advection, square, 20 rows", 0, ":"),
 )
-"""振幅の時系列を描くケース（ケース名、凡例、系列の色の番号、線の種類）。"""
+"""振幅の時系列を描くケース（ケース名、凡例、系列の色の番号、線の種類）。既定は2次の移流。"""
+V09_MARKERS = {
+    ("SecondOrder", "Rectangular"): ("s", SERIES[0], "square"),
+    ("SecondOrder", "Hexagonal"): ("o", SERIES[1], "hexagonal"),
+    ("Upwind", "Rectangular"): ("s", "0.6", "square, first order"),
+    ("Upwind", "Hexagonal"): ("o", "0.6", "hexagonal, first order"),
+}
+"""成長率と波長の図の印（移流と配置ごとに、印、色、凡例）。1次の移流は比較のために灰色で描く。"""
 
 
 V09_TEXT_COLUMNS = ("case", "layout", "advection")
@@ -766,10 +774,9 @@ def plot_v09(root: Path, output: Path) -> None:
             zorder=0,
             label=f"linear theory, B = {width_case:g} m (β = {b:.1f})",
         )
-    markers = {"Rectangular": ("s", SERIES[0], "square"), "Hexagonal": ("o", SERIES[1], "hexagonal")}
     shown = set()
     for layout, coarse, fine in bar_refinement_pairs(list(summary.values())):
-        marker, color, name = markers[layout]
+        marker, color, name = V09_MARKERS[(str(fine["advection"]), layout)]
         wavelength = float(fine["wavelength"])
         for row, filled in ((coarse, False), (fine, True)):
             key = (name, filled)

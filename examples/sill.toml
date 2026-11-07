@@ -40,8 +40,8 @@ kinematic_viscosity = 1.0e-6    # [m²/s]
 [time]
 # 時間刻みは可変：セルから1ステップで流出する体積が、セルの体積の courant 倍以下になる
 # 最大の値を dt_max で頭打ちにして使う（固定にするなら courant と dt_max の代わりに dt を書く）。
-# 床止めの直下の射流（約 5.7 m/s）で、格子幅 1 m の六角形配置なら dt ≈ 0.062 s になる。
-courant = 0.5
+# 床止めの直下の射流（約 6 m/s）で、格子幅 1 m の六角形配置なら dt ≈ 0.075 s になる。
+courant = 0.8
 dt_max = 0.2            # [s]（乾いた状態から始めるときの上限）
 end = 3600.0            # [s]（流れの時間）
 morphology_start = 600.0  # 助走計算の後に河床変動を始める [s]（乾いた状態から約 500 s で定常）
@@ -50,8 +50,8 @@ morphology_start = 600.0  # 助走計算の後に河床変動を始める [s]（
 theta = 0.55
 manning_n = 0.025
 dry_depth = 1.0e-3      # [m]
-advection = "upwind"    # 運動量の移流："upwind"（保存型風上差分）、"second_order"、"none"
-time_integration = "euler"  # 時間積分："euler"（1段）または "predictor_corrector"（予測子・修正子。"second_order" に必要）
+advection = "second_order"  # 運動量の移流："second_order"（2次精度）、"upwind"（1次の風上差分）、"none"
+time_integration = "predictor_corrector"  # 時間積分："predictor_corrector"（"second_order" に必要）または "euler"（1段）
 
 [hydro.solver]
 newton_tol = 1.0e-10

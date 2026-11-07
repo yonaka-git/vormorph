@@ -84,7 +84,7 @@ fn check_prints_the_summary_of_the_example() {
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(stdout.contains("OK"), "{stdout}");
-    assert!(stdout.contains("adaptive dt (Courant 0.5"), "{stdout}");
+    assert!(stdout.contains("adaptive dt (Courant 0.8"), "{stdout}");
 }
 
 #[test]
