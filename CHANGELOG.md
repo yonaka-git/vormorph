@@ -107,4 +107,6 @@
 - 河床を作るツール `tools/make_bed.py` と、領域の定義の `[bed]`（`kind = "centerline"`：中心線に沿った一様な勾配、`kind = "plane"`：平面。`vormesh/bed.py`）。`examples/domains/straight.toml`・`bend.toml` に `[bed]` を追加。fixture `tests/data/straight_coarse.cells.toml`
 - 設定 `[mesh] kind = "file"` に `cells` を追加し、`Model::new`（`vormorph run`）が格子ファイルの格子を組み立てられるようにする（乾いた河床から始める。`[bed]` と周期境界は使えない）。`ModelError::MeshFile`・`ModelError::CellValues`。`vormorph check` の要約にセルの値のファイルを表示する
 - ADR-0020（格子ファイルの格子の河床高は、別のセルの値のファイルで与える）。`docs/design/mesh-generation.md` の第1章・第6章・第7章（7.2 節を新設）・第8章
+- 掃流砂量式の砂漣係数 `[sediment.bedload] ripple_factor`（μ、既定 1、0 < μ ≤ 1。ADR-0021）。有効掃流力 τ*e = μτ* を、MPM 式（限界との比較も τ*e。Struiksma, 1983 の式 (1)）と芦田・道上式（先頭の係数 17 τ*e^{3/2} だけ）に使う。勾配補正の γ は全掃流力 τ* のまま。μ = 1 ならこれまでと同じ計算。`sediment::formulas::bedload_intensity` は砂漣係数を、`ashida_michiue` は有効掃流力と全掃流力を受け取る形に変更。`vormorph check` の要約に、1 でない砂漣係数を表示する。`examples/sill.toml` に `ripple_factor = 1.0` を明記
+- ADR-0021（流砂量式の有効掃流力に砂漣係数を掛ける。勾配補正の γ には掛けない）。`docs/design/overview.md` の第2.2節・第4.6節。`docs/references.md` に Struiksma (1983)（DHL の湾曲水路の移動床実験。V10 の比較対象）を追加
 - ライセンス：MIT OR Apache-2.0
