@@ -66,7 +66,12 @@
 //! どちらも多角形の並び（[`voronoi::PolygonMesh`]）を作り、[`voronoi::build`] で接続配列と
 //! 幾何量を組み立てる。格子生成ツールはセルをヒルベルト曲線の順に並べて書き出すので、
 //! 番号の近いセルは空間的にも近い（`docs/design/mesh-generation.md`）。
+//!
+//! 格子ファイルの格子のセルの河床高は、別のファイル（セルの値のファイル。[`cells::read`]、
+//! ADR-0020）で与える。`tools/make_bed.py` が、領域の定義の河床（中心線に沿った勾配か平面）を
+//! 母点で評価して書き出す。
 
+pub mod cells;
 pub mod channel;
 pub mod file;
 pub mod gradient;

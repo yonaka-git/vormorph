@@ -10,6 +10,10 @@ uv sync --project tools
 uv run --project tools python tools/make_mesh.py examples/domains/bend.toml \
     -o output/mesh/bend.mesh.toml --plot output/mesh/bend.png
 
+# 河床：格子の母点で領域の定義の [bed] を評価し、セルの値のファイルを作る（ADR-0020）
+uv run --project tools python tools/make_bed.py examples/domains/bend.toml \
+    output/mesh/bend.mesh.toml -o output/mesh/bend.cells.toml
+
 # 縦断図：セル中心を水路中心線の近くで切り出し、河床高と水位を描く
 uv run --project tools python tools/plot_profile.py output/sill/sill_*.vtu -o profile.png
 
@@ -29,10 +33,13 @@ uv run --project tools pytest tools/tests
 | ファイル | 内容 |
 |---|---|
 | `make_mesh.py` | 格子生成のコマンド。`--cell-size` と `--iterations` で領域の定義の値を上書きできる |
+| `make_bed.py` | 格子ファイルの母点で河床高を求め、セルの値のファイルを書くコマンド |
 | `vormesh/domain.py` | 領域の定義の読み込みと、gmsh による境界の分割・初期の母点 |
 | `vormesh/voronoi.py` | 境界の母点の対、Lloyd 法、多角形格子の組み立てと検査 |
 | `vormesh/hilbert.py` | ヒルベルト曲線による並べ替え |
 | `vormesh/meshfile.py` | 格子ファイル（vormorph mesh 形式 v1、TOML）の書き出しと読み込み |
+| `vormesh/bed.py` | 河床の定義（中心線に沿った勾配、平面）と、母点での河床高 |
+| `vormesh/cellsfile.py` | セルの値のファイル（vormorph cells 形式 v1、TOML）の書き出しと読み込み |
 | `vormesh/plot.py` | 格子の図（セルを番号で塗り分け、母点を番号順に結ぶ） |
 | `plot_profile.py` | `.vtu` のセルデータ（`x_cell`, `y_cell`, `zb`, `eta`, `h`）から縦断図を描く |
 | `plot_verification.py` | 検証ケースの図。ケースの条件は `tests/verification.rs` の定数と合わせる |

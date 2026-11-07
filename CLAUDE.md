@@ -25,7 +25,7 @@
 | 浮遊砂 | hC の移流拡散（連続式と同じ θ 平均流量を使用）。沈降は陰的に扱い、浅いセルでは浮上を止める |
 | 河床 | Exner 式、MORFAC、安息角補正（体積保存の Jacobi 型の反復）。河床更新時は湛水セルの水位を保持（ADR-0012） |
 | 境界条件 | 上流：流量（通水能で配分）と給砂（平衡給砂／一定の給砂量／なし。ADR-0011, 0013）、下流：水位固定／水深一定（水深一定は固定床だけ）、壁、周期境界（直線水路の両端をつなぐ。勾配は運動量式の体積力。ADR-0014） |
-| 格子生成 | gmsh を使った自作ツール（`tools/make_mesh.py`）。境界は鏡映対の母点、内部は重心ボロノイ分割。セルはヒルベルト曲線の順（ADR-0005） |
+| 格子生成 | gmsh を使った自作ツール（`tools/make_mesh.py`）。境界は鏡映対の母点、内部は重心ボロノイ分割。セルはヒルベルト曲線の順（ADR-0005）。河床高は別のセルの値のファイル（`tools/make_bed.py` が領域の定義の `[bed]`（中心線に沿った勾配か平面）を母点で評価。母点の座標で格子と照合。設定は `[mesh] cells`。ADR-0020） |
 | 言語 | Rust（stable）。外部依存は最小限（serde, toml 程度から始める） |
 | 出力 | ParaView 用 VTK |
 
@@ -36,7 +36,7 @@
 | パス | 内容 |
 |---|---|
 | `src/config.rs` | TOML 設定（物理定数の受け渡し口） |
-| `src/mesh/` | ボロノイ格子（MPAS 形式）、多角形の並びからの組み立て、直線水路の生成、格子ファイルの読み込み、セル中心の値の勾配（最小二乗） |
+| `src/mesh/` | ボロノイ格子（MPAS 形式）、多角形の並びからの組み立て、直線水路の生成、格子ファイルとセルの値のファイルの読み込み、セル中心の値の勾配（最小二乗） |
 | `src/state.rs` | 状態変数 |
 | `src/hydro.rs` | 半陰解法、Perot 再構成、移流（1次・2次）、時間積分（予測子・修正子） |
 | `src/linsolve.rs` | 行列フリー PCG |
@@ -46,7 +46,7 @@
 | `src/io.rs` | VTK 出力 |
 | `tests/verification.rs` | 検証ケース（`docs/verification.md` と 1 対 1） |
 | `examples/` | 例題の設定ファイル。`examples/domains/` は格子生成ツールの入力 |
-| `tools/` | Python の格子生成（`make_mesh.py`, `vormesh/`）と後処理（uv で管理）。テストは `tools/tests/` |
+| `tools/` | Python の格子生成（`make_mesh.py`, `make_bed.py`, `vormesh/`）と後処理（uv で管理）。テストは `tools/tests/` |
 | `references/` | 文献 PDF（コミットしない） |
 | `.devcontainer/` | GitHub Codespaces の開発環境（使い方は `docs/codespaces.md`） |
 
@@ -119,6 +119,6 @@ scope: config, mesh, hydro, linsolve, sediment, model, io, tools など（任意
 - 作者の環境は WSL2 上の Ubuntu で、リポジトリは Windows 側のドライブ（`/mnt/c/...`）にある。ファイルアクセスが遅いので、ビルドに時間がかかっても異常ではない。
 - Python の後処理と格子生成は `tools/` で uv を使う。例：`uv run --project tools python tools/plot_profile.py output/sill/*.vtu`
 - PyPI の gmsh は `libGLU.so.1` と `libXft.so.2` を必要とする（Ubuntu では `sudo apt install libglu1-mesa libxft2`）。ないと `import gmsh` が `OSError` になり、`tools/tests/test_gmsh.py` は飛ばされる。ただし `VORMORPH_REQUIRE_GMSH=1`（CI と Codespaces で設定）のときは失敗させる。
-- 格子ファイルの形式（`tools/vormesh/meshfile.py` と `src/mesh/file.rs`）を変えるときは、両方と `docs/design/mesh-generation.md` を同じコミットで直し、`tests/data/island_coarse.mesh.toml` を作り直す（コマンドは `tests/mesh_file.rs` の冒頭）。
+- 格子ファイルの形式（`tools/vormesh/meshfile.py` と `src/mesh/file.rs`）を変えるときは、両方と `docs/design/mesh-generation.md` を同じコミットで直し、`tests/data/island_coarse.mesh.toml` を作り直す（コマンドは `tests/mesh_file.rs` の冒頭）。セルの値のファイル（`tools/vormesh/cellsfile.py` と `src/mesh/cells.rs`）も同じで、`tests/data/straight_coarse.cells.toml` を作り直す（コマンドは `tests/cell_values.rs` の冒頭）。
 - 計算は GitHub Codespaces でも実行できる（`.devcontainer/`、手順は `docs/codespaces.md`）。アイドルタイムアウト（ターミナルへの出力でリセット）と最長 12 時間の制限がある。gmsh が必要とする共有ライブラリを変えたら `.devcontainer/Dockerfile` も直す。
 - CI（`.github/workflows/ci.yml`）は ubuntu と windows で fmt・clippy・test を、ubuntu で MSRV（1.85）の check と `cargo doc`、`tools/` の pytest を実行する。
