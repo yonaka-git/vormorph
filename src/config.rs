@@ -242,7 +242,7 @@ pub struct HydroConfig {
     /// 運動量の移流の扱い（省略時は保存型の風上差分）。
     #[serde(default)]
     pub advection: AdvectionScheme,
-    /// 時間積分の方法（省略時は1段）。2次の移流には `"ssp_rk2"` が必要（ADR-0016）。
+    /// 時間積分の方法（省略時は1段）。2次の移流には `"predictor_corrector"` が必要（ADR-0016、ADR-0017）。
     #[serde(default)]
     pub time_integration: TimeIntegration,
     /// 水位の連立方程式の反復解法。
@@ -262,7 +262,8 @@ pub enum AdvectionScheme {
     #[serde(rename = "upwind")]
     Upwind,
     /// 保存型の2次精度の差分（[`crate::hydro::advection_second_order`]。ADR-0016）。
-    /// セルの流速の勾配（最小二乗）で面の値を再構成する。`time_integration = "ssp_rk2"` が必要。
+    /// セルの流速の勾配（最小二乗）で面の値を再構成する。`time_integration = "predictor_corrector"`
+    /// が必要。
     #[serde(rename = "second_order")]
     SecondOrder,
     /// 移流項を省く（F u_j = u_j）。検証で移流の効果を比べるためのもので、急変流には使えない。
@@ -270,19 +271,21 @@ pub enum AdvectionScheme {
     Disabled,
 }
 
-/// 流れの時間積分の方法。設定ファイルでは `"euler"` または `"ssp_rk2"`。
+/// 流れの時間積分の方法。設定ファイルでは `"euler"` または `"predictor_corrector"`。
 ///
-/// どちらも、1段は θ 法の半陰解法の1ステップ S（移流は陽的に1回評価する）。
+/// どちらも、水位勾配は θ 法、摩擦は陰的に扱う。違いは陽的な部分（移流と、連続式の風上の
+/// 辺の水深）の扱い（[`crate::hydro::HydroSolver::step`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 pub enum TimeIntegration {
     /// S を1回（移流は前進 Euler）。
     #[default]
     #[serde(rename = "euler")]
     Euler,
-    /// 1ステップ全体の SSP-RK2（Heun）：u^{n+1} = (u^n + S(S(u^n))) / 2。
-    /// 計算量は2倍だが、2次の移流でも安定で、定常解は Δt によらない（ADR-0016）。
-    #[serde(rename = "ssp_rk2")]
-    SspRk2,
+    /// 予測子・修正子：時刻 n で1段解いた予測子 U* と時刻 n の陽的な部分を平均し（Heun 法）、
+    /// 時刻 n から水位を解き直す。計算量は2倍だが、2次の移流でも安定で、定常解は Δt によらず、
+    /// 重力波の減衰は θ 法と同じ（ADR-0017）。
+    #[serde(rename = "predictor_corrector")]
+    PredictorCorrector,
 }
 
 /// 水位の連立方程式（Newton 法＋PCG）の設定。
@@ -693,8 +696,8 @@ impl Config {
         require(positive(hydro.dry_depth), "hydro.dry_depth must be > 0");
         require(
             hydro.advection != AdvectionScheme::SecondOrder
-                || hydro.time_integration == TimeIntegration::SspRk2,
-            "hydro.advection = \"second_order\" needs hydro.time_integration = \"ssp_rk2\" (it is unstable with \"euler\")",
+                || hydro.time_integration == TimeIntegration::PredictorCorrector,
+            "hydro.advection = \"second_order\" needs hydro.time_integration = \"predictor_corrector\" (it is unstable with \"euler\")",
         );
         require(
             positive(hydro.solver.newton_tol) && hydro.solver.newton_max_iter > 0,
@@ -848,7 +851,7 @@ impl TimeIntegration {
     fn name(self) -> &'static str {
         match self {
             Self::Euler => "euler",
-            Self::SspRk2 => "ssp_rk2",
+            Self::PredictorCorrector => "predictor_corrector",
         }
     }
 }
@@ -1046,17 +1049,22 @@ mod tests {
             .replacen("advection = \"upwind\"", "advection = \"second_order\"", 1)
             .replacen(
                 "time_integration = \"euler\"",
-                "time_integration = \"ssp_rk2\"",
+                "time_integration = \"predictor_corrector\"",
                 1,
             );
-        let config: Config = text.parse().expect("second_order with ssp_rk2 is valid");
+        let config: Config = text
+            .parse()
+            .expect("second_order with predictor_corrector is valid");
         assert_eq!(config.hydro.advection, AdvectionScheme::SecondOrder);
-        assert_eq!(config.hydro.time_integration, TimeIntegration::SspRk2);
+        assert_eq!(
+            config.hydro.time_integration,
+            TimeIntegration::PredictorCorrector
+        );
         assert!(
             config
                 .summary()
                 .to_string()
-                .contains("advection second_order, time integration ssp_rk2")
+                .contains("advection second_order, time integration predictor_corrector")
         );
         let omitted = SILL.replacen("advection = \"upwind\"", "", 1);
         assert_eq!(
@@ -1072,7 +1080,7 @@ mod tests {
 
     /// 時間積分は省略すると1段。2次の移流は1段では不安定なので、組み合わせを誤りにする。
     #[test]
-    fn second_order_advection_needs_ssp_rk2() {
+    fn second_order_advection_needs_predictor_corrector() {
         let config: Config = SILL.parse().expect("valid");
         assert_eq!(config.hydro.time_integration, TimeIntegration::Euler);
         assert!(
@@ -1092,7 +1100,7 @@ mod tests {
         );
         let upwind = SILL.replacen(
             "time_integration = \"euler\"",
-            "time_integration = \"ssp_rk2\"",
+            "time_integration = \"predictor_corrector\"",
             1,
         );
         assert_eq!(
@@ -1101,7 +1109,7 @@ mod tests {
                 .expect("valid")
                 .hydro
                 .time_integration,
-            TimeIntegration::SspRk2
+            TimeIntegration::PredictorCorrector
         );
         let euler = SILL.replacen("advection = \"upwind\"", "advection = \"second_order\"", 1);
         match euler.parse::<Config>() {

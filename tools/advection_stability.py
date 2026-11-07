@@ -1,4 +1,4 @@
-"""運動量の移流と時間積分の、1次元の線形安定解析（ADR-0016）。
+"""運動量の移流と時間積分の、1次元の線形安定解析（ADR-0016、ADR-0017）。
 
 vormorph の半陰解法（`docs/design/overview.md` の4.1〜4.4節）を、1次元・周期・等間隔の C 格子で
 一様流（流速 U > 0、水深 H）のまわりに線形化し、1ステップの増幅行列のスペクトル半径 max|λ| を
@@ -21,20 +21,31 @@ vormorph の半陰解法（`docs/design/overview.md` の4.1〜4.4節）を、1�
 
 | 名前 | 内容 |
 |---|---|
-| `euler` | S を1回（移流は前進 Euler） |
-| `ssp_rk2` | 1ステップ全体の SSP-RK2：(I + S²)/2（vormorph の `time_integration = "ssp_rk2"`） |
+| `euler` | S を1回（移流は前進 Euler。vormorph の `time_integration = "euler"`） |
+| `predictor_corrector` | 予測子・修正子：x* = S x^n、L x^{n+1} = R_I x^n + (E x^n + E x*)/2（vormorph の `"predictor_corrector"`） |
+| `ssp_rk2` | 1ステップ全体の SSP-RK2：(I + S²)/2（ADR-0016 で採り、重力波を減衰させるので ADR-0017 で置き換えた） |
 | `lax_wendroff` | 面の値を Δt/2 だけ上流で評価する（û_l = U_l + (1 − C) G_l/2）。2次の移流だけ |
 | `advection_rk2` | 移流だけ SSP-RK2：A = I + ΔtL + (ΔtL)²/2（水位は1回） |
 | `ab3` | 移流を3段の Adams–Bashforth で積分する（前の2ステップの移流の項を使う） |
+
+S の右辺 R を、陽的な部分 E（移流の増分 F − I と、連続式の風上の水深の項 −(Δt/Δx) D' U η_up）と
+それ以外 R_I に分ける（R = R_I + E。L は S の左辺）。予測子・修正子は、陽的な部分を Heun 法で、
+陰的な部分（水位勾配、連続式の流速の項）を θ 法の1回で進める形になる。
 
 使い方：
 
     uv run --project tools python tools/advection_stability.py              # 限界クーラン数の表
     uv run --project tools python tools/advection_stability.py --theta 0.6 --friction
+    uv run --project tools python tools/advection_stability.py --gravity    # 重力波の減衰
 
 限界クーラン数は、C を 1 まで二分法で探した値（その C 以下で max|λ| ≤ 1）。この1次元の解析は、
 2次元の V09 で見えた横断方向の蛇行（前進 Euler と2次の移流）は表さないが、同じ組み合わせが
 1次元でも不安定になることを示す。
+
+重力波の減衰（`gravity_wave_amplitude`）は、平均流のない（U = 0）水面の振動の、最も長い波の
+1周期あたりの振幅の比。U = 0 では陽的な部分がないので、予測子・修正子は θ 法の1段と同じになる。
+SSP-RK2 の (I + S²)/2 は時刻 n と n+2 の状態の平均に近く、重力波に対しては時間について1次で
+余分に減衰する（1周期 200 ステップ、θ = 0.55 で、θ 法の 0.990 に対し 0.897）。
 """
 
 from __future__ import annotations
@@ -48,16 +59,25 @@ VELOCITY = 1.87  # 一様流の流速 [m/s]（V06・V09 の等流と同じ）
 CELL_SIZE = 2.0  # 格子幅 [m]（V09 の 20 行の正方形配置と同じ）
 MANNING_N = 0.025
 ADVECTION = ("upwind", "second_order")
-TIME_INTEGRATION = ("euler", "ssp_rk2", "lax_wendroff", "advection_rk2", "ab3")
+TIME_INTEGRATION = (
+    "euler",
+    "predictor_corrector",
+    "ssp_rk2",
+    "lax_wendroff",
+    "advection_rk2",
+    "ab3",
+)
 FROUDE = (0.2, 0.3, 0.58, 0.95)
 METHODS = (
     ("upwind", "euler"),
+    ("upwind", "predictor_corrector"),
     ("upwind", "ssp_rk2"),
     ("second_order", "euler"),
     ("second_order", "lax_wendroff"),
     ("second_order", "advection_rk2"),
     ("second_order", "ab3"),
     ("second_order", "ssp_rk2"),
+    ("second_order", "predictor_corrector"),
 )
 
 
@@ -88,19 +108,36 @@ def advection_matrix(n: int, courant: float, scheme: str, lax_wendroff: bool = F
     return np.array(columns).T
 
 
-def _blocks(n: int, depth: float, dt: float, theta: float, gamma: float):
-    """半陰解法の1段の左辺 L と、右辺のうち移流によらない部分（状態 (u, η)）。"""
+def _blocks(
+    n: int,
+    depth: float,
+    dt: float,
+    theta: float,
+    gamma: float,
+    advection: np.ndarray,
+    velocity: float = VELOCITY,
+    cell_size: float = CELL_SIZE,
+):
+    """半陰解法の1段の左辺 L、右辺 R、そのうちの陽的な部分 E（状態 (u, η)）。
+
+    `advection` は移流の行列 A（u^n → F u^n）。E は移流の増分 A − I と、連続式の風上の水深の項。
+    """
     eye = np.eye(n)
+    zero = np.zeros((n, n))
     grad = _shift_matrix(n, 1) - eye  # (D η)_j = η_{j+1} − η_j
     div = eye - _shift_matrix(n, -1)  # (D' q)_i = q_i − q_{i−1}
-    a = GRAVITY * dt / CELL_SIZE
-    b = dt / CELL_SIZE
+    a = GRAVITY * dt / cell_size
+    b = dt / cell_size
     lhs = np.block([[(1.0 + dt * gamma) * eye, theta * a * grad], [b * theta * depth * div, eye]])
-    eta_part = np.block(
-        [[-(1.0 - theta) * a * grad], [eye - b * VELOCITY * div]]
-    )  # η^n の列
-    u_part = -b * (1.0 - theta) * depth * div  # 連続式の u^n の項
-    return lhs, eta_part, u_part
+    upwind_depth = -b * velocity * div  # 連続式の U η_up の項
+    rhs = np.block(
+        [
+            [advection, -(1.0 - theta) * a * grad],
+            [-b * (1.0 - theta) * depth * div, eye + upwind_depth],
+        ]
+    )
+    explicit = np.block([[advection - eye, zero], [zero, upwind_depth]])
+    return lhs, rhs, explicit
 
 
 def _shift_matrix(n: int, k: int) -> np.ndarray:
@@ -135,40 +172,69 @@ def amplification_matrix(
     depth = depth_for_froude(froude)
     dt = courant * CELL_SIZE / VELOCITY
     gamma = friction_coefficient(depth) if friction else 0.0
-    lhs, eta_part, u_part = _blocks(n, depth, dt, theta, gamma)
     eye = np.eye(n)
 
-    def stage(a: np.ndarray) -> np.ndarray:
-        rhs = np.hstack([np.vstack([a, u_part]), eta_part])
-        return np.linalg.solve(lhs, rhs)
+    def blocks(a: np.ndarray):
+        return _blocks(n, depth, dt, theta, gamma, a)
 
     euler = advection_matrix(n, courant, advection)
-    if time_integration == "euler":
-        return stage(euler)
-    if time_integration == "ssp_rk2":
-        s = stage(euler)
-        return 0.5 * (np.eye(2 * n) + s @ s)
+    if time_integration in ("euler", "ssp_rk2", "predictor_corrector"):
+        return _time_integration(time_integration, *blocks(euler))
     if advection == "upwind":
         raise ValueError(f"{time_integration} is defined only for second_order advection")
     if time_integration == "lax_wendroff":
-        return stage(advection_matrix(n, courant, advection, lax_wendroff=True))
+        lhs, rhs, _ = blocks(advection_matrix(n, courant, advection, lax_wendroff=True))
+        return np.linalg.solve(lhs, rhs)
     increment = euler - eye  # Δt L
     if time_integration == "advection_rk2":
-        return stage(eye + increment + 0.5 * increment @ increment)
+        lhs, rhs, _ = blocks(eye + increment + 0.5 * increment @ increment)
+        return np.linalg.solve(lhs, rhs)
     # ab3：F u = u^n + Δt L (23 u^n − 16 u^{n−1} + 5 u^{n−2}) / 12。状態 (u^n, η^n, u^{n−1}, u^{n−2})
+    lhs, rhs, _ = blocks(eye)  # 移流は下で足す
     weights = (23.0 / 12.0, -16.0 / 12.0, 5.0 / 12.0)
     size = 4 * n
     big_lhs = np.eye(size)
     big_lhs[: 2 * n, : 2 * n] = lhs
     big_rhs = np.zeros((size, size))
-    big_rhs[:n, :n] = eye + weights[0] * increment
+    big_rhs[: 2 * n, : 2 * n] = rhs
+    big_rhs[:n, :n] += weights[0] * increment
     big_rhs[:n, 2 * n : 3 * n] = weights[1] * increment
     big_rhs[:n, 3 * n :] = weights[2] * increment
-    big_rhs[n : 2 * n, :n] = u_part
-    big_rhs[: 2 * n, n : 2 * n] = eta_part
     big_rhs[2 * n : 3 * n, :n] = eye  # u^{n−1} ← u^n
     big_rhs[3 * n :, 2 * n : 3 * n] = eye  # u^{n−2} ← u^{n−1}
     return np.linalg.solve(big_lhs, big_rhs)
+
+
+def _time_integration(name: str, lhs: np.ndarray, rhs: np.ndarray, explicit: np.ndarray) -> np.ndarray:
+    """1段 S = L⁻¹R から、`euler`・`ssp_rk2`・`predictor_corrector` の増幅行列を作る。"""
+    stage = np.linalg.solve(lhs, rhs)
+    if name == "euler":
+        return stage
+    if name == "ssp_rk2":
+        return 0.5 * (np.eye(len(stage)) + stage @ stage)
+    # 予測子・修正子：L x^{n+1} = (R − E) x^n + (E x^n + E x*)/2、x* = S x^n
+    return np.linalg.solve(lhs, rhs - 0.5 * explicit + 0.5 * explicit @ stage)
+
+
+def gravity_wave_amplitude(
+    time_integration: str,
+    steps_per_period: int,
+    theta: float = 0.55,
+    n: int = 48,
+    depth: float = 1.0,
+) -> float:
+    """平均流のない水面の振動（U = 0、摩擦なし）の、最も長い波の1周期あたりの振幅の比。"""
+    if time_integration not in ("euler", "ssp_rk2", "predictor_corrector"):
+        raise ValueError(f"unknown time integration for gravity waves: {time_integration}")
+    period = n * CELL_SIZE / np.sqrt(GRAVITY * depth)
+    dt = period / steps_per_period
+    blocks = _blocks(n, depth, dt, theta, 0.0, np.eye(n), velocity=0.0)
+    values = np.linalg.eigvals(_time_integration(time_integration, *blocks))
+    # 最も長い波の固有値：1ステップの位相が 2π / steps_per_period に最も近いもの
+    target = 2.0 * np.pi / steps_per_period
+    phases = np.abs(np.angle(values))
+    longest = values[np.argmin(np.abs(phases - target))]
+    return float(np.abs(longest) ** steps_per_period)
 
 
 def spectral_radius(*args, **kwargs) -> float:
@@ -203,10 +269,20 @@ def critical_courant(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="移流と時間積分の1次元の線形安定解析（ADR-0016）")
+    parser = argparse.ArgumentParser(description="移流と時間積分の1次元の線形安定解析（ADR-0016、ADR-0017）")
     parser.add_argument("--theta", type=float, default=0.55, help="θ 法の重み（既定 0.55）")
     parser.add_argument("--friction", action="store_true", help="マニング式の摩擦を入れる（n = 0.025）")
+    parser.add_argument("--gravity", action="store_true", help="重力波の1周期あたりの減衰を表にする")
     args = parser.parse_args()
+    if args.gravity:
+        steps = (50, 100, 200, 400)
+        print(f"平均流のない重力波の、1周期あたりの振幅の比（θ = {args.theta}、最も長い波）")
+        print("| 時間積分 | " + " | ".join(f"{s} ステップ/周期" for s in steps) + " |")
+        print("|---|" + "---|" * len(steps))
+        for name in ("euler", "predictor_corrector", "ssp_rk2"):
+            values = [gravity_wave_amplitude(name, s, args.theta) for s in steps]
+            print(f"| {name} | " + " | ".join(f"{v:.3f}" for v in values) + " |")
+        return
     label = "摩擦あり" if args.friction else "摩擦なし"
     print(f"限界クーラン数（θ = {args.theta}、{label}、U = {VELOCITY} m/s、Δx = {CELL_SIZE} m）")
     print("| 移流 | 時間積分 | " + " | ".join(f"Fr {fr}" for fr in FROUDE) + " |")

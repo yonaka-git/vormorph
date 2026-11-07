@@ -146,22 +146,26 @@ def test_crest_position_is_exact_for_a_parabola(peak: float) -> None:
 def test_read_bar_summary_and_refinement_pairs(tmp_path: Path) -> None:
     summary = tmp_path / "v09_summary.csv"
     summary.write_text(
-        "case,layout,rows,width,wavelength,cells,growth,celerity,theory_growth,theory_celerity\n"
-        "a,Rectangular,10,40,211.4,530,1.0e-3,0.3,2.0e-3,0.34\n"
-        "b,Rectangular,20,40,211.4,2120,1.5e-3,0.33,2.0e-3,0.34\n"
-        "c,Hexagonal,10,10,142.5,1230,-1.0e-2,0.28,-5.0e-3,0.31\n"
-        "d,Rectangular,5,10,142.5,355,-6.0e-3,0.31,-5.0e-3,0.31\n"
-        "e,Rectangular,10,10,142.5,1430,-5.5e-3,0.31,-5.0e-3,0.31\n",
+        "case,layout,rows,width,wavelength,advection,cells,steps,growth,celerity,theory_growth,theory_celerity\n"
+        "a,Rectangular,10,40,211.4,Upwind,530,1459,1.0e-3,0.3,2.0e-3,0.34\n"
+        "b,Rectangular,20,40,211.4,Upwind,2120,2740,1.5e-3,0.33,2.0e-3,0.34\n"
+        "c,Hexagonal,10,10,142.5,Upwind,1230,3852,-1.0e-2,0.28,-5.0e-3,0.31\n"
+        "d,Rectangular,5,10,142.5,Upwind,355,1666,-6.0e-3,0.31,-5.0e-3,0.31\n"
+        "e,Rectangular,10,10,142.5,Upwind,1430,3354,-5.5e-3,0.31,-5.0e-3,0.31\n"
+        "f,Rectangular,20,40,211.4,SecondOrder,2120,1714,1.8e-3,0.34,2.0e-3,0.34\n"
+        "g,Rectangular,40,40,211.4,SecondOrder,8480,3400,1.9e-3,0.34,2.0e-3,0.34\n",
         encoding="utf-8",
     )
     rows = read_bar_summary(summary)
     assert rows[0]["case"] == "a" and rows[0]["layout"] == "Rectangular"
+    assert rows[5]["advection"] == "SecondOrder"
     assert rows[1]["growth"] == pytest.approx(1.5e-3)
     pairs = bar_refinement_pairs(rows)
-    # 六角形の幅 10 m は1つしかないので組にならない
+    # 六角形の幅 10 m は1つしかないので組にならない。移流の違う 20 行どうしも組にしない
     assert [(layout, coarse["case"], fine["case"]) for layout, coarse, fine in pairs] == [
         ("Rectangular", "a", "b"),
         ("Rectangular", "d", "e"),
+        ("Rectangular", "f", "g"),
     ]
 
 

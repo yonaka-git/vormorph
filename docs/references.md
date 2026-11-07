@@ -39,7 +39,7 @@
 
 ## 時間積分
 
-1ステップ全体の SSP-RK2（`[hydro] time_integration = "ssp_rk2"`）の判断の理由は [ADR-0016](design/adr/0016-second-order-advection-ssp-rk2.md) にあります。
+予測子・修正子（`[hydro] time_integration = "predictor_corrector"`）の陽的な部分は Heun 法（2次の SSP Runge–Kutta 法）です。判断の理由は [ADR-0016](design/adr/0016-second-order-advection-ssp-rk2.md) と [ADR-0017](design/adr/0017-predictor-corrector.md) にあります。
 
 | 著者 | 年 | 題名 | 誌名・巻(号)・頁 | DOI / URL | 入手状況 |
 |---|---|---|---|---|---|

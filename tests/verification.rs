@@ -1231,8 +1231,8 @@ fn v08_trench_migration() {
 /// - 幅 10 m（β = 4.7。どの波長でも減衰する）、L = 142.5 m：正方形配置の 5・10 行。
 ///   六角形配置の 10 行でも減衰すること
 ///
-/// ここまでは既定の1次の風上差分・1段（クーラン数 0.5）。さらに、2次の移流と1ステップ全体の
-/// SSP-RK2（ADR-0016。クーラン数 0.8）で、幅 40 m・L = 211.4 m を正方形配置の 10・20 行と
+/// ここまでは既定の1次の風上差分・1段（クーラン数 0.5）。さらに、2次の移流と予測子・修正子
+/// （ADR-0016、ADR-0017。クーラン数 0.8）で、幅 40 m・L = 211.4 m を正方形配置の 10・20 行と
 /// 六角形配置の 20・40 行で計算し、同じ基準で確かめる（六角形配置の 10 行は減衰するので除く）。
 /// 辺の水深が1次精度なので、2次の移流でも成長率の収束は1次のまま（誤差の定数が小さくなる）。
 ///
@@ -1473,10 +1473,10 @@ impl BarNumerics {
         label: "",
         suffix: "",
     };
-    /// 2次の移流、1ステップ全体の SSP-RK2（ADR-0016）。クーラン数 0.8。
+    /// 2次の移流、予測子・修正子（ADR-0016、ADR-0017）。クーラン数 0.8。
     const SECOND_ORDER: Self = Self {
         advection: AdvectionScheme::SecondOrder,
-        time_integration: TimeIntegration::SspRk2,
+        time_integration: TimeIntegration::PredictorCorrector,
         courant: 0.8,
         label: "second order, ",
         suffix: "_second_order",
