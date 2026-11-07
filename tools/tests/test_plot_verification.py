@@ -160,6 +160,8 @@ def test_read_bar_summary_and_refinement_pairs(tmp_path: Path) -> None:
     assert rows[0]["case"] == "a" and rows[0]["layout"] == "Rectangular"
     assert rows[5]["advection"] == "SecondOrder"
     assert rows[1]["growth"] == pytest.approx(1.5e-3)
+    # 二次流の列がない集計は、二次流なし
+    assert all(row["secondary_flow"] == "none" for row in rows)
     pairs = bar_refinement_pairs(rows)
     # 六角形の幅 10 m は1つしかないので組にならない。移流の違う 20 行どうしも組にしない
     assert [(layout, coarse["case"], fine["case"]) for layout, coarse, fine in pairs] == [
@@ -169,7 +171,26 @@ def test_read_bar_summary_and_refinement_pairs(tmp_path: Path) -> None:
     ]
 
 
+def test_secondary_flow_runs_are_paired_separately(tmp_path: Path) -> None:
+    summary = tmp_path / "v09_summary.csv"
+    header = "case,layout,rows,width,wavelength,advection,secondary_flow,cells,steps,growth,celerity"
+    summary.write_text(
+        f"{header},theory_growth,theory_celerity\n"
+        "a,Rectangular,10,40,211.4,SecondOrder,none,530,1459,2.0e-3,0.34,2.6e-3,0.34\n"
+        "b,Rectangular,20,40,211.4,SecondOrder,none,2120,1714,2.3e-3,0.34,2.6e-3,0.34\n"
+        "c,Rectangular,20,40,211.4,SecondOrder,transport,2120,1292,3.5e-3,0.36,3.8e-3,0.36\n"
+        "d,Rectangular,10,40,211.4,SecondOrder,transport,530,1100,3.1e-3,0.36,3.8e-3,0.36\n",
+        encoding="utf-8",
+    )
+    rows = read_bar_summary(summary)
+    assert rows[2]["secondary_flow"] == "transport"
+    pairs = bar_refinement_pairs(rows)
+    assert [(coarse["case"], fine["case"]) for _, coarse, fine in pairs] == [("a", "b"), ("d", "c")]
+
+
 def test_bar_growth_curve_matches_the_v09_reference_value() -> None:
     # tests/verification.rs の v09_alternate_bars（MORFAC 100）の理論値
     assert bar_growth_curve(40.0, np.array([211.4]))[0] == pytest.approx(2.5895e-3, rel=2e-4)
+    with_secondary_flow = bar_growth_curve(40.0, np.array([211.4]), secondary_flow="transport")[0]
+    assert with_secondary_flow == pytest.approx(3.7512e-3, rel=2e-4)
     assert bar_beta(40.0) == pytest.approx(18.705, abs=1e-3)

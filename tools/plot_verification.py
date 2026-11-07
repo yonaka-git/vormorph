@@ -633,15 +633,17 @@ V09_MAIN = (
 )
 """振幅の時系列を描くケース（ケース名、凡例、系列の色の番号、線の種類）。既定は2次の移流。"""
 V09_MARKERS = {
-    ("SecondOrder", "Rectangular"): ("s", SERIES[0], "square"),
-    ("SecondOrder", "Hexagonal"): ("o", SERIES[1], "hexagonal"),
-    ("Upwind", "Rectangular"): ("s", "0.6", "square, first order"),
-    ("Upwind", "Hexagonal"): ("o", "0.6", "hexagonal, first order"),
+    ("SecondOrder", "none", "Rectangular"): ("s", SERIES[0], "square"),
+    ("SecondOrder", "none", "Hexagonal"): ("o", SERIES[1], "hexagonal"),
+    ("Upwind", "none", "Rectangular"): ("s", "0.6", "square, first order"),
+    ("Upwind", "none", "Hexagonal"): ("o", "0.6", "hexagonal, first order"),
+    ("SecondOrder", "transport", "Rectangular"): ("D", SERIES[2], "square, secondary flow"),
+    ("SecondOrder", "transport", "Hexagonal"): ("^", SERIES[2], "hexagonal, secondary flow"),
 }
-"""成長率と波長の図の印（移流と配置ごとに、印、色、凡例）。1次の移流は比較のために灰色で描く。"""
+"""成長率と波長の図の印（移流・二次流・配置ごとに、印、色、凡例）。1次の移流は比較のために灰色で描く。"""
 
 
-V09_TEXT_COLUMNS = ("case", "layout", "advection")
+V09_TEXT_COLUMNS = ("case", "layout", "advection", "secondary_flow")
 """`v09_summary.csv` の文字列の列（それ以外は数値）。"""
 
 
@@ -655,21 +657,23 @@ def read_bar_summary(path: Path) -> list[dict[str, str | float]]:
         row: dict[str, str | float] = {}
         for key, value in zip(header, values, strict=True):
             row[key] = value if key in V09_TEXT_COLUMNS else float(value)
+        # 二次流の列がない（ADR-0019 より前の）集計は、二次流なし
+        row.setdefault("secondary_flow", "none")
         rows.append(row)
     return rows
 
 
 def bar_refinement_pairs(rows: list[dict[str, str | float]]) -> list[tuple[str, dict, dict]]:
-    """V09 の結果を、移流・配置・幅・波長が同じ組に分け、行数の少ない方と多い方の組（配置, 粗, 細）を返す。
+    """V09 の結果を、移流・二次流・配置・幅・波長が同じ組に分け、行数の少ない方と多い方の組（配置, 粗, 細）を返す。
 
     行数がちょうど2倍の組だけを返す（1つしかない組は除く）。
     """
     groups: dict[tuple, list[dict[str, str | float]]] = {}
     for row in rows:
-        key = (row["advection"], row["layout"], row["width"], row["wavelength"])
+        key = (row["advection"], row["secondary_flow"], row["layout"], row["width"], row["wavelength"])
         groups.setdefault(key, []).append(row)
     pairs = []
-    for (_, layout, _, _), members in groups.items():
+    for (_, _, layout, _, _), members in groups.items():
         members = sorted(members, key=lambda r: float(r["rows"]))
         for coarse, fine in itertools.pairwise(members):
             if float(fine["rows"]) == 2.0 * float(coarse["rows"]):
@@ -684,13 +688,18 @@ def bar_beta(width: float) -> float:
     return width / (2.0 * bar_theory.base_state(bar_theory.Closure()).depth)
 
 
-def bar_growth_curve(width: float, wavelengths: np.ndarray, morfac: float = V09_MORFAC) -> np.ndarray:
-    """線形理論の成長率 [1/s]（流れの時間あたり。examples/sill.toml の条件、MORFAC `morfac`）。"""
+def bar_growth_curve(
+    width: float, wavelengths: np.ndarray, morfac: float = V09_MORFAC, secondary_flow: str = "none"
+) -> np.ndarray:
+    """線形理論の成長率 [1/s]（流れの時間あたり。examples/sill.toml の条件、MORFAC `morfac`）。
+
+    `secondary_flow` は二次流の扱い（`bar_theory.Closure.secondary_flow`。N* = 7、α_D = 0.15）。
+    """
     from dataclasses import replace
 
     import bar_theory
 
-    closure = replace(bar_theory.Closure(), morfac=morfac)
+    closure = replace(bar_theory.Closure(), morfac=morfac, secondary_flow=secondary_flow)
     return np.array([bar_theory.growth_and_celerity(closure, wl, width)[0] for wl in wavelengths])
 
 
@@ -774,9 +783,20 @@ def plot_v09(root: Path, output: Path) -> None:
             zorder=0,
             label=f"linear theory, B = {width_case:g} m (β = {b:.1f})",
         )
+    if any(row["secondary_flow"] != "none" for row in summary.values()):
+        dispersion.plot(
+            wavelengths,
+            bar_growth_curve(40.0, wavelengths, secondary_flow="transport") * 1e3,
+            color=SERIES[2],
+            alpha=0.5,
+            lw=2.0,
+            ls="-.",
+            zorder=0,
+            label="linear theory with secondary flow, B = 40 m",
+        )
     shown = set()
     for layout, coarse, fine in bar_refinement_pairs(list(summary.values())):
-        marker, color, name = V09_MARKERS[(str(fine["advection"]), layout)]
+        marker, color, name = V09_MARKERS[(str(fine["advection"]), str(fine["secondary_flow"]), layout)]
         wavelength = float(fine["wavelength"])
         for row, filled in ((coarse, False), (fine, True)):
             key = (name, filled)

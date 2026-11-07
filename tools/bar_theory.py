@@ -7,9 +7,12 @@
 - 掃流砂：MPM 式または芦田・道上式。長谷川の式による全方向の勾配補正
   q_b = q̂(τ*) [u/|u| − γ ∇z_b]、γ = √(τ*_c / (μ_s μ_k τ*))、τ* = n² |u|² / (h^{1/3} s d)
 - Exner 式 (1 − λ) ∂z_b/∂t + M ∇·q_b = 0（MORFAC M は河床の式だけに掛ける）
+- 二次流（任意。ADR-0019）：強さ I の輸送方程式（遠心加速度を生成項とし、適応長 L_I で平衡値へ
+  緩和する）か平衡型。掃流砂の向きを tan δ = N* I / |u| だけ内岸側へ回す（`Closure.secondary_flow`）
 - 側壁は滑り条件。勾配 I の等流（水深 H、流速 U）のまわりで線形化し、横断方向のモード m の
   u, h, z_b ∝ cos(mπy/B) e^{ikx}、v ∝ sin(mπy/B) e^{ikx} の振幅 X = (u, v, h, z) について
-  dX/dt = J X を立てる（`jacobian`）。
+  dX/dt = J X を立てる（`jacobian`）。二次流の輸送方程式を解くときは、I ∝ sin(mπy/B) e^{ikx} を
+  5番目の状態に加える。
 
 J の固有値のうち、MORFAC が小さい極限で 0 に近づく根が河床のモードで、実部が成長率、
 −Im ω / k が移動速度になる（`bed_mode`）。どちらも流れの時間あたりの値（MORFAC を掛けた後）。
@@ -21,6 +24,8 @@ MORFAC が大きいと、流れの調整の遅れのために準定常の理論�
     uv run --project tools python tools/bar_theory.py --width 40 --morfac 100 --wavelength 211.4
     uv run --project tools python tools/bar_theory.py --width 40 --scan        # 最も速く育つ波長
     uv run --project tools python tools/bar_theory.py --critical-width         # 発生の境の幅
+    uv run --project tools python tools/bar_theory.py --width 40 --morfac 100 --wavelength 211.4 \
+        --secondary-flow transport                                               # 二次流あり
 
 参考：線形安定解析の考え方は Colombini, Seminara & Tubino (1987) などの交互砂州の理論と同じで、
 Federici & Seminara (2003) は、その不安定が移流型であることを示した。
@@ -54,6 +59,10 @@ class Closure:
     gravity: float = GRAVITY
     formula: str = "mpm"  # "mpm" または "ashida_michiue"
     advection: bool = True  # 運動量の移流を含めるか（vormorph の advection = "none" に対応）
+    secondary_flow: str = "none"  # 二次流："none"、"transport"（輸送方程式型）、"equilibrium"（平衡型）
+    n_star: float = 7.0  # 掃流砂の偏角の係数 N*
+    diffusivity_coef: float = 0.15  # 二次流の強さの拡散係数 D = α_D u* h の α_D
+    von_karman: float = 0.41  # κ
 
 
 @dataclass(frozen=True)
@@ -103,13 +112,33 @@ def base_state(c: Closure) -> Base:
     return Base(h, u, tau, scale * phi, phi_t, gamma)
 
 
+def adaptation_length(c: Closure, depth: float) -> float:
+    """二次流の適応長 L_I = (1 − 2α) h / (2κ² α)、α = √g n / (κ h^{1/6})（α ≥ 1/2 なら 0）。"""
+    alpha = np.sqrt(c.gravity) * c.manning_n / (c.von_karman * depth ** (1.0 / 6.0))
+    return 0.0 if alpha >= 0.5 else (1.0 - 2.0 * alpha) * depth / (2.0 * c.von_karman**2 * alpha)
+
+
+def secondary_flow_diffusivity(c: Closure, speed: float, depth: float) -> float:
+    """二次流の強さの拡散係数 D = α_D u* h、u* = √g n |u| / h^{1/6} [m²/s]。"""
+    return c.diffusivity_coef * np.sqrt(c.gravity) * c.manning_n * speed / depth ** (1.0 / 6.0) * depth
+
+
 def jacobian(c: Closure, k: float, width: float, mode: int = 1) -> np.ndarray:
-    """状態 X = (u, v, h, z) の線形系 dX/dt = J X の係数行列（4×4、複素数）。
+    """状態 X = (u, v, h, z[, I]) の線形系 dX/dt = J X の係数行列（4×4 か 5×5、複素数）。
 
     z は勾配を除いた河床高の振れ。x 方向の掃流砂量は q̂ (1 + γI − γ ∂z/∂x) なので、τ* の振れ
     τ*'/τ*0 = 2u/U − h/(3H) と、γ ∝ τ*^{-1/2} の振れの両方を含める。連続式は
     ∂h/∂t = −∂z/∂t − ∇·(h u)（河床の変化の分だけ水深が変わる。水位を保つ vormorph の河床の
     更新と同じ）。
+
+    二次流（`secondary_flow`。vormorph の `[sediment.secondary_flow]`、ADR-0019）：等流では I = 0
+    で、振れの平衡値は I_e = h a_n / |u| = H ∂v/∂x（a_n ≈ U ∂v/∂x）。横断方向の掃流砂量に
+    q̂ N* I / U が加わる（tan δ = N* I / |u|。向きの正規化 √(1 + tan²δ) は2次の微小量）。
+
+    - `"transport"`：I ∝ sin(μy) を5番目の状態にし、
+      ∂I/∂t = −U ∂I/∂x + D ∇²I + (U / L_I)(I_e − I)（hI の式から連続式を引いたもの）。
+      側壁で ∂I/∂y = 0 の条件は満たさない（D μ² の項は側壁の境界層を無視した近似）。
+    - `"equilibrium"`：I = I_e を河床の式に代入する（4×4 のまま）。
     """
     b = base_state(c)
     g, i, h, u = c.gravity, c.slope, b.depth, b.velocity
@@ -125,12 +154,27 @@ def jacobian(c: Closure, k: float, width: float, mode: int = 1) -> np.ndarray:
         ],
         dtype=complex,
     )
+    # 横断方向の掃流砂量の二次流の項 q̂ N* I / U の、河床の式への寄与（I の係数）
+    spiral = coef * mu * c.n_star / u
+    if c.secondary_flow == "equilibrium":
+        bed[1] += spiral * h * 1j * k
+    elif c.secondary_flow not in ("none", "transport"):
+        raise ValueError(f"unknown secondary flow {c.secondary_flow!r}")
+    size = 5 if c.secondary_flow == "transport" else 4
     adv = 1j * k * u if c.advection else 0.0
-    j = np.zeros((4, 4), dtype=complex)
-    j[0] = [-adv - 2 * g * i / u, 0, -1j * k * g + 4 / 3 * g * i / h, -1j * k * g]
-    j[1] = [0, -adv - g * i / u, g * mu, g * mu]
-    j[3] = bed
-    j[2] = -bed + np.array([-1j * k * h, -h * mu, -1j * k * u, 0])
+    j = np.zeros((size, size), dtype=complex)
+    j[0, :4] = [-adv - 2 * g * i / u, 0, -1j * k * g + 4 / 3 * g * i / h, -1j * k * g]
+    j[1, :4] = [0, -adv - g * i / u, g * mu, g * mu]
+    j[3, :4] = bed
+    j[2, :4] = -bed + np.array([-1j * k * h, -h * mu, -1j * k * u, 0])
+    if size == 5:
+        length = adaptation_length(c, h)
+        rate = u / length
+        diffusion = secondary_flow_diffusivity(c, u, h)
+        j[3, 4] = spiral
+        j[2, 4] = -spiral
+        j[4, 1] = rate * h * 1j * k
+        j[4, 4] = -1j * k * u - diffusion * (k * k + mu * mu) - rate
     return j
 
 
@@ -152,9 +196,15 @@ def bed_mode(c: Closure, k: float, width: float, mode: int = 1) -> complex:
 def quasi_steady_mode(c: Closure, k: float, width: float, mode: int = 1) -> complex:
     """流れを準定常とした河床のモードの ω（M → 0 の極限。検算用）。"""
     j = jacobian(replace(c, morfac=1.0), k, width, mode)
-    # 流れの3式で ∂/∂t を省き、z = 1 に対する (u, v, h) を解いて、河床の式に代入する
-    flow = np.linalg.solve(j[:3, :3] + np.outer([0, 0, 1], j[3, :3]), -(j[:3, 3] + [0, 0, j[3, 3]]))
-    return complex(c.morfac * (j[3, :3] @ flow + j[3, 3]))
+    # 流れの式（z 以外）で ∂/∂t を省き、z = 1 に対する (u, v, h[, I]) を解いて、河床の式に代入する。
+    # 水深の式の ∂h/∂t = −∂z/∂t − ∇·(hu) の −∂z/∂t（河床の式）を、h の行に戻してから解く
+    flow = [r for r in range(j.shape[0]) if r != 3]
+    a = j[np.ix_(flow, flow)].copy()
+    rhs = -j[flow, 3].copy()
+    a[2] += j[3, flow]
+    rhs[2] -= j[3, 3]
+    x = np.linalg.solve(a, rhs)
+    return complex(c.morfac * (j[3, flow] @ x + j[3, 3]))
 
 
 def growth_and_celerity(c: Closure, wavelength: float, width: float, mode: int = 1) -> tuple[float, float]:
@@ -200,9 +250,24 @@ def main() -> None:
     parser.add_argument("--wavelength", type=float, nargs="*", default=[], help="波長 [m]")
     parser.add_argument("--scan", action="store_true", help="最も速く育つ波長を探す")
     parser.add_argument("--critical-width", action="store_true", help="発生の境の幅を求める")
+    parser.add_argument(
+        "--secondary-flow", default="none", choices=["none", "transport", "equilibrium"], help="二次流"
+    )
+    parser.add_argument("--n-star", type=float, default=7.0, help="掃流砂の偏角の係数 N*")
+    parser.add_argument("--diffusivity", type=float, default=0.15, help="二次流の拡散係数の係数 α_D")
     args = parser.parse_args()
 
-    c = Closure(args.q, args.slope, args.n, args.d, formula=args.formula, morfac=args.morfac)
+    c = Closure(
+        args.q,
+        args.slope,
+        args.n,
+        args.d,
+        formula=args.formula,
+        morfac=args.morfac,
+        secondary_flow=args.secondary_flow,
+        n_star=args.n_star,
+        diffusivity_coef=args.diffusivity,
+    )
     b = base_state(c)
     froude = b.velocity / np.sqrt(c.gravity * b.depth)
     print(
