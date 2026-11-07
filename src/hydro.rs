@@ -86,7 +86,8 @@
 //!
 //! `hydro.advection = "second_order"` では、セル中心の流速の勾配（最小二乗。
 //! [`crate::mesh::gradient`]）で面の値と辺へ外挿したセルの流速を作り、空間について2次精度に
-//! する（[`advection_second_order`]、ADR-0016）。勾配を 0 にすると上の形に一致する。
+//! する（[`advection_second_order`]、ADR-0016）。勾配を 0 にすると上の形に一致する。汀線の
+//! 近くと、開境界の辺を持つセルでは勾配を 0 にする（ADR-0018）。
 //!
 //! ## 時間積分
 //!
@@ -1244,7 +1245,8 @@ pub fn advection(
 ///   前進 Euler のままでは不安定なので、予測子・修正子（`time_integration = "predictor_corrector"`、
 ///   [`HydroSolver::step`]）と組み合わせて使う（ADR-0016、ADR-0017）。
 /// - 勾配は、セルとその隣のセルの内部の辺がすべて濡れている（`active`）ときだけ求め、
-///   それ以外は 0 とする（汀線と、乾いた辺のある段差の近くでは1次に戻る）。
+///   それ以外は 0 とする（汀線と、乾いた辺のある段差の近くでは1次に戻る）。開境界の辺を持つセルも
+///   0 とする（境界から流れ込む流れで発散しないため）。
 /// - 境界辺から流れ込む水の流速は、その辺の法線流速 u_l n_l とする（再構成しない）。
 /// - σ_j > 1 の辺（時間刻みが大きすぎるとき）は、1次の形と同じく F u_j = ū_j とする（安全策）。
 ///
@@ -1267,6 +1269,10 @@ pub fn advection_second_order(
 /// セル c と、境界の外を除くすべての隣のセルで、内部の辺がすべて `active` のときだけ求め、
 /// それ以外は 0 とする。汀線のセルの Perot 流速は乾いた辺を流速 0 として数えるので小さく出る
 /// （ADR-0008）。その値を使った勾配で、隣のセルの面の値を作らないようにするため。
+///
+/// 開境界（上流端・下流端）の辺を持つセルも 0 とする。勾配は内側だけの片側の差で、境界から
+/// 水が流れ込むとき、境界へ向かう流速の傾きを外挿で強めて発散するため（乾いた河床に下流端の
+/// 水位境界から水が入る `examples/sill.toml` の初期で確認。ADR-0018）。壁の辺は数えない。
 fn velocity_gradients(
     mesh: &Mesh,
     state: &State,
@@ -1285,10 +1291,15 @@ fn velocity_gradients(
             .zip(&mesh.cells_on_cell[c])
             .all(|(&e, &k)| k == NONE || active[e]);
     }
+    let open = |c: usize| {
+        mesh.edges_on_cell[c]
+            .iter()
+            .any(|&e| matches!(mesh.edge_kind[e], EdgeKind::Upstream | EdgeKind::Downstream))
+    };
     for (c, g) in gradient.iter_mut().enumerate() {
         *g = [[0.0; 2]; 2];
         let neighbors = &mesh.cells_on_cell[c];
-        if !wet[c] || neighbors.iter().any(|&k| k != NONE && !wet[k]) {
+        if !wet[c] || open(c) || neighbors.iter().any(|&k| k != NONE && !wet[k]) {
             continue;
         }
         let [ux, uy] = state.u_cell[c];
