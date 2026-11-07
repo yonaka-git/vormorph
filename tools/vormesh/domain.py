@@ -20,6 +20,11 @@ circle = { center = [30.0, 15.0], radius = 5.0 }   # または polygon = [[x, y]
 [lloyd]                               # 省略可
 iterations = 100                      # Lloyd 法の反復回数の上限
 tolerance = 1e-3                      # 収束判定：母点の移動量の二乗平均平方根 / cell_size
+
+[bed]                                 # 省略可。河床の定義（`tools/make_bed.py` が使う。`bed` を参照）
+kind = "plane"
+z0 = 0.0
+gradient = [-0.002, 0.0]
 ```
 
 gmsh は次の2つに使う。ボロノイ格子そのものは `vormesh.voronoi` で作る。
@@ -38,6 +43,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
+
+from .bed import Bed, BedError, parse_bed
 
 KINDS = ("wall", "upstream", "downstream")
 """境界の種類。Rust 側の `mesh::EdgeKind` の Wall / Upstream / Downstream に対応する。"""
@@ -87,6 +94,8 @@ class Domain:
     outer: list[Segment]
     holes: list[list[Segment]] = field(default_factory=list)
     lloyd: LloydSettings = LloydSettings()
+    bed: Bed | None = None
+    """河床の定義（`[bed]`。格子の生成には使わず、`tools/make_bed.py` が使う）。"""
 
     @classmethod
     def load(cls, path: Path) -> Domain:
@@ -96,7 +105,7 @@ class Domain:
 
     @classmethod
     def from_dict(cls, data: dict, source: str = "<domain>") -> Domain:
-        known = {"title", "cell_size", "outer", "holes", "lloyd"}
+        known = {"title", "cell_size", "outer", "holes", "lloyd", "bed"}
         unknown = sorted(set(data) - known)
         if unknown:
             raise DomainError(f"{source}: unknown keys: {', '.join(unknown)}")
@@ -116,7 +125,11 @@ class Domain:
         if unknown:
             raise DomainError(f"{source}: unknown keys in [lloyd]: {', '.join(unknown)}")
         lloyd = LloydSettings(**lloyd_spec)
-        domain = cls(title, cell_size, outer, holes, lloyd)
+        try:
+            bed = parse_bed(data["bed"], f"{source}: [bed]") if "bed" in data else None
+        except BedError as err:
+            raise DomainError(str(err)) from None
+        domain = cls(title, cell_size, outer, holes, lloyd, bed)
         domain.validate(source)
         return domain
 

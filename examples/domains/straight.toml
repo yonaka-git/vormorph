@@ -27,3 +27,13 @@ line = [[60.0, 10.0], [0.0, 10.0]]
 [[outer]]
 kind = "upstream"
 line = [[0.0, 10.0], [0.0, 0.0]]
+
+# 河床（tools/make_bed.py が使う）：勾配 1/500、下流端（x = 60 m）で 0 m の平面
+#
+#   uv run --project tools python tools/make_bed.py examples/domains/straight.toml \
+#       output/mesh/straight.mesh.toml -o output/mesh/straight.cells.toml
+
+[bed]
+kind = "plane"
+z0 = 0.12                            # x = 0 の河床高 [m]
+gradient = [-0.002, 0.0]             # ∂z/∂x, ∂z/∂y [-]

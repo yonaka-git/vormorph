@@ -85,10 +85,17 @@ pub enum MeshConfig {
         layout: ChannelLayout,
     },
     /// 格子生成ツール（`tools/make_mesh.py`）が書き出した格子ファイルを読み込む
-    /// （[`crate::mesh::file`]）。
+    /// （[`crate::mesh::file`]）。セルの河床高は、`tools/make_bed.py` が書き出すセルの値の
+    /// ファイル（[`crate::mesh::cells`]、ADR-0020）で与える。
+    ///
+    /// パスは、実行したディレクトリからの相対パス（`output.dir` と同じ）。
     File {
         /// 格子ファイルのパス。
         path: PathBuf,
+        /// セルの値のファイルのパス（河床高、非侵食層）。[`crate::model::Model::new`] で
+        /// 組み立てるときに必要（[`crate::model::Model::with_state`] では使わない）。
+        #[serde(default)]
+        cells: Option<PathBuf>,
     },
 }
 
@@ -657,8 +664,12 @@ impl Config {
                     }
                 }
             }
-            MeshConfig::File { path } => {
+            MeshConfig::File { path, cells } => {
                 require(!path.as_os_str().is_empty(), "mesh.path must not be empty");
+                require(
+                    cells.as_ref().is_none_or(|c| !c.as_os_str().is_empty()),
+                    "mesh.cells must not be empty",
+                );
                 require(
                     self.structures.is_empty(),
                     "structures are supported only with mesh.kind = \"channel\" for now",
@@ -950,7 +961,15 @@ impl fmt::Display for Summary<'_> {
                 "mesh       : channel {length} m x {width} m, cell size {cell_size} m, {}",
                 layout.name()
             )?,
-            MeshConfig::File { path } => writeln!(f, "mesh       : file {}", path.display())?,
+            MeshConfig::File { path, cells } => match cells {
+                Some(cells) => writeln!(
+                    f,
+                    "mesh       : file {}, cell values {}",
+                    path.display(),
+                    cells.display()
+                )?,
+                None => writeln!(f, "mesh       : file {}", path.display())?,
+            },
         }
         if let Some(bed) = &c.bed {
             writeln!(

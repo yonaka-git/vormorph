@@ -103,4 +103,8 @@
 - ADR-0019（二次流の強さを輸送方程式で求め、掃流砂の向きを内岸側へ回す）。`docs/design/overview.md` の第2.5節・第4.10節（新設）、第2.2節、第4.6節、第5章、第7章、第8章（運動量式への効果と、スカラーの移流の2次精度化を未決事項に）
 - 交互砂州の線形安定解析 `tools/bar_theory.py` に二次流を追加（`Closure.secondary_flow = "transport" | "equilibrium"`、`--secondary-flow`）。輸送方程式型は二次流の強さを5番目の状態にした 5×5 の系。係数行列は二次流を含む非線形の式の数値的な線形化と照合する
 - 検証ケース V09 に二次流ありのケース（輸送方程式型、幅 40 m・L = 211.4 m、正方形 10・20 行、六角形 20・40 行）を追加。外挿した成長率は理論と +1.3%・+0.1%、移動速度は +1.0%。`v09_summary.csv` に `secondary_flow` の列を追加し、`tools/plot_verification.py` の V09 の図に二次流ありの組と理論の曲線を描く
+- セルの値のファイル（vormorph cells 形式 v1、ADR-0020）。格子ファイルの格子の河床高（と非侵食層）を、母点の座標とともに別のファイルで与える。Rust の `mesh::cells`（形式・長さ・有限・z_ne ≤ z_b の検査と、母点の座標による格子との照合）、Python の `vormesh/cellsfile.py`
+- 河床を作るツール `tools/make_bed.py` と、領域の定義の `[bed]`（`kind = "centerline"`：中心線に沿った一様な勾配、`kind = "plane"`：平面。`vormesh/bed.py`）。`examples/domains/straight.toml`・`bend.toml` に `[bed]` を追加。fixture `tests/data/straight_coarse.cells.toml`
+- 設定 `[mesh] kind = "file"` に `cells` を追加し、`Model::new`（`vormorph run`）が格子ファイルの格子を組み立てられるようにする（乾いた河床から始める。`[bed]` と周期境界は使えない）。`ModelError::MeshFile`・`ModelError::CellValues`。`vormorph check` の要約にセルの値のファイルを表示する
+- ADR-0020（格子ファイルの格子の河床高は、別のセルの値のファイルで与える）。`docs/design/mesh-generation.md` の第1章・第6章・第7章（7.2 節を新設）・第8章
 - ライセンス：MIT OR Apache-2.0

@@ -1,13 +1,13 @@
 # 格子生成
 
-この文書は、格子生成ツール `tools/make_mesh.py`（Python パッケージ `tools/vormesh/`）の手順と、ツールが書き出す格子ファイルの形式をまとめたものです。判断の理由は [ADR-0005](adr/0005-mesh-generator.md) にあります。
+この文書は、格子生成ツール `tools/make_mesh.py`（Python パッケージ `tools/vormesh/`）の手順と、ツールが書き出す格子ファイルの形式、格子の母点で河床高を求めるツール `tools/make_bed.py` とセルの値のファイルの形式をまとめたものです。判断の理由は [ADR-0005](adr/0005-mesh-generator.md)（格子生成）と [ADR-0020](adr/0020-cell-values-file.md)（セルの値のファイル）にあります。
 
 ## 1. 位置づけ
 
 | 格子 | 作り方 | 用途 |
 |---|---|---|
 | 直線矩形水路 | Rust の `mesh::channel` が内部で生成する。`build_periodic` は上流端と下流端をつないだ周期的な水路を作る（[ADR-0014](adr/0014-periodic-channel.md)） | 検証ケース V01・V02・V05〜V07・V11・V12、交互砂州（V09） |
-| 任意の平面形（湾曲、島、合流など） | `tools/make_mesh.py` で格子ファイルを作り、Rust の `mesh::file` が読む | 検証ケース V10、島や橋脚のある領域、実河川への適用 |
+| 任意の平面形（湾曲、島、合流など） | `tools/make_mesh.py` で格子ファイルを作り、Rust の `mesh::file` が読む。河床高は `tools/make_bed.py` でセルの値のファイルを作り、`mesh::cells` が読む（7.2 節） | 検証ケース V10、島や橋脚のある領域、実河川への適用 |
 
 格子生成ツールは、[gmsh](https://gmsh.info/)（Geuzaine & Remacle, 2009）を境界の分割と初期の母点の配置に使い、ボロノイ格子そのものは自前で作ります。セルはヒルベルト曲線の順に並べて書き出します。
 
@@ -139,11 +139,28 @@ circle = { center = [30.0, 15.0], radius = 5.0 }   # または polygon = [[x, y]
 [lloyd]                               # 省略可
 iterations = 100
 tolerance = 1e-3                      # 母点の移動量の二乗平均平方根 / cell_size
+
+[bed]                                 # 省略可。河床（tools/make_bed.py が使う。格子の生成には使わない）
+kind = "centerline"                   # 中心線に沿った一様な勾配。または "plane"（平面）
+slope = 0.002                         # 中心線に沿った勾配（下流へ下がる向きを正）[-]
+z_downstream = 0.0                    # 中心線の終点（下流端）の河床高 [m]
+centerline = [                        # 上流端から下流端へたどる区間の列（外周と同じ line / arc）
+  { line = [[30.0, -40.0], [30.0, 0.0]] },
+  { arc = { center = [0.0, 0.0], radius = 30.0, start = 0.0, end = 180.0 } },
+  { line = [[-30.0, 0.0], [-30.0, -40.0]] },
+]
 ```
+
+河床の定義（`[bed]`）は2種類です。
+
+- `kind = "centerline"`：母点を中心線へ射影した点までの、中心線に沿った距離 $s$ を求め、$z_b = z_{\mathrm{downstream}} + I\,(s_{\mathrm{end}} - s)$ とします（$I$ は `slope`、$s_{\mathrm{end}}$ は中心線の全長）。区間ごとに最も近い点を求め、最も近い区間を選びます（円弧は厳密に扱う）。湾曲水路の軸に沿った勾配を表すためのものです。中心線は上流端から下流端までをおおうように与えます（両端より外の母点は端の点に射影する）。
+- `kind = "plane"`：$z_b = z_0 + a x + b y$（`z0`、`gradient = [a, b]`）。
 
 例：[`examples/domains/bend.toml`](../../examples/domains/bend.toml)（180° 湾曲水路）、[`examples/domains/island.toml`](../../examples/domains/island.toml)（島のある池）。
 
-## 7. 出力：格子ファイル（vormorph mesh 形式 v1）
+## 7. 出力：格子ファイル（vormorph mesh 形式 v1）とセルの値のファイル
+
+### 7.1 格子ファイル
 
 TOML の1ファイルです。Rust 側では `mesh::file::MeshFile` が読み、`serde` の `deny_unknown_fields` で未知のキーを拒否します。
 
@@ -164,6 +181,30 @@ TOML の1ファイルです。Rust 側では `mesh::file::MeshFile` が読み、
 - 接続配列（`cells_on_edge` など）と幾何量（`dc_edge` など）はファイルに含めず、Rust 側で多角形の並びから組み立てます。符号の規約を1か所（`mesh::voronoi` と `Mesh::derive_cell_connectivity`）で決めるためです。
 - Python と Rust で規約が一致していることは、ツールで作った小さな格子（`tests/data/island_coarse.mesh.toml`）を Rust 側で読むテスト（`tests/mesh_file.rs`）で確かめています。
 
+### 7.2 セルの値のファイル（vormorph cells 形式 v1）
+
+格子ファイルには河床高などのセルの値を含めず、別のファイルで与えます（[ADR-0020](adr/0020-cell-values-file.md)）。`tools/make_bed.py` が、格子ファイルの母点で領域の定義の `[bed]`（6 節）を評価して書き出します。格子を作り直さずに、河床の定義だけを変えて書き直せます。
+
+```bash
+uv run --project tools python tools/make_bed.py examples/domains/bend.toml \
+    output/mesh/bend.mesh.toml -o output/mesh/bend.cells.toml
+```
+
+| キー | 型 | 内容 |
+|---|---|---|
+| `format` | 文字列 | `"vormorph-cells"` |
+| `version` | 整数 | `1` |
+| `title` | 文字列 | 格子の名前（格子ファイルの `title`。照合には使わない） |
+| `[meta]` | 表 | 任意の付加情報（生成に使った領域の定義と格子ファイル、河床の種類）。読み込み側は解釈しない |
+| `cells.x`, `cells.y` | 浮動小数点数の配列 | 母点の座標 [m]（格子ファイルと同じ値。照合に使う） |
+| `cells.zb` | 浮動小数点数の配列 | 河床高 [m] |
+| `cells.z_ne` | 浮動小数点数の配列 | 非侵食層の上面の高さ [m]（任意。なければ非侵食層なし。今のツールは書かない） |
+
+- セルの順は格子ファイルと同じです。
+- Rust の `mesh::cells` は、配列の長さ、値が有限であること、$z_{ne} \le z_b$ を検査し、セル数と母点の座標が格子と一致すること（許容差は母点の広がりの $10^{-9}$ 倍）を確かめます。格子を作り直したのにセルの値のファイルを作り直さなかった、という取り違えを防ぐためです。
+- vormorph の設定では、`[mesh] kind = "file"` の `path` に格子ファイル、`cells` にこのファイルを指定します（パスは実行したディレクトリからの相対パス）。`Model::new` は河床高をこの値にし、乾いた河床（$\eta = z_b$）から計算を始めます。`[bed]` と周期境界は使えません。
+- Python と Rust で規約が一致していることは、`tests/data/straight_coarse.cells.toml`（`examples/domains/straight.toml` の平面の河床）を Rust 側で読むテスト（`tests/cell_values.rs`）で確かめています。
+
 ## 8. 制限と今後の課題
 
 - 格子幅は領域全体で一様です。局所的に細かくする（gmsh のサイズ場と、重みつきの重心）のは今後の課題です。
@@ -173,7 +214,7 @@ TOML の1ファイルです。Rust 側では `mesh::file::MeshFile` が読み、
   - 河床変動への影響は、`tests/corner_cells.rs` で確かめました（2026-11-06）。格子生成ツールの直線水路（延長 60 m、幅 10 m、格子幅 2 m）で、下流端の水位を等流水位より 0.3 m 下げて、出口の角へ向かって加速する流れを作ります。河床の変化を、正方形配置（格子幅 0.5 m）の1次元の計算と比べました。
   - 河床の変化の最大値 0.111 m に対し、1次元の計算との差の最大値は、凸な角に接するセルで 1.37 mm、内部で 1.27 mm、直線の壁ぎわで 1.35 mm でした。角のセルに土砂がたまるなどの偏りはなく、差は主に格子幅の違いによるものです。そのため、角の近くの母点の置き方は変えていません。
   - 流砂量の向きは辺の流速 $u_j$ を直接使うので、Perot 法の誤差は、流速の大きさの接線成分（2次の効果）と移流を通してしか入りません。1次元に近い流れでは、影響が小さいと考えられます。
-- 河床高などのセルの値の受け渡し方法は未定です。
+- 河床の定義は、中心線に沿った一様な勾配と平面だけです。測量した横断面からの補間や、非侵食層（`z_ne`）を作る機能は、必要になったら加えます（形式は `z_ne` を受け付けます）。
 
 ## 9. 依存パッケージとライセンス
 

@@ -48,3 +48,18 @@ line = [[25.0, 0.0], [25.0, -40.0]]
 [lloyd]
 iterations = 100
 tolerance = 1e-3
+
+# 河床（tools/make_bed.py が使う）：水路の中心線に沿って勾配 1/500、下流端で 0 m
+#
+#   uv run --project tools python tools/make_bed.py examples/domains/bend.toml \
+#       output/mesh/bend.mesh.toml -o output/mesh/bend.cells.toml
+
+[bed]
+kind = "centerline"
+slope = 0.002                        # 中心線に沿った勾配 [-]
+z_downstream = 0.0                   # 中心線の終点（下流端）の河床高 [m]
+centerline = [                       # 上流端から下流端へ（中心線の半径 30 m）
+  { line = [[30.0, -40.0], [30.0, 0.0]] },
+  { arc = { center = [0.0, 0.0], radius = 30.0, start = 0.0, end = 180.0 } },
+  { line = [[-30.0, 0.0], [-30.0, -40.0]] },
+]

@@ -12,6 +12,10 @@
 //!   （[`channel::build_periodic`]）を作る。河床高と水位は `[bed] slope` の勾配 I を除いた値で
 //!   持つので、初期の河床高は一様に `z_downstream` で、初期状態は流量 `discharge` の等流
 //!   （水深 h_n = (n q / √I)^{3/5}、q = Q / W、辺の流速 (q / h_n) n_x）にする（ADR-0014）。
+//! - 格子ファイル（`[mesh] kind = "file"`）では、格子（[`crate::mesh::file`]）と、セルの値の
+//!   ファイル（`cells`。[`crate::mesh::cells`]、ADR-0020）を読む。河床高と非侵食層はセルの値の
+//!   ファイルの値で、初期状態は乾いた河床（η = z_b、u = 0）。`[bed]` と周期境界は使えない
+//!   （河床はセルの値のファイルで与え、周期境界は直線水路の格子だけ）。
 //! - [`Model::with_state`]：格子と初期状態を外から与える（検証ケースで任意の地形を使うため）。
 //!
 //! ## 1ステップの流れ
@@ -54,7 +58,9 @@ use crate::config::{
 };
 use crate::hydro::{self, HydroError, HydroParams, HydroSolver, StepReport};
 use crate::io::{SedimentOutput, VtkWriter};
+use crate::mesh::cells::{self, CellValuesError};
 use crate::mesh::channel::{self, ChannelSpec};
+use crate::mesh::file::{self, MeshFileError};
 use crate::mesh::{EdgeKind, Mesh, MeshError};
 use crate::sediment::{BedUpdateReport, BedloadReport, SedimentParams, SedimentSolver};
 use crate::state::State;
@@ -114,6 +120,20 @@ pub enum ModelError {
     Setup(String),
     /// 格子を作れない。
     Mesh(MeshError),
+    /// 格子ファイルを読めない。
+    MeshFile {
+        /// 格子ファイルのパス。
+        path: std::path::PathBuf,
+        /// 元の誤り。
+        source: MeshFileError,
+    },
+    /// セルの値のファイルを読めない、または格子と合わない。
+    CellValues {
+        /// セルの値のファイルのパス。
+        path: std::path::PathBuf,
+        /// 元の誤り。
+        source: CellValuesError,
+    },
     /// 流れの計算が失敗した。
     Hydro(HydroError),
     /// 可変の時間刻みが正の有限の値にならない（時刻と、求めた値 \[s\]）。
@@ -133,6 +153,14 @@ impl fmt::Display for ModelError {
             Self::Config(e) => write!(f, "configuration error: {e}"),
             Self::Setup(message) => write!(f, "invalid model setup: {message}"),
             Self::Mesh(e) => write!(f, "cannot build the mesh: {e}"),
+            Self::MeshFile { path, source } => {
+                write!(f, "cannot read the mesh file {}: {source}", path.display())
+            }
+            Self::CellValues { path, source } => write!(
+                f,
+                "cannot use the cell values file {}: {source}",
+                path.display()
+            ),
             Self::Hydro(e) => write!(f, "hydrodynamic solver error: {e}"),
             Self::TimeStep { time, dt } => write!(
                 f,
@@ -149,6 +177,8 @@ impl Error for ModelError {
             Self::Config(e) => Some(e),
             Self::Setup(_) | Self::TimeStep { .. } => None,
             Self::Mesh(e) => Some(e),
+            Self::MeshFile { source, .. } => Some(source),
+            Self::CellValues { source, .. } => Some(source),
             Self::Hydro(e) => Some(e),
             Self::Io(e) => Some(e),
         }
@@ -287,8 +317,11 @@ impl Model {
     /// 河床（η = z_b、u = 0）。周期境界では、周期的な格子と、`discharge` の等流の初期状態を作る
     /// （流量・勾配・粗度係数が正でなければ [`ModelError::Setup`]）。
     ///
-    /// `mesh.kind = "file"` は、格子ファイルにセルの河床高がないので、まだ使えない
-    /// （[`ModelError::Setup`]。[`Model::with_state`] で状態を与える）。
+    /// `mesh.kind = "file"` のとき、格子ファイルとセルの値のファイル（`mesh.cells`）を読み、
+    /// 河床高と非侵食層をセルの値のファイルの値にする。初期状態は乾いた河床。`mesh.cells` が
+    /// ないとき、`[bed]` があるとき、周期境界のときは [`ModelError::Setup`]、ファイルを読めない
+    /// ときやセルの値の母点が格子と合わないときは [`ModelError::MeshFile`]・
+    /// [`ModelError::CellValues`] を返す。
     pub fn new(config: Config) -> Result<Self, ModelError> {
         config.validate()?;
         let (mesh, state) = match &config.mesh {
@@ -318,12 +351,7 @@ impl Model {
                     (mesh, state)
                 }
             }
-            MeshConfig::File { path } => {
-                return Err(ModelError::Setup(format!(
-                    "mesh.kind = \"file\" ({}) is not supported by Model::new yet: mesh files have no bed elevations (build the state yourself and use Model::with_state)",
-                    path.display()
-                )));
-            }
+            MeshConfig::File { path, cells } => file_state(&config, path, cells.as_deref())?,
         };
         Self::with_state(config, mesh, state)
     }
@@ -585,6 +613,44 @@ impl Model {
         self.writer.write_collection()?;
         Ok(())
     }
+}
+
+/// 格子ファイルとセルの値のファイルから、格子と乾いた河床の初期状態を作る（ADR-0020）。
+fn file_state(
+    config: &Config,
+    path: &std::path::Path,
+    cells_path: Option<&std::path::Path>,
+) -> Result<(Mesh, State), ModelError> {
+    let cells_path = cells_path.ok_or_else(|| {
+        ModelError::Setup(
+            "mesh.cells is required with mesh.kind = \"file\" (make it with tools/make_bed.py)"
+                .to_owned(),
+        )
+    })?;
+    if config.bed.is_some() {
+        return Err(ModelError::Setup(
+            "[bed] cannot be used with mesh.kind = \"file\" (the bed comes from mesh.cells)"
+                .to_owned(),
+        ));
+    }
+    if config.boundary.is_periodic() {
+        return Err(ModelError::Setup(
+            "periodic boundaries need mesh.kind = \"channel\"".to_owned(),
+        ));
+    }
+    let mesh = file::read(path).map_err(|source| ModelError::MeshFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let values = cells::read(cells_path, &mesh).map_err(|source| ModelError::CellValues {
+        path: cells_path.to_path_buf(),
+        source,
+    })?;
+    let mut state = State::new(mesh.n_cells(), mesh.n_edges());
+    state.z_ne = values.non_erodible();
+    state.zb = values.cells.zb;
+    state.eta.clone_from(&state.zb);
+    Ok((mesh, state))
 }
 
 /// 配列の長さと、境界条件・境界辺の対応を確かめる。
@@ -982,14 +1048,31 @@ height = 1.0
     }
 
     #[test]
-    fn new_rejects_file_meshes_and_suspended_sediment_for_now() {
+    fn new_rejects_incomplete_file_meshes_and_suspended_sediment_for_now() {
+        // 格子ファイルには、セルの値のファイルが要る。河床は [bed] ではなくセルの値で与える
         let mut config = channel_config("reject", "", "dt = 0.1");
         config.mesh = MeshConfig::File {
             path: "mesh.toml".into(),
+            cells: None,
         };
+        let err = Model::new(config.clone()).unwrap_err();
+        assert!(
+            matches!(&err, ModelError::Setup(m) if m.contains("mesh.cells is required")),
+            "{err}"
+        );
+        config.mesh = MeshConfig::File {
+            path: "mesh.toml".into(),
+            cells: Some("mesh.cells.toml".into()),
+        };
+        let err = Model::new(config.clone()).unwrap_err();
+        assert!(
+            matches!(&err, ModelError::Setup(m) if m.contains("[bed] cannot be used")),
+            "{err}"
+        );
+        config.bed = None;
         let err = Model::new(config).unwrap_err();
         assert!(
-            matches!(&err, ModelError::Setup(m) if m.contains("not supported")),
+            matches!(&err, ModelError::MeshFile { path, .. } if path.ends_with("mesh.toml")),
             "{err}"
         );
 
