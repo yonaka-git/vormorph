@@ -661,7 +661,7 @@ uv run --project tools python tools/plot_verification.py v09 output/verification
 - 周期境界の V06・V12 と継ぎ目のテスト（`tests/periodic_channel.rs`）は、ADR-0015 の後も同じ合格基準で通ります。V12 の六角形配置の河床の変化は $5.4\times10^{-15}$ m から $4.4\times10^{-15}$ m に、継ぎ目のテストの差は $10^{-16}$ の水準のままです。
 - **ADR-0013 の流路の分化との関係**：`examples/sill.toml` の幅 20 m で一定の給砂量にしたときの流路の分化（1 mm → 0.93 m を地形の時間 $3\times10^4$ s。$e$ 倍の時間は約 4400 s）は、等流の交互砂州（$e$ 倍の時間 $1.2\times10^5$ s。数値拡散でさらに遅くなる）より約 30 倍速く、交互砂州の不安定ではありません。給砂不足で河床が下がることが駆動する、別の不安定と考えられます。
 
-### V09 交互砂州：2次の移流と SSP-RK2（2026-11-07, commit （次のコミットで記入））
+### V09 交互砂州：2次の移流と SSP-RK2（2026-11-07, commit 6282e8f）
 
 2次の移流と1ステップ全体の SSP-RK2（[ADR-0016](design/adr/0016-second-order-advection-ssp-rk2.md)。クーラン数 0.8）のケースを加えた結果です。`cargo test --release --test verification v09 -- --nocapture` の出力です。1次の形の 11 ケースの値は、上の表（commit 5b3e7e4）と同じでした。
 
