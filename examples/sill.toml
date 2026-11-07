@@ -51,7 +51,7 @@ theta = 0.55
 manning_n = 0.025
 dry_depth = 1.0e-3      # [m]
 advection = "upwind"    # 運動量の移流："upwind"（保存型風上差分）、"second_order"、"none"
-time_integration = "euler"  # 時間積分："euler"（1段）または "ssp_rk2"（2段。"second_order" に必要）
+time_integration = "euler"  # 時間積分："euler"（1段）または "predictor_corrector"（予測子・修正子。"second_order" に必要）
 
 [hydro.solver]
 newton_tol = 1.0e-10

@@ -90,15 +90,18 @@
 //!
 //! ## 時間積分
 //!
-//! 下の「1ステップの手順」の 1〜6 を1段 S とする（移流は前進 Euler）。
+//! 下の「1ステップの手順」の 1〜2 を陽的な部分（辺の水深 H_j と流量、移流の増分
+//! Δ_j = F u_j − u_j、摩擦係数に使う |u|_j）、3〜6 を陰的な部分とする。
 //!
-//! - `hydro.time_integration = "euler"`：S を1回。
-//! - `hydro.time_integration = "ssp_rk2"`：1ステップ全体の SSP-RK2（Heun）、
-//!   u^{n+1} = (u^n + S(S(u^n))) / 2（ADR-0016）。セルの水深、辺の運動量 (h_1 + h_2)/2 u_j、
-//!   θ 平均の流量を2段で平均する（水と運動量が保存され、段波の速さが正しく出る）。
-//!   計算量は2倍だが、1次元の線形解析ではどのフルード数でもクーラン数 1 まで安定で
-//!   （`tools/advection_stability.py`）、定常解は S の定常解と同じ（Δt によらない）。
-//!   2次の移流は S を1回では不安定なので、この形と組み合わせる。
+//! - `hydro.time_integration = "euler"`：時刻 n の陽的な部分で1回解く（移流は前進 Euler）。
+//! - `hydro.time_integration = "predictor_corrector"`：予測子・修正子（ADR-0017）。時刻 n の
+//!   陽的な部分で1回解いて予測子 U* を求め、U* の陽的な部分と平均して（H̄ = (H^n + H*)/2、
+//!   移流は辺の運動量と体積を2つの状態の流束の平均で進めた値、流量と |u| も平均）、時刻 n から
+//!   解き直す。陽的な部分は Heun 法、
+//!   水位勾配と摩擦は θ 法の1回なので、平均流のない重力波の減衰は θ 法と同じ。計算量は約2倍だが、
+//!   1次元の線形解析ではどのフルード数でもクーラン数 1 まで安定で（`tools/advection_stability.py`）、
+//!   定常解は1段の定常解と同じ（Δt によらない）。2次の移流は1段では不安定なので、この形と
+//!   組み合わせる。
 //!
 //! ## 1ステップの手順
 //!
@@ -118,7 +121,8 @@
 //! 6. 乾いたセルの水位を河床高に揃え、Perot 法でセル中心の流速を再構成する
 //!    （[`reconstruct_cell_velocity`]）。
 //!
-//! SSP-RK2 では、1〜6 を2回行ってから平均し、Perot 法で再構成し直す（上の「時間積分」）。
+//! 予測子・修正子では、1〜6 で予測子を求め、予測子の状態で 1〜2 を行って時刻 n の値と平均し、
+//! 時刻 n の状態から 3〜6 を行う（上の「時間積分」）。
 //!
 //! ## 参考文献
 //!
@@ -189,8 +193,9 @@ pub fn background_slope(config: &Config) -> f64 {
 
 /// 1ステップの計算の記録。
 ///
-/// SSP-RK2（`hydro.time_integration = "ssp_rk2"`）では、反復回数は2段の合計、それ以外は2段の
-/// 大きい方を記録する。
+/// 予測子・修正子（`hydro.time_integration = "predictor_corrector"`）では、反復回数は2回の合計、
+/// セルの流出量の比 `outflow_courant` は時刻 n の値（可変の時間刻みを決めた値）、移流の局所
+/// クーラン数と残差は2回の大きい方を記録する。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct StepReport {
     /// 時間刻み Δt \[s\]。
@@ -378,12 +383,30 @@ pub struct HydroSolver {
     theta_flux: Vec<f64>,
     /// PCG の作業配列
     pcg: PcgWorkspace,
-    /// SSP-RK2 の、ステップの初めのセルの水深 h^n \[m\]
-    initial_depth: Vec<f64>,
-    /// SSP-RK2 の、ステップの初めの辺の流速 u_j^n \[m/s\]
+    /// 摩擦係数に使う辺の流速の大きさ |u|_j \[m/s\]
+    speed: Vec<f64>,
+    /// 時刻 n の流量で連続式を陽的に進めたセルの水深 h*_i \[m\]（移流と同じ値）
+    advanced_depth: Vec<f64>,
+    /// 辺の両側のセルの水深の和 h_1 + h_2 \[m\]（境界辺は内側のセルだけ）
+    side_depth: Vec<f64>,
+    /// 辺の両側のセルの h* の和 h*_1 + h*_2 \[m\]（境界辺は内側のセルだけ）
+    advanced_side_depth: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の水位 \[m\]
+    initial_level: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の辺の流速 u_j^n \[m/s\]
     initial_velocity: Vec<f64>,
-    /// SSP-RK2 の、1段目の θ 平均の単位幅流量 \[m²/s\]
-    first_stage_flux: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の辺の水深 H_j^n \[m\]
+    initial_edge_depth: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の辺の単位幅流量 q_j^n \[m²/s\]（流量境界では配分した流入量）
+    initial_edge_flux: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の |u|_j \[m/s\]
+    initial_speed: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の移流の増分 F u_j^n − u_j^n \[m/s\]
+    initial_increment: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の h_1 + h_2 \[m\]
+    initial_side_depth: Vec<f64>,
+    /// 予測子・修正子の、時刻 n の h*_1 + h*_2 \[m\]
+    initial_advanced_side_depth: Vec<f64>,
 }
 
 impl HydroSolver {
@@ -409,9 +432,18 @@ impl HydroSolver {
             correction: vec![0.0; n_cells],
             theta_flux: vec![0.0; n_edges],
             pcg: PcgWorkspace::new(n_cells),
-            initial_depth: vec![0.0; n_cells],
+            speed: vec![0.0; n_edges],
+            advanced_depth: vec![0.0; n_cells],
+            side_depth: vec![0.0; n_edges],
+            advanced_side_depth: vec![0.0; n_edges],
+            initial_level: vec![0.0; n_cells],
             initial_velocity: vec![0.0; n_edges],
-            first_stage_flux: vec![0.0; n_edges],
+            initial_edge_depth: vec![0.0; n_edges],
+            initial_edge_flux: vec![0.0; n_edges],
+            initial_speed: vec![0.0; n_edges],
+            initial_increment: vec![0.0; n_edges],
+            initial_side_depth: vec![0.0; n_edges],
+            initial_advanced_side_depth: vec![0.0; n_edges],
         }
     }
 
@@ -424,7 +456,7 @@ impl HydroSolver {
     ///
     /// 向きは u_n と同じ（`cells_on_edge[e][0]` から外向きを正）。連続式は
     /// V_i^{n+1} = V_i^n − Δt Σ_j s_ij L_j q_j^θ を、Newton 法の残差の範囲で満たす。
-    /// SSP-RK2 では2段の流量の平均で、セルの水深も2段で平均するので、同じ式が成り立つ。
+    /// 予測子・修正子では、修正子の流量（辺の水深は時刻 n と予測子の平均）。
     pub fn theta_flux(&self) -> &[f64] {
         &self.theta_flux
     }
@@ -504,8 +536,8 @@ impl HydroSolver {
 
     /// 時刻を `dt` だけ進め、`state` の η, u_n, u_cell を更新する。
     ///
-    /// `hydro.time_integration` が `"euler"` なら半陰解法の1段、`"ssp_rk2"` なら1ステップ全体の
-    /// SSP-RK2（2段の平均。モジュールの説明の「時間積分」）で進める。
+    /// `hydro.time_integration` が `"euler"` なら半陰解法の1段、`"predictor_corrector"` なら
+    /// 予測子・修正子（モジュールの説明の「時間積分」）で進める。
     ///
     /// `state` は、全セルで η ≥ z_b、壁の辺で u_n = 0、`u_cell` が `u_n` を再構成した値で
     /// あることを前提にする（ステップの最後にこの状態に揃えて返す）。失敗したときの
@@ -518,23 +550,40 @@ impl HydroSolver {
         dt: f64,
     ) -> Result<StepReport, HydroError> {
         match self.params.time_integration {
-            TimeIntegration::Euler => self.stage(mesh, state, boundary, dt),
-            TimeIntegration::SspRk2 => self.step_ssp_rk2(mesh, state, boundary, dt),
+            TimeIntegration::Euler => {
+                let report = self.explicit_terms(mesh, state, boundary, dt);
+                self.implicit_solve(mesh, state, dt, report)
+            }
+            TimeIntegration::PredictorCorrector => {
+                self.step_predictor_corrector(mesh, state, boundary, dt)
+            }
         }
     }
 
-    /// 1ステップ全体の SSP-RK2（Heun）：u^{n+1} = (u^n + S(S(u^n))) / 2（ADR-0016）。
+    /// 予測子・修正子（ADR-0017）。
     ///
-    /// S は [`HydroSolver::stage`]（θ 法の半陰解法の1段）。2段とも同じ境界条件と Δt を使う。
-    /// 平均は次のとおり。
+    /// 1. 時刻 n の陽的な部分（辺の水深 H^n、流量、移流の増分 Δ^n = F u^n − u^n、|u|^n）で
+    ///    1段解き、予測子 U* を得る。
+    /// 2. U* の陽的な部分（H*、流量、Δ* = F* u* − u*、|u|*）を求める。
+    /// 3. 陽的な部分を平均し、時刻 n の状態から水位と流速を解き直す（修正子）。辺の水深は
+    ///    H̄ = (H^n + H*)/2、流量と |u| も平均する。移流は、辺の運動量 (h_1 + h_2) u と体積
+    ///    h_1 + h_2 を、2つの状態の流束の平均で陽的に進めた値とする（ADR-0008 の h* で割る形を
+    ///    2つの状態で平均したもの）。
     ///
-    /// - セルの水深を平均する（η = z_b + (h^n + h^{(2)}) / 2）。θ 平均の流量も2段の平均にするので、
-    ///   V^{n+1} = V^n − Δt Σ_j s_ij L_j q_j^θ が Newton 法の残差の範囲で成り立つ。
-    /// - 辺の運動量 h̄_j u_j を平均する（h̄_j = (h_1 + h_2) / 2。境界辺は内側のセルの水深）。
-    ///   流速を平均すると、動く段波で運動量が保存されず、段波の速さがずれる（V05）。
-    ///   流量境界の辺だけは、平均した流量を新しい水深で割った値にする（1段のときと同じ定義）。
-    /// - Perot 法でセル中心の流速を作り直す。
-    fn step_ssp_rk2(
+    /// ```text
+    /// F u = [h^n u^n + (P^n + P*)/2] / [h^n − (D^n + D*)/2]
+    /// P_s = h*_s F_s u_s − h_s u_s（運動量の流束 × Δt）,  D_s = h_s − h*_s（体積の流出 × Δt）
+    /// ```
+    ///
+    /// h_s、h*_s は状態 s の両側のセルの水深と h* の和。流速の増分 F_s u_s − u_s をそのまま
+    /// 平均すると、動く段波で運動量が保存されず、段波の速さがずれる（V05）。どちらかの状態で
+    /// h* が 0 の辺（干出しかけた辺）では、流速の増分の平均にする。
+    ///
+    /// 陽的な部分については Heun 法（SSP-RK2 と同じ）、水位勾配と摩擦については θ 法の1回なので、
+    /// 平均流のない重力波の減衰は θ 法と同じになる。連続式は修正子の1回の流量で閉じるので、
+    /// V^{n+1} = V^n − Δt Σ_j s_ij L_j q_j^θ が Newton 法の残差の範囲で成り立つ。
+    /// 定常解は1段の定常解と同じ（U* = U^n なら修正子は予測子と同じ式になる）。
+    fn step_predictor_corrector(
         &mut self,
         mesh: &Mesh,
         state: &mut State,
@@ -542,104 +591,98 @@ impl HydroSolver {
         dt: f64,
     ) -> Result<StepReport, HydroError> {
         let time = state.time;
-        for (c, h) in self.initial_depth.iter_mut().enumerate() {
-            *h = state.depth(c);
-        }
+        // 1. 時刻 n の陽的な部分と予測子
+        let predictor = self.explicit_terms(mesh, state, boundary, dt);
+        self.initial_level.copy_from_slice(&state.eta);
         self.initial_velocity.copy_from_slice(&state.u_n);
-        let first = self.stage(mesh, state, boundary, dt)?;
-        self.first_stage_flux.copy_from_slice(&self.theta_flux);
-        let second = self.stage(mesh, state, boundary, dt)?;
+        self.initial_edge_depth.copy_from_slice(&self.edge_depth);
+        self.initial_edge_flux.copy_from_slice(&self.edge_flux);
+        self.initial_speed.copy_from_slice(&self.speed);
+        self.initial_side_depth.copy_from_slice(&self.side_depth);
+        self.initial_advanced_side_depth
+            .copy_from_slice(&self.advanced_side_depth);
+        for (d, (&f, &u)) in self
+            .initial_increment
+            .iter_mut()
+            .zip(self.advected.iter().zip(&state.u_n))
+        {
+            *d = f - u;
+        }
+        let first = self.implicit_solve(mesh, state, dt, predictor)?;
 
-        // 辺の運動量 h̄_j u_j を平均する（h̄_j は両側のセルの水深の平均。セルの水深も平均するので、
-        // 平均した運動量を平均した h̄_j で割ればよい）
-        let h0 = &self.initial_depth;
-        for (e, (u, &u0)) in state.u_n.iter_mut().zip(&self.initial_velocity).enumerate() {
-            let [c1, c2] = mesh.cells_on_edge[e];
-            let (initial, current) = if c2 == NONE {
-                (h0[c1], (state.eta[c1] - state.zb[c1]).max(0.0))
-            } else {
-                (
-                    0.5 * (h0[c1] + h0[c2]),
-                    0.5 * ((state.eta[c1] - state.zb[c1]).max(0.0)
-                        + (state.eta[c2] - state.zb[c2]).max(0.0)),
-                )
-            };
-            let total = initial + current;
-            *u = if total > 0.0 {
-                (initial * u0 + current * *u) / total
-            } else {
-                0.0
-            };
-        }
-        for (c, &h) in h0.iter().enumerate() {
-            state.eta[c] = state.zb[c] + 0.5 * (h + state.depth(c));
-        }
-        for (q, &q1) in self.theta_flux.iter_mut().zip(&self.first_stage_flux) {
-            *q = 0.5 * (*q + q1);
-        }
-        // 流量境界の辺の流速は、平均した流量を新しい水深で割った値（1段のときと同じ定義）
+        // 2. 予測子 U* の陽的な部分
+        let explicit = self.explicit_terms(mesh, state, boundary, dt);
+
+        // 3. 陽的な部分を平均して、時刻 n から解き直す
         let dry_depth = self.params.dry_depth;
-        for (e, u) in state.u_n.iter_mut().enumerate() {
-            if self.role[e] == EdgeRole::Discharge {
-                let c = mesh.cells_on_edge[e][0];
-                *u = self.theta_flux[e] / (state.eta[c] - state.zb[c]).max(dry_depth);
-            }
+        for e in 0..mesh.n_edges() {
+            let depth = 0.5 * (self.initial_edge_depth[e] + self.edge_depth[e]);
+            self.edge_depth[e] = if depth >= dry_depth { depth } else { 0.0 };
+            self.edge_flux[e] = 0.5 * (self.initial_edge_flux[e] + self.edge_flux[e]);
+            self.speed[e] = 0.5 * (self.initial_speed[e] + self.speed[e]);
+            // 移流：辺の運動量 (h_1 + h_2) u と体積 h_1 + h_2 を、2つの状態の流束の平均で陽的に
+            // 進める（ADR-0008 の h* で割る形の平均）。流速の増分をそのまま平均すると、動く段波で
+            // 運動量が保存されない
+            let (u0, d0) = (self.initial_velocity[e], self.initial_increment[e]);
+            let (h0, s0) = (
+                self.initial_side_depth[e],
+                self.initial_advanced_side_depth[e],
+            );
+            let (u1, f1) = (state.u_n[e], self.advected[e]);
+            let (h1, s1) = (self.side_depth[e], self.advanced_side_depth[e]);
+            let volume = 0.5 * (h0 + s0 + s1 - h1);
+            self.advected[e] = if s0 > 0.0 && s1 > 0.0 && volume > 0.0 {
+                0.5 * (h0 * u0 + s0 * (u0 + d0) + s1 * f1 - h1 * u1) / volume
+            } else {
+                u0 + 0.5 * (d0 + f1 - u1)
+            };
         }
+        state.eta.copy_from_slice(&self.initial_level);
+        state.u_n.copy_from_slice(&self.initial_velocity);
         reconstruct_cell_velocity(mesh, &state.u_n, &mut state.u_cell);
-        state.time = time + dt;
-        Ok(StepReport {
+        state.time = time;
+        let corrector = StepReport {
             dt,
-            outflow_courant: first.outflow_courant.max(second.outflow_courant),
+            max_courant: first.max_courant.max(explicit.max_courant),
+            limited_edges: first.limited_edges.max(explicit.limited_edges),
+            ..StepReport::default()
+        };
+        let second = self.implicit_solve(mesh, state, dt, corrector)?;
+        Ok(StepReport {
+            outflow_courant: first.outflow_courant,
             newton_iterations: first.newton_iterations + second.newton_iterations,
             pcg_iterations: first.pcg_iterations + second.pcg_iterations,
             residual: first.residual.max(second.residual),
-            max_courant: first.max_courant.max(second.max_courant),
-            limited_edges: first.limited_edges.max(second.limited_edges),
+            ..second
         })
     }
 
-    /// θ 法の半陰解法の1段 S：`state` を時刻 n から `dt` だけ進める（移流は陽的に1回評価する）。
-    fn stage(
+    /// 1ステップの手順の 1〜2（陽的な部分）：辺の役割、辺の水深 H_j、辺の流量 q_j、移流 F u_j
+    /// （`advected`）、摩擦係数に使う |u|_j（`speed`）を `state` から求める。
+    ///
+    /// 返す記録には、Δt、セルの流出量の比、移流の局所クーラン数を入れる。
+    fn explicit_terms(
         &mut self,
         mesh: &Mesh,
-        state: &mut State,
+        state: &State,
         boundary: &BoundaryConfig,
         dt: f64,
-    ) -> Result<StepReport, HydroError> {
-        // 1. 辺の役割と辺の水深、辺の流量
+    ) -> StepReport {
         self.prepare_edges(mesh, state, boundary);
         let Self {
             params,
-            role,
-            outside_level,
-            edge_depth,
             edge_flux,
             momentum_edge,
             advection: advection_workspace,
             advected,
-            friction,
-            explicit_part,
-            weight,
-            explicit_flux,
-            rhs,
-            wet_area,
-            residual,
-            correction,
-            theta_flux,
-            pcg,
+            speed,
             ..
         } = self;
-        let (g, theta) = (params.gravity, params.theta);
-        let n2 = params.manning_n * params.manning_n;
-        // 周期境界の体積力 g I（x 方向）
-        let body_force = g * params.background_slope;
         let mut report = StepReport {
             dt,
             outflow_courant: dt * outflow_rate(mesh, state, edge_flux),
             ..StepReport::default()
         };
-
-        // 2. 移流
         let scheme = match params.advection {
             AdvectionScheme::Upwind => Some(advection as AdvectionFn),
             AdvectionScheme::SecondOrder => Some(advection_second_order as AdvectionFn),
@@ -661,6 +704,76 @@ impl HydroSolver {
             }
             None => advected.copy_from_slice(&state.u_n),
         }
+        for (e, s) in speed.iter_mut().enumerate() {
+            *s = edge_speed(mesh, state, e);
+        }
+        // 移流と同じ h*_i と、辺の両側の和（予測子・修正子で運動量を平均するため）
+        let Self {
+            edge_flux,
+            advanced_depth,
+            side_depth,
+            advanced_side_depth,
+            ..
+        } = self;
+        for (c, h) in advanced_depth.iter_mut().enumerate() {
+            let outflow: f64 = mesh.edges_on_cell[c]
+                .iter()
+                .zip(&mesh.edge_sign_on_cell[c])
+                .map(|(&e, &sign)| sign * mesh.dv_edge[e] * edge_flux[e])
+                .sum();
+            *h = (state.depth(c) - dt * outflow / mesh.area_cell[c]).max(0.0);
+        }
+        for (e, (h, h_star)) in side_depth
+            .iter_mut()
+            .zip(advanced_side_depth.iter_mut())
+            .enumerate()
+        {
+            (*h, *h_star) = (0.0, 0.0);
+            for c in mesh.cells_on_edge[e] {
+                if c != NONE {
+                    *h += state.depth(c);
+                    *h_star += advanced_depth[c];
+                }
+            }
+        }
+        report
+    }
+
+    /// 1ステップの手順の 3〜6（陰的な部分）：[`HydroSolver::explicit_terms`] が求めた辺の水深・
+    /// 流量・F u・|u| を使って、水位の連立方程式を解き、`state` を `dt` だけ進める。
+    ///
+    /// `report` の Newton 法・PCG の反復回数と残差を書き足して返す。
+    fn implicit_solve(
+        &mut self,
+        mesh: &Mesh,
+        state: &mut State,
+        dt: f64,
+        mut report: StepReport,
+    ) -> Result<StepReport, HydroError> {
+        let Self {
+            params,
+            role,
+            outside_level,
+            edge_depth,
+            edge_flux,
+            advected,
+            friction,
+            explicit_part,
+            weight,
+            explicit_flux,
+            rhs,
+            wet_area,
+            residual,
+            correction,
+            theta_flux,
+            pcg,
+            speed,
+            ..
+        } = self;
+        let (g, theta) = (params.gravity, params.theta);
+        let n2 = params.manning_n * params.manning_n;
+        // 周期境界の体積力 g I（x 方向）
+        let body_force = g * params.background_slope;
 
         // 3. 摩擦係数、G_j、重み w_j、右辺に入る流量（流量境界では配分した流入量）
         for e in 0..mesh.n_edges() {
@@ -670,7 +783,7 @@ impl HydroSolver {
                 flux = mesh.dv_edge[e] * edge_flux[e];
             } else if h > 0.0 {
                 if let Some((eta1, eta2, delta)) = gradient_points(mesh, role[e], &state.eta, e) {
-                    gamma = g * n2 * edge_speed(mesh, state, e) / h.powf(4.0 / 3.0);
+                    gamma = g * n2 * speed[e] / h.powf(4.0 / 3.0);
                     let denom = 1.0 + dt * gamma;
                     big_g = (advected[e] - (1.0 - theta) * g * dt * (eta2 - eta1) / delta
                         + dt * body_force * mesh.normal_edge[e][0])
@@ -1128,8 +1241,8 @@ pub fn advection(
 /// - 1次元の定常流では、面の値が面ごとに1つ、外挿の勾配がセルごとに1つなので、各辺の式の和が
 ///   打ち消し合い、跳水で Bélanger の式が成り立つ。
 /// - 時間については前進 Euler（1段）。θ 法の水位と連続式の風上の水深と組み合わせると、
-///   前進 Euler のままでは不安定なので、1ステップ全体の SSP-RK2（`time_integration = "ssp_rk2"`、
-///   [`HydroSolver::step`]）と組み合わせて使う（ADR-0016）。
+///   前進 Euler のままでは不安定なので、予測子・修正子（`time_integration = "predictor_corrector"`、
+///   [`HydroSolver::step`]）と組み合わせて使う（ADR-0016、ADR-0017）。
 /// - 勾配は、セルとその隣のセルの内部の辺がすべて濡れている（`active`）ときだけ求め、
 ///   それ以外は 0 とする（汀線と、乾いた辺のある段差の近くでは1次に戻る）。
 /// - 境界辺から流れ込む水の流速は、その辺の法線流速 u_l n_l とする（再構成しない）。
@@ -1644,7 +1757,7 @@ mod tests {
             state.eta[c] = state.zb[c].max(1.0);
         }
         let initial = state.clone();
-        for time_integration in [TimeIntegration::Euler, TimeIntegration::SspRk2] {
+        for time_integration in [TimeIntegration::Euler, TimeIntegration::PredictorCorrector] {
             let mut state = initial.clone();
             let params = HydroParams {
                 time_integration,
@@ -1662,10 +1775,10 @@ mod tests {
         }
     }
 
-    /// 周期境界の等流は、半陰解法の1段 S の定常解なので、SSP-RK2 でも（1次・2次の移流とも、
-    /// 正方形・六角形配置とも）変わらない。SSP-RK2 の定常解は Δt によらない。
+    /// 周期境界の等流は1段の定常解なので、予測子・修正子でも（1次・2次の移流とも、正方形・
+    /// 六角形配置とも）変わらない。予測子・修正子の定常解は Δt によらない。
     #[test]
-    fn ssp_rk2_keeps_the_periodic_uniform_flow() {
+    fn predictor_corrector_keeps_the_periodic_uniform_flow() {
         let (slope, manning_n, q): (f64, f64, f64) = (0.002, 0.025, 2.0);
         let depth = (manning_n * q / slope.sqrt()).powf(0.6);
         for layout in [ChannelLayout::Rectangular, ChannelLayout::Hexagonal] {
@@ -1683,7 +1796,7 @@ mod tests {
             for advection in [AdvectionScheme::Upwind, AdvectionScheme::SecondOrder] {
                 let params = HydroParams {
                     advection,
-                    time_integration: TimeIntegration::SspRk2,
+                    time_integration: TimeIntegration::PredictorCorrector,
                     background_slope: slope,
                     ..params(manning_n)
                 };
@@ -2224,12 +2337,50 @@ mod tests {
         run_closed(&mesh, &mut state, 0.02, 0.2, 200);
     }
 
-    /// SSP-RK2 でも、セルごとに V^{n+1} − V^n = −Δt Σ_j s_ij L_j q_j^θ が Newton 法の判定値の
-    /// 範囲で成り立つ（水深を2段で平均し、2段の流量の平均を θ 平均の流量とするため）。冠水と
-    /// 干出を含む振動で、1次と2次の移流について確かめる。水深は1ステップで半分より小さく
-    /// ならないので（h^{n+1} ≥ h^n / 2）、干出は水深が `dry_depth` を下回ることで数える。
+    /// 閉じた水路の静振（摩擦・移流なし、1周期 50 ステップ）：予測子・修正子の1周期後の振幅は、
+    /// θ 法の1段とほぼ同じ（重力波を余分に減衰させない）。1ステップ全体を SSP-RK2 にした形
+    /// （ADR-0016）では、1次元の線形解析で、この条件の振幅が約 0.65 倍になる。
     #[test]
-    fn ssp_rk2_volume_change_matches_the_averaged_flux() {
+    fn predictor_corrector_does_not_damp_seiches() {
+        let (length, depth, amplitude): (f64, f64, f64) = (20.0, 1.0, 0.01);
+        let mesh = mesh(length, 1.0, 0.5, ChannelLayout::Rectangular);
+        let period = 2.0 * length / (9.81 * depth).sqrt();
+        let steps = 50;
+        let dt = period / steps as f64;
+        let mut initial = State::new(mesh.n_cells(), mesh.n_edges());
+        for c in 0..mesh.n_cells() {
+            initial.eta[c] = depth + amplitude * (PI * mesh.x_cell[c] / length).cos();
+        }
+        let first = (0..mesh.n_cells())
+            .min_by(|&a, &b| mesh.x_cell[a].total_cmp(&mesh.x_cell[b]))
+            .expect("cells");
+        let run = |time_integration| {
+            let params = HydroParams {
+                advection: AdvectionScheme::Disabled,
+                time_integration,
+                ..params(0.0)
+            };
+            let mut solver = HydroSolver::new(&mesh, params);
+            let mut state = initial.clone();
+            for _ in 0..steps {
+                solver.step(&mesh, &mut state, &closed(), dt).unwrap();
+            }
+            (state.eta[first] - depth) / (initial.eta[first] - depth)
+        };
+        let euler = run(TimeIntegration::Euler);
+        let predictor_corrector = run(TimeIntegration::PredictorCorrector);
+        assert!(euler > 0.9, "euler {euler}");
+        assert!(
+            (predictor_corrector - euler).abs() <= 0.02,
+            "predictor-corrector {predictor_corrector}, euler {euler}"
+        );
+    }
+
+    /// 予測子・修正子でも、セルごとに V^{n+1} − V^n = −Δt Σ_j s_ij L_j q_j^θ が Newton 法の判定値の
+    /// 範囲で成り立つ（連続式は修正子の1回の流量で閉じる）。冠水と干出を含む振動で、1次と2次の
+    /// 移流について確かめる。
+    #[test]
+    fn predictor_corrector_volume_change_matches_the_theta_flux() {
         let mesh = mesh(20.0, 4.0, 1.0, ChannelLayout::Hexagonal);
         let mut initial = State::new(mesh.n_cells(), mesh.n_edges());
         for c in 0..mesh.n_cells() {
@@ -2242,7 +2393,7 @@ mod tests {
         for advection in [AdvectionScheme::Upwind, AdvectionScheme::SecondOrder] {
             let params = HydroParams {
                 advection,
-                time_integration: TimeIntegration::SspRk2,
+                time_integration: TimeIntegration::PredictorCorrector,
                 ..params(0.02)
             };
             let (tol, dry_depth) = (params.solver.newton_tol, params.dry_depth);
@@ -2273,10 +2424,6 @@ mod tests {
                     let (h0, h) = (v0 / mesh.area_cell[c], state.depth(c));
                     wetted |= h0 == 0.0 && h > 0.0;
                     dried |= h0 >= dry_depth && h < dry_depth;
-                    assert!(
-                        h >= 0.5 * h0 - 1e-12,
-                        "{advection:?}: cell {c}: {h0} -> {h}"
-                    );
                 }
                 assert!((0..mesh.n_cells()).all(|c| state.eta[c] >= state.zb[c]));
             }
